@@ -15,8 +15,11 @@ Reference sources (fetch before implementing)
   - `scrollable.rs`, `uniform_list.rs` — scrolling lists
   - `grid_layout.rs` — grid layouts
   - `input.rs` — text input handling
-- Component library (higher-level, better docs): https://github.com/longbridge/gpui-component
-  - Getting started: https://longbridge.github.io/gpui-component/docs/getting-started (LLM-readable .md variant linked on page)
+- Component library (higher-level, better docs): https://longbridge.github.io/gpui-component/llms.txt
+  - Getting started: https://longbridge.github.io/gpui-component/docs/getting-started.md (LLM-readable .md variant linked on page)
+  - Design Guidelines: https://longbridge.github.io/gpui-component/docs/design-guides.md
+  - Coding Guidelines: https://longbridge.github.io/gpui-component/docs/coding-guides.md
+  - Icons & Assets: https://longbridge.github.io/gpui-component/docs/assets.md
   - `story` crate in that repo — full working gallery app of all components, use as a reference implementation
 - Architecture overview (auto-generated, cross-check against source): https://deepwiki.com/zed-industries/zed
 - Real shipped GPUI apps for pattern reference: https://github.com/zed-industries/awesome-gpui
