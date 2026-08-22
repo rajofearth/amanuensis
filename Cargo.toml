@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cpal = "0.15"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7", features = ["font-kit"] }
