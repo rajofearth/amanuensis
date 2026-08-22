@@ -75,7 +75,7 @@ From [research/sherpa-lifecycle-and-issues.md](../research/sherpa-lifecycle-and-
 
 ### Memory residency across mode switches (proposal)
 
-Load/unload per mode switch: only the active mode's model resident at a time. Rationale: the app lives in the background permanently, mode flips are rare, reload after first fetch is fast via OS page cache, and the pending-start queue already absorbs load latency. Consequence: the onboarding RAM check validates against **one** model's footprint plus headroom, not the sum of both. Prerequisite: measure actual RSS post-load in phase 3 — no published numbers exist for these models.
+Load/unload per mode switch: only the active mode's model resident at a time. Rationale: the app lives in the background permanently, mode flips are rare, reload after first fetch is fast via OS page cache, and the pending-start queue already absorbs load latency. Consequence: the onboarding RAM check validates against **one** model's footprint plus headroom, not the sum of both. Prerequisite BEFORE locking this design: phase 3 must measure actual RSS post-load **and** unload→reload wall time for both models — neither number is published anywhere, and record mode's instant-paste pitch depends on reload being fast when F9 lands right after a mode switch.
 
 ## Additions
 
@@ -94,9 +94,9 @@ First launch opens an onboarding window, not idle:
 ## Build order
 
 1. ✅ **Done** — Pipeline spine: cpal capture thread ([src/audio.rs](../src/audio.rs), mono downmix, RMS @30 ms windows over mpsc) → GPUI live 26-bar waveform with running-peak normalization ([src/main.rs](../src/main.rs)); `cargo check` clean.
-2. Hotkeys + FSM: F9 toggle, record/stop, buffer accumulation. FSM knows which mode it's in to pick the model.
-3. ASR live mode: Nemotron via sherpa_onnx @80ms chunks (`feature_dim=128`, normalize=none, greedy_search), partials into HUD; log resident RSS after load.
-4. ASR record mode: unified @240ms chunks (feat_dim=128, per_feature normalization), same trait, final-paste path.
+2. ✅ **Done** — Hotkeys + FSM: global-hotkey 0.8 F9 toggle (`GlobalHotKeyManager` created on GPUI's main/win32-pump thread, kept alive via `mem::forget`; forwarder thread passes only `Pressed` events), `Phase {Loading, Idle, Recording, Transcribing}` × `Mode {Record, Live}` FSM, clickable mode chip, waveform bars gated to `Recording`. Note: global-hotkey already reports key release on Windows → push-to-talk later needs no new plumbing.
+3. ASR live mode: Nemotron via sherpa_onnx @80ms chunks (`feature_dim=128`, greedy_search), partials into HUD. Checklist: ☐ confirm `normalize_type` is read from encoder metadata, not left at a Rust-side default (nemotron expects none) · ☐ log resident RSS after load **and** unload→reload wall time for BOTH models — gates locking the load/unload-per-switch residency design.
+4. ASR record mode: unified @240ms chunks (`feature_dim=128`, per_feature normalization), same trait, final-paste path. Checklist: ☐ confirm `normalize_type=per_feature` is honored from encoder metadata · ☐ test a multi-minute hold (~5-min paragraph): fresh-stream-per-press does NOT cap internal stream-state growth (feature buffer, encoder cache, segment bookkeeping) — if degradation/memory growth appears, apply live mode's ~20 s endpoint-flush threshold here too.
 5. Paste path: arboard + enigo, gates, filler cleanup.
 6. Boundary redecode (record mode).
 7. Onboarding window: device detection, recommended model, download UX, per-mode config; RAM check validates single-resident-model footprint.
