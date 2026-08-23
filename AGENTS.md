@@ -1,7 +1,5 @@
 Always respond minimally. Tell me what you are doing, then do the thing, and tell me you did the thing.
 If a task can be delegated to the subagent—whether it’s research, exploration, or writing code—please use subagents. Use multiple if necessary.
-Always respond minimally. Tell me what you are doing, then do the thing, and tell me you did the thing.
-If a task can be delegated to the subagent—whether it's research, exploration, or writing code—please use subagents. Use multiple if necessary.
 
 This project uses GPUI (Zed's UI framework), not to be confused with general GUI/GPU terms.
 Subagents must ground themselves in the actual source/examples below before writing GPUI code, do not rely on memorized API shapes.

@@ -1,10 +1,7 @@
+mod asr;
 mod audio;
 
-use std::{
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -16,10 +13,16 @@ use gpui::{
 };
 use gpui_platform::application;
 
+use asr::{Command, Event};
+
 const BARS: usize = 26;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const PLACEHOLDER_DELAY: Duration = Duration::from_secs(1);
+
+enum HotkeyMessage {
+    ToggleRecording,
+    DebugReload,
+}
 
 struct Waveform {
     bars: [f32; BARS],
@@ -55,7 +58,6 @@ impl Waveform {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
-    #[allow(dead_code)]
     Loading,
     Idle,
     Recording,
@@ -72,28 +74,29 @@ struct Dictation {
     phase: Phase,
     mode: Mode,
     waveform: Waveform,
+    commands: mpsc::Sender<Command>,
+    status: String,
+    partial: String,
+    committed: String,
+    pending_start: bool,
 }
 
 impl Dictation {
+    fn begin_recording(&mut self) {
+        self.phase = Phase::Recording;
+        self.partial.clear();
+        let _ = self.commands.send(Command::Start);
+    }
+
     fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         match self.phase {
-            Phase::Idle => self.phase = Phase::Recording,
+            Phase::Loading => self.pending_start = true,
+            Phase::Idle => self.begin_recording(),
             Phase::Recording => {
                 self.phase = Phase::Transcribing;
-                cx.spawn(async move |dictation, cx| {
-                    cx.background_executor().timer(PLACEHOLDER_DELAY).await;
-                    dictation
-                        .update(cx, |dictation, cx| {
-                            if dictation.phase == Phase::Transcribing {
-                                dictation.phase = Phase::Idle;
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                })
-                .detach();
+                let _ = self.commands.send(Command::Stop);
             }
-            Phase::Loading | Phase::Transcribing => {}
+            Phase::Transcribing => {}
         }
         cx.notify();
     }
@@ -104,6 +107,44 @@ impl Dictation {
             Mode::Live => Mode::Record,
         };
         cx.notify();
+    }
+
+    fn handle_asr_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        match event {
+            Event::LoadingProgress(message) => self.status = message,
+            Event::Ready => {
+                if self.phase == Phase::Loading && self.pending_start {
+                    self.pending_start = false;
+                    self.begin_recording();
+                } else if self.phase == Phase::Loading {
+                    self.phase = Phase::Idle;
+                }
+            }
+            Event::Partial(text) => {
+                if self.phase == Phase::Recording {
+                    self.partial = text;
+                }
+            }
+            Event::Committed(text) => {
+                if self.phase == Phase::Transcribing {
+                    self.phase = Phase::Idle;
+                    self.committed = text;
+                    self.partial.clear();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_hotkey(&mut self, message: HotkeyMessage, cx: &mut Context<Self>) {
+        match message {
+            HotkeyMessage::ToggleRecording => self.toggle_recording(cx),
+            HotkeyMessage::DebugReload => {
+                if self.phase == Phase::Idle {
+                    let _ = self.commands.send(Command::ReloadForDebug);
+                }
+            }
+        }
     }
 }
 
@@ -126,7 +167,11 @@ impl Render for Dictation {
                     .gap(px(12.))
                     .text_size(px(11.))
                     .text_color(rgb(0x909090))
-                    .child(format!("{:?} (F9)", self.phase))
+                    .child(if self.phase == Phase::Loading || !self.status.is_empty() {
+                        format!("{:?} (F9): {}", self.phase, self.status)
+                    } else {
+                        format!("{:?} (F9)", self.phase)
+                    })
                     .child(
                         div()
                             .id("mode")
@@ -144,6 +189,20 @@ impl Render for Dictation {
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_mode(cx))),
                     ),
             )
+            .children((self.phase == Phase::Recording && !self.partial.is_empty()).then(|| {
+                div()
+                    .max_w(px(720.))
+                    .text_size(px(12.))
+                    .text_color(rgb(0xcccccc))
+                    .child(format!("partial: {}", self.partial))
+            }))
+            .children((!self.committed.is_empty()).then(|| {
+                div()
+                    .max_w(px(720.))
+                    .text_size(px(12.))
+                    .text_color(rgb(0x33cc66))
+                    .child(format!("committed: {}", self.committed))
+            }))
             .child(
                 div()
                     .flex()
@@ -157,7 +216,11 @@ impl Render for Dictation {
                             .flex_1()
                             .h(relative(level.clamp(0.02, 1.0)))
                             .rounded_sm()
-                            .bg(rgb(0x33cc66))
+                            .bg(if self.phase == Phase::Recording {
+                                rgb(0x33cc66)
+                            } else {
+                                rgb(0x404040)
+                            })
                     })),
             )
     }
@@ -165,22 +228,33 @@ impl Render for Dictation {
 
 fn main() {
     application().run(|cx: &mut App| {
-        let manager =
-            GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
-        manager
-            .register(HotKey::new(None, Code::F9))
-            .expect("failed to register F9");
+        let manager = GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
+        let toggle_key = HotKey::new(None, Code::F9);
+        let debug_key = HotKey::new(None, Code::F10);
+        manager.register(toggle_key).expect("failed to register F9");
+        manager.register(debug_key).expect("failed to register F10");
         std::mem::forget(manager);
 
-        let (hotkey_sender, hotkey_receiver) = mpsc::channel::<()>();
-        thread::spawn(move || loop {
-            match GlobalHotKeyEvent::receiver().try_recv() {
-                Ok(event) => {
-                    if event.state() == HotKeyState::Pressed {
-                        let _ = hotkey_sender.send(());
+        let (hotkey_sender, hotkey_receiver) = mpsc::channel::<HotkeyMessage>();
+        thread::spawn(move || {
+            loop {
+                match GlobalHotKeyEvent::receiver().try_recv() {
+                    Ok(event) => {
+                        if event.state() == HotKeyState::Pressed {
+                            let message = if event.id == toggle_key.id() {
+                                Some(HotkeyMessage::ToggleRecording)
+                            } else if event.id == debug_key.id() {
+                                Some(HotkeyMessage::DebugReload)
+                            } else {
+                                None
+                            };
+                            if let Some(message) = message {
+                                let _ = hotkey_sender.send(message);
+                            }
+                        }
                     }
+                    Err(_) => thread::sleep(HOTKEY_POLL_INTERVAL),
                 }
-                Err(_) => thread::sleep(HOTKEY_POLL_INTERVAL),
             }
         });
 
@@ -191,52 +265,84 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let (sender, receiver) = mpsc::channel();
-                audio::spawn(sender);
+                let (audio_sender, audio_receiver) = mpsc::channel::<Vec<f32>>();
+                audio::spawn(audio_sender);
+
+                let (event_sender, event_receiver) = mpsc::channel::<Event>();
+                let command_sender = asr::spawn_worker(event_sender);
+
                 let view = cx.new(|_| Dictation {
-                    phase: Phase::Idle,
+                    phase: Phase::Loading,
                     mode: Mode::Record,
                     waveform: Waveform {
                         bars: [0.0; BARS],
                         peak: 0.0,
                     },
+                    commands: command_sender,
+                    status: "fetching model".to_owned(),
+                    partial: String::new(),
+                    committed: String::new(),
+                    pending_start: false,
                 });
-                window.spawn(cx, {
-                    let view = view.clone();
-                    async move |cx| {
-                        let mut pending: Vec<f32> = Vec::new();
-                        loop {
-                            while let Ok(rms) = receiver.try_recv() {
-                                pending.push(rms);
-                            }
-                            while hotkey_receiver.try_recv().is_ok() {
+                window
+                    .spawn(cx, {
+                        let view = view.clone();
+                        async move |cx| {
+                            let mut pending_levels: Vec<f32> = Vec::new();
+                            let mut pending_chunks: Vec<Vec<f32>> = Vec::new();
+                            loop {
+                                while let Ok(chunk) = audio_receiver.try_recv() {
+                                    pending_levels.push(rms_level(&chunk));
+                                    pending_chunks.push(chunk);
+                                }
+                                while let Ok(event) = event_receiver.try_recv() {
+                                    cx.update(|_, cx| {
+                                        view.update(cx, |dictation, cx| {
+                                            dictation.handle_asr_event(event, cx)
+                                        });
+                                    })
+                                    .ok();
+                                }
+                                while let Ok(message) = hotkey_receiver.try_recv() {
+                                    cx.update(|_, cx| {
+                                        view.update(cx, |dictation, cx| {
+                                            dictation.handle_hotkey(message, cx)
+                                        });
+                                    })
+                                    .ok();
+                                }
                                 cx.update(|_, cx| {
                                     view.update(cx, |dictation, cx| {
-                                        dictation.toggle_recording(cx)
+                                        if dictation.phase == Phase::Recording {
+                                            dictation.waveform.extend(pending_levels.drain(..));
+                                            for chunk in pending_chunks.drain(..) {
+                                                let _ =
+                                                    dictation.commands.send(Command::Chunk(chunk));
+                                            }
+                                        } else {
+                                            pending_levels.clear();
+                                            pending_chunks.clear();
+                                        }
+                                        cx.notify();
                                     });
                                 })
                                 .ok();
+                                cx.background_executor().timer(POLL_INTERVAL).await;
                             }
-                            cx.update(|_, cx| {
-                                if view.read(cx).phase != Phase::Recording {
-                                    pending.clear();
-                                } else if !pending.is_empty() {
-                                    view.update(cx, |dictation, cx| {
-                                        dictation.waveform.extend(pending.drain(..));
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .ok();
-                            cx.background_executor().timer(POLL_INTERVAL).await;
                         }
-                    }
-                })
-                .detach();
+                    })
+                    .detach();
                 view
             },
         )
         .unwrap();
         cx.activate(true);
     });
+}
+
+fn rms_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
 }

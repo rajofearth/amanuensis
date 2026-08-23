@@ -6,5 +6,10 @@ edition = "2024"
 [dependencies]
 cpal = "0.15"
 global-hotkey = "0.8"
+hound = "3"
+hf-hub = { version = "1.0", features = ["blocking"] }
+sherpa-onnx = "=1.13.5"
+sherpa-onnx-sys = "=1.13.5"
+sysinfo = "0.39"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7", features = ["font-kit"] }
