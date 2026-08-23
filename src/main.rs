@@ -43,6 +43,10 @@ enum DownloadMessage {
     Finished(Result<(ModelKind, ModelKind), String>),
 }
 
+enum UiMessage {
+    OpenSettings,
+}
+
 struct Waveform {
     bars: [f32; BARS],
     peak: f32,
@@ -89,6 +93,7 @@ struct Dictation {
     waveform: Waveform,
     commands: mpsc::Sender<Command>,
     results: mpsc::Sender<PasteResult>,
+    ui: mpsc::Sender<UiMessage>,
     status: String,
     partial: String,
     committed: String,
@@ -251,6 +256,18 @@ impl Dictation {
         }
         cx.notify();
     }
+
+    fn open_settings(&self) {
+        let _ = self.ui.send(UiMessage::OpenSettings);
+    }
+
+    fn cancel_pending_start(&mut self, cx: &mut Context<Self>) {
+        if self.pending_start {
+            log!("app", "opening settings: cancelled queued start");
+            self.pending_start = false;
+            cx.notify();
+        }
+    }
 }
 
 impl Render for Dictation {
@@ -297,6 +314,22 @@ impl Render for Dictation {
                             })
                             .child(format!("{:?}", self.mode))
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_mode(cx))),
+                    )
+                    .children(
+                        (self.phase != Phase::Recording && self.phase != Phase::Transcribing).then(
+                            || {
+                                div()
+                                    .id("settings")
+                                    .cursor_pointer()
+                                    .rounded_sm()
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .bg(rgb(0x1c1c1c))
+                                    .text_color(rgb(0x909090))
+                                    .child("settings")
+                                    .on_click(cx.listener(|this, _, _, _| this.open_settings()))
+                            },
+                        ),
                     ),
             )
             .children(
@@ -361,10 +394,15 @@ struct OnboardingView {
 }
 
 impl OnboardingView {
-    fn new(device: (u32, usize), download: mpsc::Sender<DownloadMessage>) -> Self {
+    fn new(
+        device: (u32, usize),
+        download: mpsc::Sender<DownloadMessage>,
+        record_id: &'static str,
+        live_id: &'static str,
+    ) -> Self {
         Self {
-            record_id: "nemotron",
-            live_id: "nemotron",
+            record_id,
+            live_id,
             ram_gb: device.0,
             cores: device.1,
             cached: REGISTRY
@@ -647,43 +685,55 @@ impl Render for OnboardingView {
 
 #[derive(Clone)]
 enum Screen {
-    Onboarding(Entity<OnboardingView>),
-    Dictation(Entity<Dictation>),
+    Onboarding {
+        view: Entity<OnboardingView>,
+        from_hud: bool,
+    },
+    Dictation,
 }
 
 struct AppRoot {
     screen: Screen,
+    dictation: Option<Entity<Dictation>>,
+    commands: Option<mpsc::Sender<Command>>,
     events: mpsc::Sender<Event>,
     results: mpsc::Sender<PasteResult>,
+    downloads: mpsc::Sender<DownloadMessage>,
+    ui: mpsc::Sender<UiMessage>,
     pending_start: bool,
 }
 
 impl AppRoot {
     fn handle_asr_event(&mut self, event: Event, cx: &mut Context<Self>) {
-        if let Screen::Dictation(dictation) = self.screen.clone() {
+        if let Some(dictation) = self.dictation.clone() {
             dictation.update(cx, |dictation, cx| dictation.handle_asr_event(event, cx));
         }
     }
 
     fn handle_hotkey(&mut self, message: HotkeyMessage, cx: &mut Context<Self>) {
-        if let Screen::Dictation(dictation) = self.screen.clone() {
-            dictation.update(cx, |dictation, cx| dictation.handle_hotkey(message, cx));
-            return;
-        }
-        match message {
-            HotkeyMessage::ToggleRecording => {
-                self.pending_start = true;
-                log!("app", "F9 during onboarding: queued start after setup");
-                if let Screen::Onboarding(onboarding) = self.screen.clone() {
-                    onboarding.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+        match self.screen.clone() {
+            Screen::Dictation => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| dictation.handle_hotkey(message, cx));
                 }
             }
-            HotkeyMessage::DebugReload => log!("app", "F10 ignored during onboarding"),
+            Screen::Onboarding { view, from_hud } => match message {
+                HotkeyMessage::ToggleRecording => {
+                    if from_hud {
+                        log!("app", "F9 ignored while settings open");
+                    } else {
+                        self.pending_start = true;
+                        log!("app", "F9 during onboarding: queued start after setup");
+                        view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                    }
+                }
+                HotkeyMessage::DebugReload => log!("app", "F10 ignored during onboarding"),
+            },
         }
     }
 
     fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
-        if let Screen::Dictation(dictation) = self.screen.clone() {
+        if let Some(dictation) = self.dictation.clone() {
             dictation.update(cx, |dictation, cx| {
                 dictation.handle_paste_result(result, cx)
             });
@@ -696,7 +746,8 @@ impl AppRoot {
         chunks: &mut Vec<Vec<f32>>,
         cx: &mut Context<Self>,
     ) {
-        if let Screen::Dictation(dictation) = self.screen.clone() {
+        if let (Screen::Dictation, Some(dictation)) = (self.screen.clone(), self.dictation.clone())
+        {
             let drained_levels = std::mem::take(levels);
             let drained_chunks = std::mem::take(chunks);
             dictation.update(cx, |dictation, cx| {
@@ -714,19 +765,50 @@ impl AppRoot {
         }
     }
 
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.screen, Screen::Dictation) {
+            return;
+        }
+        if let Some(dictation) = self.dictation.clone() {
+            dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
+        }
+        let config = config::load();
+        let default_id = ModelKind::Nemotron.spec().id;
+        let resolve =
+            |id: &str| -> &'static str { spec_by_id(id).map_or(default_id, |spec| spec.id) };
+        let record_id = config
+            .as_ref()
+            .map_or(default_id, |config| resolve(&config.record_model));
+        let live_id = config
+            .as_ref()
+            .map_or(default_id, |config| resolve(&config.live_model));
+        log!(
+            "app",
+            "opening settings from HUD: record={record_id} live={live_id}"
+        );
+        let device = detect_device();
+        let view =
+            cx.new(|_| OnboardingView::new(device, self.downloads.clone(), record_id, live_id));
+        self.screen = Screen::Onboarding {
+            view,
+            from_hud: true,
+        };
+        cx.notify();
+    }
+
     fn handle_download_message(&mut self, message: DownloadMessage, cx: &mut Context<Self>) {
         match message {
             DownloadMessage::Progress(text) => {
-                if let Screen::Onboarding(onboarding) = self.screen.clone() {
-                    onboarding.update(cx, |onboarding, cx| onboarding.set_status(text, cx));
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| onboarding.set_status(text, cx));
                 }
             }
             DownloadMessage::Finished(Ok((record, live))) => {
                 self.finish_onboarding(record, live, cx)
             }
             DownloadMessage::Finished(Err(error)) => {
-                if let Screen::Onboarding(onboarding) = self.screen.clone() {
-                    onboarding.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
                 }
             }
         }
@@ -746,22 +828,50 @@ impl AppRoot {
             ),
             Err(error) => log!("app", "config save FAILED: {error}"),
         }
+        if matches!(self.screen, Screen::Onboarding { from_hud: true, .. }) {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::SetModels { record, live });
+                    log!(
+                        "app",
+                        "SetModels sent to worker: record={} live={}",
+                        record.spec().id,
+                        live.spec().id
+                    );
+                }
+                None => log!("app", "ERROR: no worker channel for SetModels"),
+            }
+            self.screen = Screen::Dictation;
+            cx.notify();
+            return;
+        }
         let selection = ModelSelection { record, live };
         let commands = asr::spawn_worker(self.events.clone(), selection);
         log!("app", "worker spawned with selection {selection:?}");
         let pending_start = std::mem::replace(&mut self.pending_start, false);
-        self.screen = Screen::Dictation(
-            cx.new(|_| build_dictation(commands, self.results.clone(), pending_start)),
-        );
+        let dictation = cx.new(|_| {
+            build_dictation(
+                commands.clone(),
+                self.results.clone(),
+                self.ui.clone(),
+                pending_start,
+            )
+        });
+        self.dictation = Some(dictation);
+        self.commands = Some(commands);
+        self.screen = Screen::Dictation;
         cx.notify();
     }
 }
 
 impl Render for AppRoot {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.screen {
-            Screen::Dictation(dictation) => div().size_full().child(dictation.clone()),
-            Screen::Onboarding(onboarding) => div().size_full().child(onboarding.clone()),
+        match self.screen.clone() {
+            Screen::Onboarding { view, .. } => div().size_full().child(view),
+            Screen::Dictation => match self.dictation.clone() {
+                Some(dictation) => div().size_full().child(dictation),
+                None => div().size_full(),
+            },
         }
     }
 }
@@ -769,6 +879,7 @@ impl Render for AppRoot {
 fn build_dictation(
     commands: mpsc::Sender<Command>,
     results: mpsc::Sender<PasteResult>,
+    ui: mpsc::Sender<UiMessage>,
     pending_start: bool,
 ) -> Dictation {
     Dictation {
@@ -780,6 +891,7 @@ fn build_dictation(
         },
         commands,
         results,
+        ui,
         status: "fetching model".to_owned(),
         partial: String::new(),
         committed: String::new(),
@@ -859,11 +971,12 @@ fn main() {
                 let (event_sender, event_receiver) = mpsc::channel::<Event>();
                 let (paste_sender, paste_receiver) = mpsc::channel::<PasteResult>();
                 let (download_sender, download_receiver) = mpsc::channel::<DownloadMessage>();
+                let (ui_sender, ui_receiver) = mpsc::channel::<UiMessage>();
 
                 let loaded_config = config::load();
                 let device = detect_device();
 
-                let screen = match &loaded_config {
+                let (dictation, commands) = match &loaded_config {
                     Some(config) => {
                         let selection = selection_from_config(config);
                         log!(
@@ -873,9 +986,15 @@ fn main() {
                             config.live_model
                         );
                         let commands = asr::spawn_worker(event_sender.clone(), selection);
-                        Screen::Dictation(
-                            cx.new(|_| build_dictation(commands, paste_sender.clone(), false)),
-                        )
+                        let dictation = cx.new(|_| {
+                            build_dictation(
+                                commands.clone(),
+                                paste_sender.clone(),
+                                ui_sender.clone(),
+                                false,
+                            )
+                        });
+                        (Some(dictation), Some(commands))
                     }
                     None => {
                         log!(
@@ -884,14 +1003,34 @@ fn main() {
                             device.0,
                             device.1
                         );
-                        Screen::Onboarding(cx.new(|_| OnboardingView::new(device, download_sender)))
+                        (None, None)
+                    }
+                };
+
+                let screen = if dictation.is_some() {
+                    Screen::Dictation
+                } else {
+                    Screen::Onboarding {
+                        view: cx.new(|_| {
+                            OnboardingView::new(
+                                device,
+                                download_sender.clone(),
+                                "nemotron",
+                                "nemotron",
+                            )
+                        }),
+                        from_hud: false,
                     }
                 };
 
                 let app = cx.new(|_| AppRoot {
                     screen,
+                    dictation,
+                    commands,
                     events: event_sender,
                     results: paste_sender,
+                    downloads: download_sender,
+                    ui: ui_sender,
                     pending_start: false,
                 });
 
@@ -930,6 +1069,14 @@ fn main() {
                                     cx.update(|_, cx| {
                                         app.update(cx, |app, cx| {
                                             app.handle_download_message(message, cx)
+                                        });
+                                    })
+                                    .ok();
+                                }
+                                while let Ok(message) = ui_receiver.try_recv() {
+                                    cx.update(|_, cx| {
+                                        app.update(cx, |app, cx| match message {
+                                            UiMessage::OpenSettings => app.open_settings(cx),
                                         });
                                     })
                                     .ok();

@@ -20,9 +20,13 @@ pub enum Command {
     Shutdown,
     ReloadForDebug,
     SwitchMode(Mode),
+    SetModels {
+        record: ModelKind,
+        live: ModelKind,
+    },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
     pub record: ModelKind,
     pub live: ModelKind,
@@ -56,13 +60,9 @@ pub fn spawn_worker(events: Sender<Event>, selection: ModelSelection) -> Sender<
     commands
 }
 
-fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelection) {
-    let kind_for = |mode: Mode| match mode {
-        Mode::Record => selection.record,
-        Mode::Live => selection.live,
-    };
+fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelSelection) {
     let mut mode = Mode::Record;
-    let Some(paths) = fetch_paths(kind_for(mode), &events) else {
+    let Some(paths) = fetch_paths(kind_for(selection, mode), &events) else {
         return;
     };
 
@@ -202,7 +202,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                 }
             }
             Ok(Command::SwitchMode(target)) => {
-                if kind_for(target) == kind_for(mode) {
+                if kind_for(selection, target) == kind_for(selection, mode) {
                     log!(
                         "asr",
                         "switch to {target:?}: same underlying model, keeping recognizer"
@@ -211,54 +211,141 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                     let _ = events.send(Event::ModelReady(mode));
                     continue;
                 }
-                if active {
-                    active = false;
-                    let text = backend.finalize();
-                    let _ = events.send(Event::Committed {
-                        text,
-                        duration_secs: session_samples as f32 / SESSION_SAMPLE_RATE as f32,
-                    });
-                }
+                let target_kind = kind_for(selection, target);
                 let cached = match target {
                     Mode::Record => &mut record_paths,
                     Mode::Live => &mut live_paths,
                 };
-                let new_paths = match cached.take() {
-                    Some(paths) => Some(paths),
-                    None => fetch_paths(kind_for(target), &events),
-                };
-                let Some(new_paths) = new_paths else {
-                    continue;
-                };
-                let _ = events.send(Event::LoadingProgress(format!(
-                    "loading {:?} recognizer",
-                    target
-                )));
-                let load_started = Instant::now();
-                let Some(new_backend) = load_backend(target, &new_paths) else {
+                match load_and_swap(
+                    target,
+                    target_kind,
+                    &mut active,
+                    &mut backend,
+                    &mut last_partial,
+                    cached,
+                    session_samples,
+                    &events,
+                ) {
+                    SwapOutcome::Swapped => mode = target,
+                    SwapOutcome::FetchFailed => {}
+                    SwapOutcome::Fatal => return,
+                }
+            }
+            Ok(Command::SetModels { record, live }) => {
+                if record == selection.record && live == selection.live {
                     log!(
                         "asr",
-                        "ERROR: switch to {target:?} failed, create returned None"
+                        "set models: already {record:?}/{live:?}, nothing to do"
                     );
-                    return;
+                    continue;
+                }
+                if record != selection.record {
+                    log!(
+                        "asr",
+                        "set models: record {:?} -> {:?}",
+                        selection.record,
+                        record
+                    );
+                    record_paths = None;
+                }
+                if live != selection.live {
+                    log!("asr", "set models: live {:?} -> {:?}", selection.live, live);
+                    live_paths = None;
+                }
+                let active_kind_changed = match mode {
+                    Mode::Record => record != selection.record,
+                    Mode::Live => live != selection.live,
                 };
-                let unload_started = Instant::now();
-                drop(std::mem::replace(&mut backend, new_backend));
-                log!(
-                    "asr",
-                    "switch {mode:?} -> {target:?}: old unload {:.2}s, new load {:.2}s, resident {:.0} MiB",
-                    unload_started.elapsed().as_secs_f64(),
-                    load_started.elapsed().as_secs_f64(),
-                    resident_mib()
-                );
-                mode = target;
-                last_partial.clear();
-                *cached = Some(new_paths);
-                let _ = events.send(Event::ModelReady(mode));
+                selection = ModelSelection { record, live };
+                if !active_kind_changed {
+                    continue;
+                }
+                let new_kind = kind_for(selection, mode);
+                let cached = match mode {
+                    Mode::Record => &mut record_paths,
+                    Mode::Live => &mut live_paths,
+                };
+                match load_and_swap(
+                    mode,
+                    new_kind,
+                    &mut active,
+                    &mut backend,
+                    &mut last_partial,
+                    cached,
+                    session_samples,
+                    &events,
+                ) {
+                    SwapOutcome::Swapped | SwapOutcome::FetchFailed => {}
+                    SwapOutcome::Fatal => return,
+                }
             }
             Ok(Command::Shutdown) | Err(_) => break,
         }
     }
+}
+
+fn kind_for(selection: ModelSelection, mode: Mode) -> ModelKind {
+    match mode {
+        Mode::Record => selection.record,
+        Mode::Live => selection.live,
+    }
+}
+
+enum SwapOutcome {
+    Swapped,
+    FetchFailed,
+    Fatal,
+}
+
+fn load_and_swap(
+    target: Mode,
+    kind: ModelKind,
+    active: &mut bool,
+    backend: &mut Box<dyn AsrBackend>,
+    last_partial: &mut String,
+    cached: &mut Option<ModelPaths>,
+    session_samples: usize,
+    events: &Sender<Event>,
+) -> SwapOutcome {
+    if *active {
+        *active = false;
+        let text = backend.finalize();
+        let _ = events.send(Event::Committed {
+            text,
+            duration_secs: session_samples as f32 / SESSION_SAMPLE_RATE as f32,
+        });
+    }
+    let new_paths = match cached.take() {
+        Some(paths) => Some(paths),
+        None => fetch_paths(kind, events),
+    };
+    let Some(new_paths) = new_paths else {
+        return SwapOutcome::FetchFailed;
+    };
+    let _ = events.send(Event::LoadingProgress(format!(
+        "loading {kind:?} recognizer"
+    )));
+    let load_started = Instant::now();
+    let Some(new_backend) = load_backend(target, &new_paths) else {
+        log!(
+            "asr",
+            "ERROR: swap to {kind:?} failed, create returned None"
+        );
+        return SwapOutcome::Fatal;
+    };
+    let unload_started = Instant::now();
+    drop(std::mem::replace(backend, new_backend));
+    log!(
+        "asr",
+        "swap to {kind:?} for {target:?}: old unload {:.2}s, new load {:.2}s, resident {:.0} MiB",
+        unload_started.elapsed().as_secs_f64(),
+        load_started.elapsed().as_secs_f64(),
+        resident_mib()
+    );
+    last_partial.clear();
+    *cached = Some(new_paths);
+    let _ = events.send(Event::ModelReady(target));
+    SwapOutcome::Swapped
 }
 
 fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
