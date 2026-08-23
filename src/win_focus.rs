@@ -28,7 +28,11 @@ pub fn capture_foreground() -> Option<FocusTarget> {
     if hwnd == 0 {
         return None;
     }
-    let mut target = FocusTarget { hwnd, title: [0; 128], title_len: 0 };
+    let mut target = FocusTarget {
+        hwnd,
+        title: [0; 128],
+        title_len: 0,
+    };
     let written = unsafe { GetWindowTextW(hwnd as HWND, target.title.as_mut_ptr(), 128) };
     target.title_len = written.max(0) as usize;
     Some(target)

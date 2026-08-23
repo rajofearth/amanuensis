@@ -22,7 +22,10 @@ fn run(sender: Sender<Vec<f32>>) -> Result<(), Box<dyn Error>> {
     let device = host
         .default_input_device()
         .ok_or("no default input device")?;
-    let device_name = device.name().map(|n| n.to_string()).unwrap_or_else(|_| "?".into());
+    let device_name = device
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "?".into());
     let supported = device.default_input_config()?;
     log!(
         "audio",
@@ -221,7 +224,11 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * FREQ * i as f32 / INPUT_RATE as f32).sin())
             .collect();
         let out = Resampler::collect(INPUT_RATE, &input);
-        assert!((out.len() as i64 - 16_000).abs() < 100, "got {} samples", out.len());
+        assert!(
+            (out.len() as i64 - 16_000).abs() < 100,
+            "got {} samples",
+            out.len()
+        );
         let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
         assert!(rms > 0.6, "sine energy lost, rms {rms}");
     }

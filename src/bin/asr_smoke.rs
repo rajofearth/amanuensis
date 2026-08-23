@@ -112,6 +112,11 @@ fn make_backend(kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBacken
 }
 
 fn feed_chunk_samples(kind: ModelKind) -> usize {
+    if let Ok(value) = std::env::var("ASR_SMOKE_FEED_SAMPLES") {
+        return value
+            .parse()
+            .expect("ASR_SMOKE_FEED_SAMPLES must be an integer");
+    }
     match kind {
         ModelKind::Nemotron => CHUNK_SAMPLES,
         ModelKind::Unified => CHUNK_SAMPLES * 8,
@@ -119,13 +124,62 @@ fn feed_chunk_samples(kind: ModelKind) -> usize {
 }
 
 fn run_transcription_check(kind: ModelKind, paths: &ModelPaths, wav_path: &Path, expected: &str) {
-    let (samples, native_rate) = read_wav_mono(wav_path);
-    let samples = resample_to_16k(&samples, native_rate);
-    println!(
-        "wav decoded: {} mono samples @ {native_rate} Hz -> {} ms at {SAMPLE_RATE} Hz",
-        samples.len(),
-        samples.len() * 1000 / SAMPLE_RATE as usize
-    );
+    let raw_mode = std::env::var("ASR_SMOKE_RAW").is_ok();
+    let mut samples = match std::env::var("ASR_SMOKE_RAW") {
+        Ok(path) => {
+            let bytes = std::fs::read(&path).expect("read ASR_SMOKE_RAW file");
+            println!(
+                "raw input: {} ({} samples @ 16000 Hz)",
+                path,
+                bytes.len() / 4
+            );
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<f32>>()
+        }
+        Err(_) => {
+            let (loaded, native_rate) = read_wav_mono(wav_path);
+            if std::env::var("ASR_SMOKE_NN_RESAMPLE").is_ok() {
+                nearest_resample_to_16k(&loaded, native_rate)
+            } else {
+                resample_to_16k(&loaded, native_rate)
+            }
+        }
+    };
+    if let Ok(value) = std::env::var("ASR_SMOKE_GAIN") {
+        let gain: f32 = value.parse().expect("ASR_SMOKE_GAIN must be a number");
+        for sample in samples.iter_mut() {
+            *sample *= gain;
+        }
+    }
+    if let Ok(secs) = std::env::var("ASR_SMOKE_PAD_LEAD_SECS") {
+        let pad: f64 = secs
+            .parse()
+            .expect("ASR_SMOKE_PAD_LEAD_SECS must be a number");
+        let mut padded = vec![0.0_f32; (pad * SAMPLE_RATE as f64) as usize];
+        padded.extend_from_slice(&samples);
+        samples = padded;
+    }
+    if let Ok(secs) = std::env::var("ASR_SMOKE_TRUNCATE_SECS") {
+        let limit: f64 = secs
+            .parse()
+            .expect("ASR_SMOKE_TRUNCATE_SECS must be a number");
+        samples.truncate((limit * SAMPLE_RATE as f64) as usize);
+    }
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    println!("input level: peak {peak:.4} rms {rms:.4}");
+    if !raw_mode {
+        println!(
+            "wav decoded: {} mono samples -> {} ms at {SAMPLE_RATE} Hz",
+            samples.len(),
+            samples.len() * 1000 / SAMPLE_RATE as usize
+        );
+    }
 
     print!("loading {:?} backend ... ", kind);
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
@@ -161,6 +215,10 @@ fn run_transcription_check(kind: ModelKind, paths: &ModelPaths, wav_path: &Path,
     );
     println!("transcript: {transcript}");
 
+    if raw_mode {
+        println!("RAW MODE ({kind:?}): transcript above — inspect manually");
+        return;
+    }
     println!("expected:   {expected}");
     let got = normalize(&transcript);
     let want = normalize(&expected);
@@ -384,6 +442,17 @@ fn read_wav_mono(path: &Path) -> (Vec<f32>, u32) {
             .collect();
     }
     (samples, spec.sample_rate)
+}
+
+fn nearest_resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
+    if from_rate == SAMPLE_RATE as u32 {
+        return samples.to_vec();
+    }
+    let step = from_rate as f64 / SAMPLE_RATE as f64;
+    let out_len = ((samples.len() as f64 - 1.0) / step).floor() as usize;
+    (0..out_len)
+        .map(|index| samples[(index as f64 * step) as usize])
+        .collect()
 }
 
 fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {

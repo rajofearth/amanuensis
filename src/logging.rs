@@ -10,10 +10,15 @@ static FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 pub fn init() {
     let _ = START.set(Instant::now());
-    let path = std::env::current_dir().unwrap_or_default().join("dictation.log");
+    let path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("dictation.log");
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = FILE.set(Mutex::new(file));
-        log("log", format!("session start, logging to {}", path.display()));
+        log(
+            "log",
+            format!("session start, logging to {}", path.display()),
+        );
     } else {
         eprintln!("[log] failed to open dictation.log; stderr only");
     }

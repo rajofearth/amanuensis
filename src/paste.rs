@@ -1,4 +1,8 @@
-use std::{sync::LazyLock, thread, time::{Duration, Instant}};
+use std::{
+    sync::LazyLock,
+    thread,
+    time::{Duration, Instant},
+};
 
 use arboard::Clipboard;
 use enigo::{
@@ -25,8 +29,10 @@ static REPLACE_RULES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 static FILLER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(^|[\s,])(uh+|u+m+|uhm|umm+|uhh+|ah+|eh+|hmm+|hm+|m+hm+|mm-?hmm?|mm+)($|[\s,.!?])")
-        .expect("valid filler pattern")
+    Regex::new(
+        r"(?i)(^|[\s,])(uh+|u+m+|uhm|umm+|uhh+|ah+|eh+|hmm+|hm+|m+hm+|mm-?hmm?|mm+)($|[\s,.!?])",
+    )
+    .expect("valid filler pattern")
 });
 
 static MULTI_SPACE: LazyLock<Regex> =
@@ -52,9 +58,7 @@ pub fn clean_transcript(raw: &str) -> String {
 fn strip_fillers(t: &str) -> String {
     let mut current = t.to_owned();
     loop {
-        let next = FILLER_RE
-            .replace_all(&current, "${1} ${2}")
-            .into_owned();
+        let next = FILLER_RE.replace_all(&current, "${1} ${2}").into_owned();
         if next == current {
             return next;
         }
@@ -65,7 +69,10 @@ fn strip_fillers(t: &str) -> String {
 pub fn paste_text(text: &str, focus: Option<FocusTarget>) -> Result<usize, String> {
     let started = Instant::now();
     let chars = text.chars().count();
-    log!("paste", "begin: {chars} chars (left on clipboard): {text:?}");
+    log!(
+        "paste",
+        "begin: {chars} chars (left on clipboard): {text:?}"
+    );
     let error = |e: arboard::Error| e.to_string();
     let mut clipboard = Clipboard::new().map_err(|e| {
         let message = error(e);
@@ -81,7 +88,10 @@ pub fn paste_text(text: &str, focus: Option<FocusTarget>) -> Result<usize, Strin
 
     if let Some(target) = &focus {
         if let Err(error) = win_focus::restore_focus(target) {
-            log!("paste", "WARN focus restore failed, keys may land on wrong window: {error}");
+            log!(
+                "paste",
+                "WARN focus restore failed, keys may land on wrong window: {error}"
+            );
         }
         thread::sleep(PASTE_SETTLE);
     } else {

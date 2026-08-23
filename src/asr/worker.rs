@@ -68,7 +68,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
 
     let _ = events.send(Event::LoadingProgress("loading recognizer".to_owned()));
     let started = Instant::now();
-    let Some(mut backend) = load_backend(mode, &paths) else {
+    let Some(mut backend) = load_backend(kind_for(selection, mode), &paths) else {
         log!("asr", "ERROR: OnlineRecognizer::create returned None");
         let _ = events.send(Event::LoadingProgress("load failed".to_owned()));
         return;
@@ -95,6 +95,11 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
     let mut sum_sq: f64 = 0.0;
     let mut peak: f32 = 0.0;
     let mut last_partial = String::new();
+    let mut dump_samples: Vec<f32> = Vec::new();
+    let dump_path = std::env::var_os("ASR_DUMP_AUDIO").map(std::path::PathBuf::from);
+    if let Some(path) = &dump_path {
+        log!("asr", "audio dump enabled -> {}", path.display());
+    }
     loop {
         match commands.recv() {
             Ok(Command::Start) => {
@@ -117,6 +122,9 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                 decode_nanos += started.elapsed().as_nanos();
                 session_feeds += 1;
                 session_samples += samples.len();
+                if dump_path.is_some() {
+                    dump_samples.extend_from_slice(&samples);
+                }
                 for &sample in &samples {
                     sum_sq += (sample as f64) * (sample as f64);
                     if sample.abs() > peak {
@@ -159,6 +167,24 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                         },
                         finalize_started.elapsed().as_secs_f64()
                     );
+                    if let Some(path) = &dump_path {
+                        let bytes: Vec<u8> = dump_samples
+                            .iter()
+                            .flat_map(|sample| sample.to_le_bytes())
+                            .collect();
+                        match std::fs::write(path, &bytes) {
+                            Ok(()) => log!(
+                                "asr",
+                                "audio dump written: {} ({} samples, f32le 16k)",
+                                path.display(),
+                                dump_samples.len()
+                            ),
+                            Err(error) => {
+                                log!("asr", "ERROR: audio dump write failed: {error}");
+                            }
+                        }
+                        dump_samples.clear();
+                    }
                     let _ = events.send(Event::Committed {
                         text,
                         duration_secs,
@@ -183,7 +209,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                     return;
                 };
                 let reload_started = Instant::now();
-                match load_backend(mode, &paths) {
+                match load_backend(kind_for(selection, mode), &paths) {
                     Some(reloaded) => {
                         backend = reloaded;
                         *cached = Some(paths);
@@ -326,7 +352,7 @@ fn load_and_swap(
         "loading {kind:?} recognizer"
     )));
     let load_started = Instant::now();
-    let Some(new_backend) = load_backend(target, &new_paths) else {
+    let Some(new_backend) = load_backend(kind, &new_paths) else {
         log!(
             "asr",
             "ERROR: swap to {kind:?} failed, create returned None"
@@ -362,10 +388,10 @@ fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
     }
 }
 
-fn load_backend(mode: Mode, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
-    match mode {
-        Mode::Record => UnifiedBackend::load(paths).map(|backend| Box::new(backend) as _),
-        Mode::Live => NemotronBackend::load(paths).map(|backend| Box::new(backend) as _),
+fn load_backend(kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
+    match kind {
+        ModelKind::Unified => UnifiedBackend::load(paths).map(|backend| Box::new(backend) as _),
+        ModelKind::Nemotron => NemotronBackend::load(paths).map(|backend| Box::new(backend) as _),
     }
 }
 
