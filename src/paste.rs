@@ -1,6 +1,6 @@
 use std::{sync::LazyLock, thread, time::{Duration, Instant}};
 
-use arboard::{Clipboard, ImageData};
+use arboard::Clipboard;
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings,
@@ -11,7 +11,6 @@ use crate::log;
 use crate::win_focus::{self, FocusTarget};
 
 pub const MIN_AUDIO_SECS: f32 = 0.3;
-const RESTORE_DELAY: Duration = Duration::from_millis(500);
 const PASTE_SETTLE: Duration = Duration::from_millis(50);
 const REPLACEMENTS: &str = "uh:;um:;uhm:;umm:;uhh:;ah:;eh:;hmm:;hm:;mm:;mhm:;mm-hmm:;mmhmm:";
 
@@ -63,35 +62,16 @@ fn strip_fillers(t: &str) -> String {
     }
 }
 
-enum SavedClip {
-    Text(String),
-    Image(ImageData<'static>),
-}
-
 pub fn paste_text(text: &str, focus: Option<FocusTarget>) -> Result<usize, String> {
     let started = Instant::now();
     let chars = text.chars().count();
-    log!("paste", "begin: {chars} chars: {text:?}");
+    log!("paste", "begin: {chars} chars (left on clipboard): {text:?}");
     let error = |e: arboard::Error| e.to_string();
     let mut clipboard = Clipboard::new().map_err(|e| {
         let message = error(e);
         log!("paste", "clipboard open failed: {message}");
         message
     })?;
-    let saved = clipboard
-        .get_image()
-        .ok()
-        .map(SavedClip::Image)
-        .or_else(|| clipboard.get_text().ok().map(SavedClip::Text));
-    log!(
-        "paste",
-        "saved previous clipboard: {}",
-        match &saved {
-            Some(SavedClip::Image(_)) => "image".into(),
-            Some(SavedClip::Text(previous)) => format!("text ({} chars)", previous.chars().count()),
-            None => "empty".into(),
-        }
-    );
     clipboard.set_text(text).map_err(|e| {
         let message = error(e);
         log!("paste", "set_text failed: {message}");
@@ -129,17 +109,6 @@ pub fn paste_text(text: &str, focus: Option<FocusTarget>) -> Result<usize, Strin
         message
     })?;
     log!("paste", "Ctrl+V sent");
-
-    thread::sleep(RESTORE_DELAY);
-    let restored = match saved {
-        Some(SavedClip::Image(image)) => clipboard.set_image(image).map(|_| "image").map_err(error),
-        Some(SavedClip::Text(previous)) => clipboard.set_text(previous).map(|_| "text").map_err(error),
-        None => Ok("empty"),
-    };
-    match restored {
-        Ok(kind) => log!("paste", "clipboard restored to {kind}"),
-        Err(e) => log!("paste", "WARN clipboard restore failed: {e}"),
-    }
     log!("paste", "done in {:.0}ms", started.elapsed().as_millis());
     Ok(chars)
 }

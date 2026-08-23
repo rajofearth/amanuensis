@@ -2,14 +2,14 @@ use std::fmt;
 
 use windows_sys::Win32::{
     Foundation::HWND,
-    System::Threading::{AttachThreadInput, GetCurrentThreadId},
+    System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId},
     UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
         SetForegroundWindow,
     },
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FocusTarget {
     hwnd: isize,
     title: [u16; 128],
@@ -32,6 +32,13 @@ pub fn capture_foreground() -> Option<FocusTarget> {
     let written = unsafe { GetWindowTextW(hwnd as HWND, target.title.as_mut_ptr(), 128) };
     target.title_len = written.max(0) as usize;
     Some(target)
+}
+
+/// True when the target window belongs to this process (i.e. our own HUD).
+pub fn is_own_window(target: &FocusTarget) -> bool {
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(target.hwnd as HWND, &mut pid) };
+    pid != 0 && pid == unsafe { GetCurrentProcessId() }
 }
 
 /// Bring the captured window back to the foreground so synthesized keys land there.

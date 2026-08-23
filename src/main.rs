@@ -173,7 +173,24 @@ impl Dictation {
                     } else {
                         self.committed = cleaned.clone();
                         let results = self.results.clone();
-                        let focus = self.focus;
+                        // Follow the user's live focus: if they switched apps during
+                        // recording, paste where they are now. Only rescue the focus
+                        // when our own HUD is in the way.
+                        let initial = self.focus;
+                        let current = win_focus::capture_foreground();
+                        let focus = match &current {
+                            Some(window) if win_focus::is_own_window(window) => {
+                                log!("app", "focus is on our HUD; restoring {initial:?}");
+                                initial
+                            }
+                            Some(window) => {
+                                if initial.as_ref() != Some(window) {
+                                    log!("app", "user moved to {window} since record start; pasting there");
+                                }
+                                None
+                            }
+                            None => initial,
+                        };
                         thread::spawn(move || {
                             let result = match paste_text(&cleaned, focus) {
                                 Ok(chars) => PasteResult::Pasted(chars),
