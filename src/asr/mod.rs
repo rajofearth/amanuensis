@@ -3,10 +3,13 @@ mod nemotron;
 mod unified;
 pub mod worker;
 
-pub use model::{ModelKind, ModelPaths, REPO_OWNER};
+pub use model::{
+    ModelKind, ModelPaths, ModelSpec, REGISTRY, REPO_OWNER, ensure_model, ensure_model_by_spec,
+    is_model_cached, kind_by_id, spec_by_id,
+};
 pub use nemotron::NemotronBackend;
 pub use unified::UnifiedBackend;
-pub use worker::{Command, Event, spawn_worker};
+pub use worker::{Command, Event, ModelSelection, spawn_worker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {

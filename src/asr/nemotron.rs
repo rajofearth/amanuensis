@@ -4,8 +4,8 @@ use sherpa_onnx::{
     OnlineRecognizer, OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
-use super::{AsrBackend, threads};
 use super::model::ModelPaths;
+use super::{AsrBackend, threads};
 
 const SAMPLE_RATE: i32 = 16000;
 const FEATURE_DIM: i32 = 128;

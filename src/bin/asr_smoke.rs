@@ -31,7 +31,9 @@ fn main() {
                 if let Some(value) = other.strip_prefix("--hold-seconds=") {
                     hold_seconds = value.parse().expect("--hold-seconds must be an integer");
                 } else {
-                    panic!("unknown argument '{other}' (expected nemotron|unified|--reload-metrics|--hold-test|--hold-seconds=N)");
+                    panic!(
+                        "unknown argument '{other}' (expected nemotron|unified|--reload-metrics|--hold-test|--hold-seconds=N)"
+                    );
                 }
             }
         }
@@ -56,7 +58,12 @@ fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
     let repo = client.model(REPO_OWNER, kind.repo_name());
 
     let mut model_paths: Vec<PathBuf> = Vec::with_capacity(4);
-    for file in ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"] {
+    for file in [
+        "encoder.int8.onnx",
+        "decoder.int8.onnx",
+        "joiner.int8.onnx",
+        "tokens.txt",
+    ] {
         print!("ensuring {file} ... ");
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         let path = repo

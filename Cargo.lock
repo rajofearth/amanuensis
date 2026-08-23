@@ -5317,6 +5317,8 @@ dependencies = [
  "hf-hub",
  "hound",
  "regex",
+ "serde",
+ "serde_json",
  "sherpa-onnx",
  "sherpa-onnx-sys",
  "sysinfo 0.39.6",

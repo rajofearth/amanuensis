@@ -6,10 +6,10 @@ use std::{
 
 use crate::log;
 
-use super::{AsrBackend, Mode, ModelKind, ModelPaths};
 use super::model;
 use super::nemotron::NemotronBackend;
 use super::unified::UnifiedBackend;
+use super::{AsrBackend, Mode, ModelKind, ModelPaths};
 
 #[derive(Debug)]
 pub enum Command {
@@ -22,6 +22,21 @@ pub enum Command {
     SwitchMode(Mode),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ModelSelection {
+    pub record: ModelKind,
+    pub live: ModelKind,
+}
+
+impl Default for ModelSelection {
+    fn default() -> Self {
+        Self {
+            record: ModelKind::Nemotron,
+            live: ModelKind::Nemotron,
+        }
+    }
+}
+
 pub enum Event {
     LoadingProgress(String),
     Ready,
@@ -32,18 +47,22 @@ pub enum Event {
 
 const SESSION_SAMPLE_RATE: usize = 16_000;
 
-pub fn spawn_worker(events: Sender<Event>) -> Sender<Command> {
+pub fn spawn_worker(events: Sender<Event>, selection: ModelSelection) -> Sender<Command> {
     let (commands, receiver) = channel::<Command>();
     thread::Builder::new()
         .name("asr-worker".to_owned())
-        .spawn(move || run(receiver, events))
+        .spawn(move || run(receiver, events, selection))
         .expect("failed to spawn asr worker thread");
     commands
 }
 
-fn run(commands: Receiver<Command>, events: Sender<Event>) {
+fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelection) {
+    let kind_for = |mode: Mode| match mode {
+        Mode::Record => selection.record,
+        Mode::Live => selection.live,
+    };
     let mut mode = Mode::Record;
-    let Some(paths) = fetch_paths(ModelKind::from(mode), &events) else {
+    let Some(paths) = fetch_paths(kind_for(mode), &events) else {
         return;
     };
 
@@ -133,10 +152,17 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                         rms,
                         peak,
                         decode_secs,
-                        if audio_secs > 0.0 { decode_secs / audio_secs } else { 0.0 },
+                        if audio_secs > 0.0 {
+                            decode_secs / audio_secs
+                        } else {
+                            0.0
+                        },
                         finalize_started.elapsed().as_secs_f64()
                     );
-                    let _ = events.send(Event::Committed { text, duration_secs });
+                    let _ = events.send(Event::Committed {
+                        text,
+                        duration_secs,
+                    });
                 }
             }
             Ok(Command::ReloadForDebug) => {
@@ -176,8 +202,11 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 }
             }
             Ok(Command::SwitchMode(target)) => {
-                if ModelKind::from(target) == ModelKind::from(mode) {
-                    log!("asr", "switch to {target:?}: same underlying model, keeping recognizer");
+                if kind_for(target) == kind_for(mode) {
+                    log!(
+                        "asr",
+                        "switch to {target:?}: same underlying model, keeping recognizer"
+                    );
                     mode = target;
                     let _ = events.send(Event::ModelReady(mode));
                     continue;
@@ -196,7 +225,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 };
                 let new_paths = match cached.take() {
                     Some(paths) => Some(paths),
-                    None => fetch_paths(ModelKind::from(target), &events),
+                    None => fetch_paths(kind_for(target), &events),
                 };
                 let Some(new_paths) = new_paths else {
                     continue;
@@ -207,7 +236,10 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 )));
                 let load_started = Instant::now();
                 let Some(new_backend) = load_backend(target, &new_paths) else {
-                    log!("asr", "ERROR: switch to {target:?} failed, create returned None");
+                    log!(
+                        "asr",
+                        "ERROR: switch to {target:?} failed, create returned None"
+                    );
                     return;
                 };
                 let unload_started = Instant::now();

@@ -9,15 +9,19 @@ use global_hotkey::{
     hotkey::{Code, HotKey},
 };
 use gpui::{
-    App, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb,
-    size,
+    App, Bounds, Context, Entity, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    relative, rgb, size,
 };
 use gpui_platform::application;
-use raycast_dictation_clone::asr::{self, Command, Event, Mode};
+use raycast_dictation_clone::asr::{
+    self, Command, Event, Mode, ModelKind, ModelSelection, ModelSpec, REGISTRY,
+    ensure_model_by_spec, is_model_cached, kind_by_id, spec_by_id,
+};
 use raycast_dictation_clone::audio;
+use raycast_dictation_clone::config::{self, AppConfig};
 use raycast_dictation_clone::log;
 use raycast_dictation_clone::logging;
-use raycast_dictation_clone::paste::{clean_transcript, paste_text, MIN_AUDIO_SECS};
+use raycast_dictation_clone::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
 use raycast_dictation_clone::win_focus::{self, FocusTarget};
 
 const BARS: usize = 26;
@@ -32,6 +36,11 @@ enum HotkeyMessage {
 enum PasteResult {
     Pasted(usize),
     Failed(String),
+}
+
+enum DownloadMessage {
+    Progress(String),
+    Finished(Result<(ModelKind, ModelKind), String>),
 }
 
 struct Waveform {
@@ -149,7 +158,10 @@ impl Dictation {
                     self.partial = text;
                 }
             }
-            Event::Committed { text, duration_secs } => {
+            Event::Committed {
+                text,
+                duration_secs,
+            } => {
                 if self.phase == Phase::Transcribing {
                     self.phase = Phase::Idle;
                     self.transcribing_since = None;
@@ -162,14 +174,21 @@ impl Dictation {
                     );
                     let cleaned = clean_transcript(&text);
                     if cleaned != text.trim() {
-                        log!("app", "cleanup: raw -> cleaned ({} chars): {cleaned:?}", cleaned.chars().count());
+                        log!(
+                            "app",
+                            "cleanup: raw -> cleaned ({} chars): {cleaned:?}",
+                            cleaned.chars().count()
+                        );
                     }
                     if cleaned.is_empty() {
                         self.status = "empty".to_owned();
                         log!("app", "gate: dropped (empty after cleanup)");
                     } else if duration_secs < MIN_AUDIO_SECS {
                         self.status = format!("discarded (<{MIN_AUDIO_SECS}s)");
-                        log!("app", "gate: dropped ({duration_secs:.2}s < {MIN_AUDIO_SECS}s min)");
+                        log!(
+                            "app",
+                            "gate: dropped ({duration_secs:.2}s < {MIN_AUDIO_SECS}s min)"
+                        );
                     } else {
                         self.committed = cleaned.clone();
                         let results = self.results.clone();
@@ -185,7 +204,10 @@ impl Dictation {
                             }
                             Some(window) => {
                                 if initial.as_ref() != Some(window) {
-                                    log!("app", "user moved to {window} since record start; pasting there");
+                                    log!(
+                                        "app",
+                                        "user moved to {window} since record start; pasting there"
+                                    );
                                 }
                                 None
                             }
@@ -277,16 +299,18 @@ impl Render for Dictation {
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_mode(cx))),
                     ),
             )
-            .children((self.phase == Phase::Recording
-                && self.mode == Mode::Live
-                && !self.partial.is_empty())
-            .then(|| {
-                div()
-                    .max_w(px(720.))
-                    .text_size(px(12.))
-                    .text_color(rgb(0xcccccc))
-                    .child(format!("partial: {}", self.partial))
-            }))
+            .children(
+                (self.phase == Phase::Recording
+                    && self.mode == Mode::Live
+                    && !self.partial.is_empty())
+                .then(|| {
+                    div()
+                        .max_w(px(720.))
+                        .text_size(px(12.))
+                        .text_color(rgb(0xcccccc))
+                        .child(format!("partial: {}", self.partial))
+                }),
+            )
             .children((!self.committed.is_empty()).then(|| {
                 div()
                     .max_w(px(720.))
@@ -315,6 +339,477 @@ impl Render for Dictation {
                     })),
             )
     }
+}
+
+#[derive(Clone, Copy)]
+enum Slot {
+    Record,
+    Live,
+}
+
+struct OnboardingView {
+    record_id: &'static str,
+    live_id: &'static str,
+    ram_gb: u32,
+    cores: usize,
+    cached: Vec<bool>,
+    status: Option<String>,
+    error: Option<String>,
+    downloading: bool,
+    start_queued: bool,
+    download: mpsc::Sender<DownloadMessage>,
+}
+
+impl OnboardingView {
+    fn new(device: (u32, usize), download: mpsc::Sender<DownloadMessage>) -> Self {
+        Self {
+            record_id: "nemotron",
+            live_id: "nemotron",
+            ram_gb: device.0,
+            cores: device.1,
+            cached: REGISTRY
+                .iter()
+                .map(|spec| is_model_cached(spec.id))
+                .collect(),
+            status: None,
+            error: None,
+            downloading: false,
+            start_queued: false,
+            download,
+        }
+    }
+
+    fn refresh_cached(&mut self) {
+        for (index, spec) in REGISTRY.iter().enumerate() {
+            self.cached[index] = is_model_cached(spec.id);
+        }
+    }
+
+    fn assign(&mut self, slot: Slot, id: &'static str, cx: &mut Context<Self>) {
+        match slot {
+            Slot::Record => self.record_id = id,
+            Slot::Live => self.live_id = id,
+        }
+        log!(
+            "app",
+            "model assigned: record={} live={}",
+            self.record_id,
+            self.live_id
+        );
+        cx.notify();
+    }
+
+    fn queue_start(&mut self, cx: &mut Context<Self>) {
+        self.start_queued = true;
+        cx.notify();
+    }
+
+    fn set_status(&mut self, text: String, cx: &mut Context<Self>) {
+        self.status = Some(text);
+        cx.notify();
+    }
+
+    fn download_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        log!("app", "download FAILED: {error}");
+        self.downloading = false;
+        self.error = Some(error);
+        self.refresh_cached();
+        cx.notify();
+    }
+
+    fn start_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.downloading {
+            return;
+        }
+        let Some(record_spec) = spec_by_id(self.record_id) else {
+            return;
+        };
+        let Some(live_spec) = spec_by_id(self.live_id) else {
+            return;
+        };
+        self.downloading = true;
+        self.error = None;
+        self.status = Some(format!("checking {} …", record_spec.display_name));
+        log!(
+            "app",
+            "download started: record={} live={}",
+            record_spec.id,
+            live_spec.id
+        );
+        let download = self.download.clone();
+        thread::spawn(move || {
+            let fetch = |spec, label| {
+                let _ = download.send(DownloadMessage::Progress(format!("checking {label} …")));
+                ensure_model_by_spec(spec, &mut |file| {
+                    log!("app", "download progress: {file}");
+                    let _ =
+                        download.send(DownloadMessage::Progress(format!("downloading {file} …")));
+                })
+            };
+            let record_result = fetch(record_spec, record_spec.display_name);
+            let live_result = fetch(live_spec, live_spec.display_name);
+            match (record_result, live_result) {
+                (Ok(_), Ok(_)) => {
+                    if let (Some(record), Some(live)) =
+                        (kind_by_id(record_spec.id), kind_by_id(live_spec.id))
+                    {
+                        log!("app", "download finished for both models");
+                        let _ = download.send(DownloadMessage::Finished(Ok((record, live))));
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    let _ = download.send(DownloadMessage::Finished(Err(error)));
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    fn model_row(
+        &self,
+        index: usize,
+        spec: &ModelSpec,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let selected_record = self.record_id == spec.id;
+        let selected_live = self.live_id == spec.id;
+        let cached = self.cached[index];
+        let record_id = spec.id;
+        let live_id = spec.id;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .border_1()
+            .border_color(rgb(0x404040))
+            .rounded_sm()
+            .p(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .child(spec.display_name)
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(if cached { rgb(0x33cc66) } else { rgb(0x909090) })
+                            .child(if cached { "cached" } else { "needs download" }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(12.))
+                    .text_size(px(11.))
+                    .text_color(rgb(0x909090))
+                    .child(format!("{} MB · {} ms chunks", spec.size_mb, spec.chunk_ms))
+                    .child(spec.wer_note),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id(2 * index)
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(if selected_record {
+                                rgb(0x33cc66)
+                            } else {
+                                rgb(0x1c1c1c)
+                            })
+                            .text_color(if selected_record {
+                                rgb(0x101010)
+                            } else {
+                                rgb(0xcccccc)
+                            })
+                            .child("use for record")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.assign(Slot::Record, record_id, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(2 * index + 1)
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(if selected_live {
+                                rgb(0x33cc66)
+                            } else {
+                                rgb(0x1c1c1c)
+                            })
+                            .text_color(if selected_live {
+                                rgb(0x101010)
+                            } else {
+                                rgb(0xcccccc)
+                            })
+                            .child("use for live")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.assign(Slot::Live, live_id, cx)
+                            })),
+                    ),
+            )
+    }
+}
+
+impl Render for OnboardingView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut warning_specs: Vec<&ModelSpec> = Vec::new();
+        for id in [self.record_id, self.live_id] {
+            if let Some(spec) = spec_by_id(id)
+                && !warning_specs.iter().any(|existing| existing.id == id)
+                && spec.min_ram_gb > self.ram_gb
+            {
+                warning_specs.push(spec);
+            }
+        }
+        let warnings: Vec<String> = warning_specs
+            .iter()
+            .map(|spec| {
+                format!(
+                    "{} recommends >= {} GB RAM (detected {} GB)",
+                    spec.display_name, spec.min_ram_gb, self.ram_gb
+                )
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for (index, spec) in REGISTRY.iter().enumerate() {
+            rows.push(self.model_row(index, spec, cx));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(24.))
+            .bg(rgb(0x101010))
+            .text_color(rgb(0xcccccc))
+            .size_full()
+            .child(div().text_size(px(18.)).child("Dictation setup"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x909090))
+                    .child(format!(
+                        "detected: {} GB RAM, {} logical cores",
+                        self.ram_gb, self.cores
+                    )),
+            )
+            .children(rows)
+            .children((!warnings.is_empty()).then(|| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xcc9933))
+                    .child(warnings.join("; "))
+            }))
+            .children(self.status.clone().map(|status| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0x33cc66))
+                    .child(status)
+            }))
+            .children(self.error.clone().map(|error| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xcc3333))
+                    .child(format!("download failed: {error}"))
+            }))
+            .children(self.start_queued.then(|| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xcc9933))
+                    .child("F9 pressed — recording will begin once models load")
+            }))
+            .child(
+                div()
+                    .id("start")
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .px(px(16.))
+                    .py(px(6.))
+                    .bg(rgb(0x1c1c1c))
+                    .border_1()
+                    .border_color(rgb(0x404040))
+                    .text_size(px(13.))
+                    .child("Start dictating")
+                    .on_click(cx.listener(|this, _, _, cx| this.start_clicked(cx))),
+            )
+    }
+}
+
+#[derive(Clone)]
+enum Screen {
+    Onboarding(Entity<OnboardingView>),
+    Dictation(Entity<Dictation>),
+}
+
+struct AppRoot {
+    screen: Screen,
+    events: mpsc::Sender<Event>,
+    results: mpsc::Sender<PasteResult>,
+    pending_start: bool,
+}
+
+impl AppRoot {
+    fn handle_asr_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if let Screen::Dictation(dictation) = self.screen.clone() {
+            dictation.update(cx, |dictation, cx| dictation.handle_asr_event(event, cx));
+        }
+    }
+
+    fn handle_hotkey(&mut self, message: HotkeyMessage, cx: &mut Context<Self>) {
+        if let Screen::Dictation(dictation) = self.screen.clone() {
+            dictation.update(cx, |dictation, cx| dictation.handle_hotkey(message, cx));
+            return;
+        }
+        match message {
+            HotkeyMessage::ToggleRecording => {
+                self.pending_start = true;
+                log!("app", "F9 during onboarding: queued start after setup");
+                if let Screen::Onboarding(onboarding) = self.screen.clone() {
+                    onboarding.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                }
+            }
+            HotkeyMessage::DebugReload => log!("app", "F10 ignored during onboarding"),
+        }
+    }
+
+    fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
+        if let Screen::Dictation(dictation) = self.screen.clone() {
+            dictation.update(cx, |dictation, cx| {
+                dictation.handle_paste_result(result, cx)
+            });
+        }
+    }
+
+    fn pump_audio(
+        &mut self,
+        levels: &mut Vec<f32>,
+        chunks: &mut Vec<Vec<f32>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Screen::Dictation(dictation) = self.screen.clone() {
+            let drained_levels = std::mem::take(levels);
+            let drained_chunks = std::mem::take(chunks);
+            dictation.update(cx, |dictation, cx| {
+                if dictation.phase == Phase::Recording {
+                    dictation.waveform.extend(drained_levels);
+                    for chunk in drained_chunks {
+                        let _ = dictation.commands.send(Command::Chunk(chunk));
+                    }
+                }
+                cx.notify();
+            });
+        } else {
+            levels.clear();
+            chunks.clear();
+        }
+    }
+
+    fn handle_download_message(&mut self, message: DownloadMessage, cx: &mut Context<Self>) {
+        match message {
+            DownloadMessage::Progress(text) => {
+                if let Screen::Onboarding(onboarding) = self.screen.clone() {
+                    onboarding.update(cx, |onboarding, cx| onboarding.set_status(text, cx));
+                }
+            }
+            DownloadMessage::Finished(Ok((record, live))) => {
+                self.finish_onboarding(record, live, cx)
+            }
+            DownloadMessage::Finished(Err(error)) => {
+                if let Screen::Onboarding(onboarding) = self.screen.clone() {
+                    onboarding.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
+                }
+            }
+        }
+    }
+
+    fn finish_onboarding(&mut self, record: ModelKind, live: ModelKind, cx: &mut Context<Self>) {
+        let config = AppConfig {
+            record_model: record.spec().id.to_owned(),
+            live_model: live.spec().id.to_owned(),
+        };
+        match config::save(&config) {
+            Ok(()) => log!(
+                "app",
+                "config saved: record={} live={}",
+                config.record_model,
+                config.live_model
+            ),
+            Err(error) => log!("app", "config save FAILED: {error}"),
+        }
+        let selection = ModelSelection { record, live };
+        let commands = asr::spawn_worker(self.events.clone(), selection);
+        log!("app", "worker spawned with selection {selection:?}");
+        let pending_start = std::mem::replace(&mut self.pending_start, false);
+        self.screen = Screen::Dictation(
+            cx.new(|_| build_dictation(commands, self.results.clone(), pending_start)),
+        );
+        cx.notify();
+    }
+}
+
+impl Render for AppRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.screen {
+            Screen::Dictation(dictation) => div().size_full().child(dictation.clone()),
+            Screen::Onboarding(onboarding) => div().size_full().child(onboarding.clone()),
+        }
+    }
+}
+
+fn build_dictation(
+    commands: mpsc::Sender<Command>,
+    results: mpsc::Sender<PasteResult>,
+    pending_start: bool,
+) -> Dictation {
+    Dictation {
+        phase: Phase::Loading,
+        mode: Mode::Record,
+        waveform: Waveform {
+            bars: [0.0; BARS],
+            peak: 0.0,
+        },
+        commands,
+        results,
+        status: "fetching model".to_owned(),
+        partial: String::new(),
+        committed: String::new(),
+        pending_start,
+        transcribing_since: None,
+        focus: None,
+    }
+}
+
+fn selection_from_config(config: &AppConfig) -> ModelSelection {
+    let resolve = |id: &str, fallback: ModelKind| {
+        kind_by_id(id).unwrap_or_else(|| {
+            log!(
+                "app",
+                "unknown model id '{id}' in config; using default instead"
+            );
+            fallback
+        })
+    };
+    ModelSelection {
+        record: resolve(&config.record_model, ModelKind::Nemotron),
+        live: resolve(&config.live_model, ModelKind::Nemotron),
+    }
+}
+
+fn detect_device() -> (u32, usize) {
+    let system = sysinfo::System::new_all();
+    let ram_gb = (system.total_memory() / (1024 * 1024 * 1024)) as u32;
+    let cores = system.cpus().len();
+    (ram_gb, cores)
 }
 
 fn main() {
@@ -363,27 +858,46 @@ fn main() {
 
                 let (event_sender, event_receiver) = mpsc::channel::<Event>();
                 let (paste_sender, paste_receiver) = mpsc::channel::<PasteResult>();
-                let command_sender = asr::spawn_worker(event_sender);
+                let (download_sender, download_receiver) = mpsc::channel::<DownloadMessage>();
 
-                let view = cx.new(|_| Dictation {
-                    phase: Phase::Loading,
-                    mode: Mode::Record,
-                    waveform: Waveform {
-                        bars: [0.0; BARS],
-                        peak: 0.0,
-                    },
-                    commands: command_sender,
+                let loaded_config = config::load();
+                let device = detect_device();
+
+                let screen = match &loaded_config {
+                    Some(config) => {
+                        let selection = selection_from_config(config);
+                        log!(
+                            "app",
+                            "config found: record={} live={}",
+                            config.record_model,
+                            config.live_model
+                        );
+                        let commands = asr::spawn_worker(event_sender.clone(), selection);
+                        Screen::Dictation(
+                            cx.new(|_| build_dictation(commands, paste_sender.clone(), false)),
+                        )
+                    }
+                    None => {
+                        log!(
+                            "app",
+                            "no config; showing onboarding (device: {} GB RAM, {} logical cores)",
+                            device.0,
+                            device.1
+                        );
+                        Screen::Onboarding(cx.new(|_| OnboardingView::new(device, download_sender)))
+                    }
+                };
+
+                let app = cx.new(|_| AppRoot {
+                    screen,
+                    events: event_sender,
                     results: paste_sender,
-                    status: "fetching model".to_owned(),
-                    partial: String::new(),
-                    committed: String::new(),
                     pending_start: false,
-                    transcribing_since: None,
-                    focus: None,
                 });
+
                 window
                     .spawn(cx, {
-                        let view = view.clone();
+                        let app = app.clone();
                         async move |cx| {
                             let mut pending_levels: Vec<f32> = Vec::new();
                             let mut pending_chunks: Vec<Vec<f32>> = Vec::new();
@@ -394,41 +908,35 @@ fn main() {
                                 }
                                 while let Ok(event) = event_receiver.try_recv() {
                                     cx.update(|_, cx| {
-                                        view.update(cx, |dictation, cx| {
-                                            dictation.handle_asr_event(event, cx)
-                                        });
+                                        app.update(cx, |app, cx| app.handle_asr_event(event, cx));
                                     })
                                     .ok();
                                 }
                                 while let Ok(message) = hotkey_receiver.try_recv() {
                                     cx.update(|_, cx| {
-                                        view.update(cx, |dictation, cx| {
-                                            dictation.handle_hotkey(message, cx)
-                                        });
+                                        app.update(cx, |app, cx| app.handle_hotkey(message, cx));
                                     })
                                     .ok();
                                 }
                                 while let Ok(result) = paste_receiver.try_recv() {
                                     cx.update(|_, cx| {
-                                        view.update(cx, |dictation, cx| {
-                                            dictation.handle_paste_result(result, cx)
+                                        app.update(cx, |app, cx| {
+                                            app.handle_paste_result(result, cx)
+                                        });
+                                    })
+                                    .ok();
+                                }
+                                while let Ok(message) = download_receiver.try_recv() {
+                                    cx.update(|_, cx| {
+                                        app.update(cx, |app, cx| {
+                                            app.handle_download_message(message, cx)
                                         });
                                     })
                                     .ok();
                                 }
                                 cx.update(|_, cx| {
-                                    view.update(cx, |dictation, cx| {
-                                        if dictation.phase == Phase::Recording {
-                                            dictation.waveform.extend(pending_levels.drain(..));
-                                            for chunk in pending_chunks.drain(..) {
-                                                let _ =
-                                                    dictation.commands.send(Command::Chunk(chunk));
-                                            }
-                                        } else {
-                                            pending_levels.clear();
-                                            pending_chunks.clear();
-                                        }
-                                        cx.notify();
+                                    app.update(cx, |app, cx| {
+                                        app.pump_audio(&mut pending_levels, &mut pending_chunks, cx)
                                     });
                                 })
                                 .ok();
@@ -437,7 +945,7 @@ fn main() {
                         }
                     })
                     .detach();
-                view
+                app
             },
         )
         .unwrap();
