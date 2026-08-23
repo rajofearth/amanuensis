@@ -151,6 +151,14 @@ struct Resampler {
 }
 
 impl Resampler {
+    #[cfg(test)]
+    fn collect(input_rate: u32, samples: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut resampler = Self::new(input_rate);
+        resampler.push(samples, &mut |sample| out.push(sample));
+        out
+    }
+
     fn new(input_rate: u32) -> Self {
         Self {
             step: input_rate as f64 / TARGET_SAMPLE_RATE as f64,
@@ -198,5 +206,23 @@ impl Chunker {
         if self.buffer.len() == CHUNK_SAMPLES {
             let _ = self.sender.send(std::mem::take(&mut self.buffer));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_produces_right_rate_and_content() {
+        const INPUT_RATE: u32 = 48_000;
+        const FREQ: f32 = 440.0;
+        let input: Vec<f32> = (0..INPUT_RATE as usize)
+            .map(|i| (2.0 * std::f32::consts::PI * FREQ * i as f32 / INPUT_RATE as f32).sin())
+            .collect();
+        let out = Resampler::collect(INPUT_RATE, &input);
+        assert!((out.len() as i64 - 16_000).abs() < 100, "got {} samples", out.len());
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(rms > 0.6, "sine energy lost, rms {rms}");
     }
 }

@@ -32,10 +32,12 @@ impl ModelKind {
 
 impl From<Mode> for ModelKind {
     fn from(mode: Mode) -> Self {
-        match mode {
-            Mode::Record => Self::Unified,
-            Mode::Live => Self::Nemotron,
-        }
+        // Record used the unified (240ms-window) model, but its windowed decode
+        // runs ~15x realtime on this SoC vs nemotron's ~2.5x. Nemotron handles
+        // short record-mode utterances fine and gives legacy-parity latency.
+        // See docs/PHASE11-NOTES.md for the offline-batch endgame.
+        let _ = mode;
+        Self::Nemotron
     }
 }
 

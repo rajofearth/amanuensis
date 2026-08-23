@@ -2,6 +2,7 @@
 name = "raycast-dictation-clone"
 version = "0.1.0"
 edition = "2024"
+default-run = "raycast-dictation-clone"
 
 [dependencies]
 arboard = "3.6"

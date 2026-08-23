@@ -73,6 +73,8 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
     let mut session_samples: usize = 0;
     let mut session_feeds: usize = 0;
     let mut decode_nanos: u128 = 0;
+    let mut sum_sq: f64 = 0.0;
+    let mut peak: f32 = 0.0;
     let mut last_partial = String::new();
     loop {
         match commands.recv() {
@@ -81,6 +83,8 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 session_samples = 0;
                 session_feeds = 0;
                 decode_nanos = 0;
+                sum_sq = 0.0;
+                peak = 0.0;
                 last_partial.clear();
                 active = true;
                 log!("asr", "session start ({mode:?})");
@@ -94,6 +98,12 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 decode_nanos += started.elapsed().as_nanos();
                 session_feeds += 1;
                 session_samples += samples.len();
+                for &sample in &samples {
+                    sum_sq += (sample as f64) * (sample as f64);
+                    if sample.abs() > peak {
+                        peak = sample.abs();
+                    }
+                }
                 if mode == Mode::Live
                     && let Some(partial) = backend.partial()
                     && partial != last_partial
@@ -110,11 +120,18 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                     let duration_secs = session_samples as f32 / SESSION_SAMPLE_RATE as f32;
                     let audio_secs = session_samples as f64 / SESSION_SAMPLE_RATE as f64;
                     let decode_secs = decode_nanos as f64 / 1e9;
+                    let rms = if session_samples > 0 {
+                        (sum_sq / session_samples as f64).sqrt()
+                    } else {
+                        0.0
+                    };
                     log!(
                         "asr",
-                        "session end: {:.2}s audio, {} feeds, decode wall {:.2}s ({:.1}x realtime), finalize {:.2}s",
+                        "session end: {:.2}s audio, {} feeds, rms {:.4} peak {:.3}, decode wall {:.2}s ({:.1}x realtime), finalize {:.2}s",
                         audio_secs,
                         session_feeds,
+                        rms,
+                        peak,
                         decode_secs,
                         if audio_secs > 0.0 { decode_secs / audio_secs } else { 0.0 },
                         finalize_started.elapsed().as_secs_f64()
@@ -159,7 +176,10 @@ fn run(commands: Receiver<Command>, events: Sender<Event>) {
                 }
             }
             Ok(Command::SwitchMode(target)) => {
-                if target == mode {
+                if ModelKind::from(target) == ModelKind::from(mode) {
+                    log!("asr", "switch to {target:?}: same underlying model, keeping recognizer");
+                    mode = target;
+                    let _ = events.send(Event::ModelReady(mode));
                     continue;
                 }
                 if active {
