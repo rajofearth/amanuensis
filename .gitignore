@@ -1,1 +1,5 @@
 /target
+/.native-libs
+
+*.log
+dictation.log

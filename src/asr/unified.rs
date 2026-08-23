@@ -11,12 +11,12 @@ const SAMPLE_RATE: i32 = 16000;
 const FEATURE_DIM: i32 = 128;
 const FINALIZE_SILENCE_SAMPLES: usize = 9600;
 
-pub struct NemotronBackend {
+pub struct UnifiedBackend {
     recognizer: OnlineRecognizer,
     stream: Option<OnlineStream>,
 }
 
-impl NemotronBackend {
+impl UnifiedBackend {
     pub fn load(model: &ModelPaths) -> Option<Self> {
         let mut config = OnlineRecognizerConfig::default();
         config.feat_config.sample_rate = SAMPLE_RATE;
@@ -37,7 +37,7 @@ impl NemotronBackend {
     }
 }
 
-impl AsrBackend for NemotronBackend {
+impl AsrBackend for UnifiedBackend {
     fn start_session(&mut self) {
         self.stream = Some(self.recognizer.create_stream());
     }

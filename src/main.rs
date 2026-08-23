@@ -1,7 +1,8 @@
-mod asr;
-mod audio;
-
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -12,8 +13,9 @@ use gpui::{
     size,
 };
 use gpui_platform::application;
-
-use asr::{Command, Event};
+use raycast_dictation_clone::asr::{self, Command, Event, Mode};
+use raycast_dictation_clone::audio;
+use raycast_dictation_clone::paste::{clean_transcript, paste_text, MIN_AUDIO_SECS};
 
 const BARS: usize = 26;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -22,6 +24,11 @@ const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 enum HotkeyMessage {
     ToggleRecording,
     DebugReload,
+}
+
+enum PasteResult {
+    Pasted(usize),
+    Failed(String),
 }
 
 struct Waveform {
@@ -64,27 +71,24 @@ enum Phase {
     Transcribing,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
-    Record,
-    Live,
-}
-
 struct Dictation {
     phase: Phase,
     mode: Mode,
     waveform: Waveform,
     commands: mpsc::Sender<Command>,
+    results: mpsc::Sender<PasteResult>,
     status: String,
     partial: String,
     committed: String,
     pending_start: bool,
+    transcribing_since: Option<Instant>,
 }
 
 impl Dictation {
     fn begin_recording(&mut self) {
         self.phase = Phase::Recording;
         self.partial.clear();
+        self.transcribing_since = None;
         let _ = self.commands.send(Command::Start);
     }
 
@@ -94,6 +98,7 @@ impl Dictation {
             Phase::Idle => self.begin_recording(),
             Phase::Recording => {
                 self.phase = Phase::Transcribing;
+                self.transcribing_since = Some(Instant::now());
                 let _ = self.commands.send(Command::Stop);
             }
             Phase::Transcribing => {}
@@ -102,17 +107,26 @@ impl Dictation {
     }
 
     fn cycle_mode(&mut self, cx: &mut Context<Self>) {
+        if self.phase != Phase::Idle {
+            return;
+        }
         self.mode = match self.mode {
             Mode::Record => Mode::Live,
             Mode::Live => Mode::Record,
         };
+        self.phase = Phase::Loading;
+        self.status = format!("switching to {:?}", self.mode);
+        let _ = self.commands.send(Command::SwitchMode(self.mode));
         cx.notify();
     }
 
     fn handle_asr_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::LoadingProgress(message) => self.status = message,
-            Event::Ready => {
+            Event::Ready | Event::ModelReady(_) => {
+                if let Event::ModelReady(mode) = event {
+                    self.mode = mode;
+                }
                 if self.phase == Phase::Loading && self.pending_start {
                     self.pending_start = false;
                     self.begin_recording();
@@ -125,11 +139,27 @@ impl Dictation {
                     self.partial = text;
                 }
             }
-            Event::Committed(text) => {
+            Event::Committed { text, duration_secs } => {
                 if self.phase == Phase::Transcribing {
                     self.phase = Phase::Idle;
-                    self.committed = text;
+                    self.transcribing_since = None;
                     self.partial.clear();
+                    let cleaned = clean_transcript(&text);
+                    if cleaned.is_empty() {
+                        self.status = "empty".to_owned();
+                    } else if duration_secs < MIN_AUDIO_SECS {
+                        self.status = format!("discarded (<{MIN_AUDIO_SECS}s)");
+                    } else {
+                        self.committed = cleaned.clone();
+                        let results = self.results.clone();
+                        thread::spawn(move || {
+                            let result = match paste_text(&cleaned) {
+                                Ok(chars) => PasteResult::Pasted(chars),
+                                Err(error) => PasteResult::Failed(error),
+                            };
+                            let _ = results.send(result);
+                        });
+                    }
                 }
             }
         }
@@ -145,6 +175,14 @@ impl Dictation {
                 }
             }
         }
+    }
+
+    fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
+        match result {
+            PasteResult::Pasted(chars) => self.status = format!("pasted {chars} chars"),
+            PasteResult::Failed(error) => self.status = format!("paste failed: {error}"),
+        }
+        cx.notify();
     }
 }
 
@@ -167,7 +205,12 @@ impl Render for Dictation {
                     .gap(px(12.))
                     .text_size(px(11.))
                     .text_color(rgb(0x909090))
-                    .child(if self.phase == Phase::Loading || !self.status.is_empty() {
+                    .child(if self.phase == Phase::Transcribing {
+                        let elapsed = self
+                            .transcribing_since
+                            .map_or(0, |started| started.elapsed().as_secs());
+                        format!("{:?} (F9): transcribing… {elapsed}s", self.phase)
+                    } else if self.phase == Phase::Loading || !self.status.is_empty() {
                         format!("{:?} (F9): {}", self.phase, self.status)
                     } else {
                         format!("{:?} (F9)", self.phase)
@@ -189,7 +232,10 @@ impl Render for Dictation {
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_mode(cx))),
                     ),
             )
-            .children((self.phase == Phase::Recording && !self.partial.is_empty()).then(|| {
+            .children((self.phase == Phase::Recording
+                && self.mode == Mode::Live
+                && !self.partial.is_empty())
+            .then(|| {
                 div()
                     .max_w(px(720.))
                     .text_size(px(12.))
@@ -269,6 +315,7 @@ fn main() {
                 audio::spawn(audio_sender);
 
                 let (event_sender, event_receiver) = mpsc::channel::<Event>();
+                let (paste_sender, paste_receiver) = mpsc::channel::<PasteResult>();
                 let command_sender = asr::spawn_worker(event_sender);
 
                 let view = cx.new(|_| Dictation {
@@ -279,10 +326,12 @@ fn main() {
                         peak: 0.0,
                     },
                     commands: command_sender,
+                    results: paste_sender,
                     status: "fetching model".to_owned(),
                     partial: String::new(),
                     committed: String::new(),
                     pending_start: false,
+                    transcribing_since: None,
                 });
                 window
                     .spawn(cx, {
@@ -307,6 +356,14 @@ fn main() {
                                     cx.update(|_, cx| {
                                         view.update(cx, |dictation, cx| {
                                             dictation.handle_hotkey(message, cx)
+                                        });
+                                    })
+                                    .ok();
+                                }
+                                while let Ok(result) = paste_receiver.try_recv() {
+                                    cx.update(|_, cx| {
+                                        view.update(cx, |dictation, cx| {
+                                            dictation.handle_paste_result(result, cx)
                                         });
                                     })
                                     .ok();

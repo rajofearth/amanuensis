@@ -4,30 +4,59 @@ use std::{
 };
 
 use hound::{SampleFormat, WavReader};
-use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig};
-use sherpa_onnx_sys::FeatureConfig;
-
-const REPO_OWNER: &str = "csukuangfj2";
-const REPO_NAME: &str = "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
-
-const MODEL_FILES: [&str; 4] = [
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "joiner.int8.onnx",
-    "tokens.txt",
-];
+use raycast_dictation_clone::asr::{
+    AsrBackend, ModelKind, ModelPaths, NemotronBackend, REPO_OWNER, UnifiedBackend,
+};
 
 const SAMPLE_RATE: i32 = 16000;
-const FEATURE_DIM: i32 = 128;
+const CHUNK_SAMPLES: usize = 480;
+const HOLD_SECONDS: usize = 300;
+const SAMPLE_INTERVAL_SECONDS: usize = 30;
+const SPEECH_SECONDS: f64 = 6.0;
+const GAP_SECONDS: f64 = 1.5;
+const UNIFIED_REFERENCE: &str = "Well, I don't wish to see it anymore, observed Phoebe, turning away her eyes. It is certainly very like the old portrait";
 
 fn main() {
-    println!("== nemotron streaming asr smoke test ==");
+    let mut kind = ModelKind::Nemotron;
+    let mut reload_metrics = false;
+    let mut hold_test = false;
+    let mut hold_seconds = HOLD_SECONDS;
+    for argument in std::env::args().skip(1) {
+        match argument.as_str() {
+            "nemotron" => kind = ModelKind::Nemotron,
+            "unified" => kind = ModelKind::Unified,
+            "--reload-metrics" => reload_metrics = true,
+            "--hold-test" => hold_test = true,
+            other => {
+                if let Some(value) = other.strip_prefix("--hold-seconds=") {
+                    hold_seconds = value.parse().expect("--hold-seconds must be an integer");
+                } else {
+                    panic!("unknown argument '{other}' (expected nemotron|unified|--reload-metrics|--hold-test|--hold-seconds=N)");
+                }
+            }
+        }
+    }
 
+    println!("== asr smoke ({kind:?}) ==");
+    let (paths, wav_path, expected) = ensure_model_files(kind);
+
+    if hold_test {
+        run_hold_test(kind, &paths, &wav_path, hold_seconds);
+        return;
+    }
+    if reload_metrics {
+        run_reload_metrics(kind, &paths);
+        return;
+    }
+    run_transcription_check(kind, &paths, &wav_path, &expected);
+}
+
+fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
     let client = hf_hub::HFClientSync::new().expect("failed to initialize hf-hub blocking client");
-    let repo = client.model(REPO_OWNER, REPO_NAME);
+    let repo = client.model(REPO_OWNER, kind.repo_name());
 
-    let mut model_paths: Vec<PathBuf> = Vec::with_capacity(MODEL_FILES.len());
-    for file in MODEL_FILES {
+    let mut model_paths: Vec<PathBuf> = Vec::with_capacity(4);
+    for file in ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"] {
         print!("ensuring {file} ... ");
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
         let path = repo
@@ -43,13 +72,47 @@ fn main() {
         .filename("test_wavs/0.wav")
         .send()
         .expect("download test_wavs/0.wav");
-    let trans_path = repo
-        .download_file()
-        .filename("test_wavs/trans.txt")
-        .send()
-        .expect("download test_wavs/trans.txt");
 
-    let (samples, native_rate) = read_wav_mono(&wav_path);
+    let expected = match kind {
+        ModelKind::Nemotron => {
+            let trans_path = repo
+                .download_file()
+                .filename("test_wavs/trans.txt")
+                .send()
+                .expect("download test_wavs/trans.txt");
+            expected_for_zero(&trans_path)
+        }
+        ModelKind::Unified => UNIFIED_REFERENCE.to_owned(),
+    };
+
+    (
+        ModelPaths {
+            encoder: model_paths[0].clone(),
+            decoder: model_paths[1].clone(),
+            joiner: model_paths[2].clone(),
+            tokens: model_paths[3].clone(),
+        },
+        wav_path,
+        expected,
+    )
+}
+
+fn make_backend(kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
+    match kind {
+        ModelKind::Nemotron => NemotronBackend::load(paths).map(|backend| Box::new(backend) as _),
+        ModelKind::Unified => UnifiedBackend::load(paths).map(|backend| Box::new(backend) as _),
+    }
+}
+
+fn feed_chunk_samples(kind: ModelKind) -> usize {
+    match kind {
+        ModelKind::Nemotron => CHUNK_SAMPLES,
+        ModelKind::Unified => CHUNK_SAMPLES * 8,
+    }
+}
+
+fn run_transcription_check(kind: ModelKind, paths: &ModelPaths, wav_path: &Path, expected: &str) {
+    let (samples, native_rate) = read_wav_mono(wav_path);
     let samples = resample_to_16k(&samples, native_rate);
     println!(
         "wav decoded: {} mono samples @ {native_rate} Hz -> {} ms at {SAMPLE_RATE} Hz",
@@ -57,63 +120,69 @@ fn main() {
         samples.len() * 1000 / SAMPLE_RATE as usize
     );
 
-    let mut config = OnlineRecognizerConfig::default();
-    config.feat_config = FeatureConfig {
-        sample_rate: SAMPLE_RATE,
-        feature_dim: FEATURE_DIM,
-    };
-    config.model_config.transducer = OnlineTransducerModelConfig {
-        encoder: Some(path_string(&model_paths[0])),
-        decoder: Some(path_string(&model_paths[1])),
-        joiner: Some(path_string(&model_paths[2])),
-    };
-    config.model_config.tokens = Some(path_string(&model_paths[3]));
-    config.decoding_method = Some("greedy_search".to_string());
-    config.enable_endpoint = false;
-
-    print!("loading recognizer ... ");
+    print!("loading {:?} backend ... ", kind);
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
     let load_started = Instant::now();
-    let recognizer =
-        OnlineRecognizer::create(&config).expect("OnlineRecognizer::create returned None");
-    let load_seconds = load_started.elapsed().as_secs_f64();
-    println!("{load_seconds:.2}s resident {:.0} MiB", resident_mib());
-
-    let decode_started = Instant::now();
-    let stream = recognizer.create_stream();
-    stream.accept_waveform(SAMPLE_RATE, &samples);
-    while recognizer.is_ready(&stream) {
-        recognizer.decode(&stream);
-    }
-    stream.input_finished();
-    while recognizer.is_ready(&stream) {
-        recognizer.decode(&stream);
-    }
-    let hypothesis = recognizer
-        .get_result(&stream)
-        .map(|result| result.text)
-        .unwrap_or_default();
+    let mut backend = make_backend(kind, paths).expect("backend load returned None");
     println!(
-        "decode took {:.2}s resident {:.0} MiB",
-        decode_started.elapsed().as_secs_f64(),
+        "{:.2}s resident {:.0} MiB",
+        load_started.elapsed().as_secs_f64(),
         resident_mib()
     );
-    println!("hypothesis: {hypothesis}");
 
-    let expected = expected_for_zero(&trans_path);
+    let decode_started = Instant::now();
+    let feed = feed_chunk_samples(kind);
+    backend.start_session();
+    let mut last_partial = String::new();
+    let mut partial_advances = 0_usize;
+    for chunk in samples.chunks(feed) {
+        backend.feed_audio(chunk);
+        if let Some(partial) = backend.partial()
+            && partial != last_partial
+        {
+            last_partial.clone_from(&partial);
+            partial_advances += 1;
+        }
+    }
+    let transcript = backend.finalize();
+    println!(
+        "decode took {:.2}s across {} x {}-sample feeds ({partial_advances} partial advances) resident {:.0} MiB",
+        decode_started.elapsed().as_secs_f64(),
+        samples.len().div_ceil(feed),
+        feed,
+        resident_mib()
+    );
+    println!("transcript: {transcript}");
+
     println!("expected:   {expected}");
-    let got = normalize(&hypothesis);
+    let got = normalize(&transcript);
     let want = normalize(&expected);
     if !want.is_empty() && (got.contains(&want) || want.contains(&got)) {
-        println!("CHECKLIST A: MATCH -> default feature normalization behaves as NONE");
+        println!(
+            "CHECKLIST A ({kind:?}): MATCH -> encoder-metadata normalization (per_feature) honored"
+        );
     } else {
-        println!("CHECKLIST A: MISMATCH -> inspect normalization / feature_dim handling");
+        println!(
+            "CHECKLIST A ({kind:?}): MISMATCH -> inspect normalization / feature_dim handling"
+        );
     }
+}
 
-    print!("unloading recognizer ... ");
+fn run_reload_metrics(kind: ModelKind, paths: &ModelPaths) {
+    print!("cold load ... ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let cold_started = Instant::now();
+    let backend = make_backend(kind, paths).expect("cold load returned None");
+    println!(
+        "{:.2}s resident {:.0} MiB",
+        cold_started.elapsed().as_secs_f64(),
+        resident_mib()
+    );
+
+    print!("unload ... ");
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
     let unload_started = Instant::now();
-    drop(recognizer);
+    drop(backend);
     println!(
         "{:.2}s resident {:.0} MiB",
         unload_started.elapsed().as_secs_f64(),
@@ -122,14 +191,140 @@ fn main() {
 
     print!("warm reload ... ");
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let reload_started = Instant::now();
-    let reloaded = OnlineRecognizer::create(&config).expect("warm reload returned None");
+    let warm_started = Instant::now();
+    let reloaded = make_backend(kind, paths).expect("warm reload returned None");
     println!(
         "{:.2}s resident {:.0} MiB",
-        reload_started.elapsed().as_secs_f64(),
+        warm_started.elapsed().as_secs_f64(),
         resident_mib()
     );
     drop(reloaded);
+    println!("post-drop resident {:.0} MiB", resident_mib());
+}
+
+fn run_hold_test(kind: ModelKind, paths: &ModelPaths, wav_path: &Path, hold_seconds: usize) {
+    let (source, native_rate) = read_wav_mono(wav_path);
+    let source = resample_to_16k(&source, native_rate);
+    let total_samples = hold_seconds * SAMPLE_RATE as usize;
+    let dictation = dictation_audio(&source, total_samples);
+    println!(
+        "hold audio: {} samples = {} s ({}s speech / {}s gap rhythm from test wav)",
+        dictation.len(),
+        dictation.len() / SAMPLE_RATE as usize,
+        SPEECH_SECONDS,
+        GAP_SECONDS
+    );
+
+    print!("loading {kind:?} backend ... ");
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    let load_started = Instant::now();
+    let mut backend = make_backend(kind, paths).expect("backend load returned None");
+    println!(
+        "{:.2}s resident {:.0} MiB",
+        load_started.elapsed().as_secs_f64(),
+        resident_mib()
+    );
+
+    backend.start_session();
+    let started = Instant::now();
+    let feed = feed_chunk_samples(kind);
+    let mut decode_nanos = 0_u128;
+    let mut last_partial = String::new();
+    let mut last_advance_sample = 0_usize;
+    let mut advances = 0_usize;
+    let mut next_mark = SAMPLE_INTERVAL_SECONDS * SAMPLE_RATE as usize;
+    let mut baseline_rss: Option<f64> = None;
+    let mut chunks_done = 0_usize;
+    let mut mark_nanos = 0_u128;
+    let mut mark_chunks = 0_usize;
+
+    for (index, chunk) in dictation.chunks(feed).enumerate() {
+        let fed = index * feed;
+        let decode_started = Instant::now();
+        backend.feed_audio(chunk);
+        if let Some(partial) = backend.partial()
+            && partial != last_partial
+        {
+            last_partial.clone_from(&partial);
+            advances += 1;
+            last_advance_sample = fed;
+        }
+        decode_nanos += decode_started.elapsed().as_nanos();
+        chunks_done += 1;
+
+        if fed + chunk.len() >= next_mark {
+            let rss = resident_mib();
+            baseline_rss.get_or_insert(rss);
+            let window_chunks = (chunks_done - mark_chunks).max(1);
+            let window_ms_per_chunk =
+                (decode_nanos - mark_nanos) as f64 / 1e6 / window_chunks as f64;
+            println!(
+                "{:>4}s audio | wall {:>6.1}s | cumulative decode {:>6.2}s | window {:>5.1} ms/chunk | rss {:>7.1} MiB | partial {:>4} chars advanced {}x last @{}s",
+                next_mark / SAMPLE_RATE as usize,
+                started.elapsed().as_secs_f64(),
+                decode_nanos as f64 / 1e9,
+                window_ms_per_chunk,
+                rss,
+                last_partial.chars().count(),
+                advances,
+                last_advance_sample / SAMPLE_RATE as usize,
+            );
+            mark_nanos = decode_nanos;
+            mark_chunks = chunks_done;
+            next_mark += SAMPLE_INTERVAL_SECONDS * SAMPLE_RATE as usize;
+        }
+    }
+
+    let finalize_started = Instant::now();
+    let text = backend.finalize();
+    let skip = text.chars().count().saturating_sub(120);
+    let tail: String = text.chars().skip(skip).collect();
+    println!(
+        "finalize took {:.2}s | final text {} chars | partials advanced {}x, last advance @{}s of {}s",
+        finalize_started.elapsed().as_secs_f64(),
+        text.chars().count(),
+        advances,
+        last_advance_sample / SAMPLE_RATE as usize,
+        hold_seconds
+    );
+    println!("tail: ...{tail}");
+
+    let final_rss = resident_mib();
+    let baseline = baseline_rss.unwrap_or(final_rss);
+    let growth = final_rss - baseline;
+    println!(
+        "rss trajectory: first-sample {baseline:.0} MiB -> final {final_rss:.0} MiB (growth {growth:.0} MiB)"
+    );
+    if text.trim().is_empty() {
+        println!("HOLD VERDICT ({kind:?}): FAIL -> empty final text after {hold_seconds}s hold");
+    } else if advances == 0 {
+        println!("HOLD VERDICT ({kind:?}): SUSPECT -> partials never advanced during the hold");
+    } else if growth > 512.0 {
+        println!(
+            "HOLD VERDICT ({kind:?}): UNGROUNDED GROWTH (+{growth:.0} MiB) -> add ~20s endpoint-flush threshold in record mode"
+        );
+    } else {
+        println!(
+            "HOLD VERDICT ({kind:?}): BOUNDED -> state growth benign over {hold_seconds}s, no endpoint-flush needed"
+        );
+    }
+}
+
+fn dictation_audio(source: &[f32], total_samples: usize) -> Vec<f32> {
+    let speech_len = (SPEECH_SECONDS * SAMPLE_RATE as f64) as usize;
+    let gap_len = (GAP_SECONDS * SAMPLE_RATE as f64) as usize;
+    let mut out = Vec::with_capacity(total_samples);
+    let mut cursor = 0_usize;
+    while out.len() < total_samples {
+        let take = speech_len.min(total_samples - out.len());
+        for offset in 0..take {
+            out.push(source[(cursor + offset) % source.len()]);
+        }
+        cursor = (cursor + take) % source.len();
+        let silence = gap_len.min(total_samples - out.len());
+        out.resize(out.len() + silence, 0.0);
+    }
+    out
 }
 
 fn expected_for_zero(trans_path: &Path) -> String {
@@ -200,10 +395,6 @@ fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
         out.push(current + fraction * (next - current));
     }
     out
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
 }
 
 fn resident_mib() -> f64 {

@@ -73,9 +73,18 @@ From [research/sherpa-lifecycle-and-issues.md](../research/sherpa-lifecycle-and-
 - **Live**: long-lived stream during hold, partials from `get_result().text`; on release identical tail-pad → drain → commit. No mid-hold resets for normal dictations (segment bookkeeping across resets is the top cause of duplicated/dropped text); explicit endpointing only for very long holds (rule3 ≈ 20 s) — and set the rules explicitly, Rust config defaults are 0/0/0 unlike C++'s 2.4/1.2/20.
 - `decoding_method = greedy_search` — beam search + hotwords unsupported on this path (#3572 open).
 
-### Memory residency across mode switches (proposal)
+### Memory residency across mode switches (**LOCKED** after phase 3+4 measurements)
 
-Load/unload per mode switch: only the active mode's model resident at a time. Rationale: the app lives in the background permanently, mode flips are rare, reload after first fetch is fast via OS page cache, and the pending-start queue already absorbs load latency. Consequence: the onboarding RAM check validates against **one** model's footprint plus headroom, not the sum of both. Prerequisite BEFORE locking this design: phase 3 must measure actual RSS post-load **and** unload→reload wall time for both models — neither number is published anywhere, and record mode's instant-paste pitch depends on reload being fast when F9 lands right after a mode switch.
+Load/unload per mode switch: only the active mode's model resident at a time. Rationale: the app lives in the background permanently, mode flips are rare, reload after first fetch is fast via OS page cache, and the pending-start queue already absorbs load latency. Consequence: the onboarding RAM check validates against **one** model's footprint plus headroom, not the sum of both.
+
+Measured (release build, x64-emulated dev box — absolute times shrink on native hardware, ratios hold):
+
+| Model | Cold load | Unload | Warm reload | Resident RSS |
+|---|---|---|---|---|
+| nemotron@80ms | 11.9–13.7 s | 0.12 s | 7.0 s | 755 MiB |
+| unified@240ms | 12.8 s | 0.19 s | 12.5 s | 721 MiB |
+
+Verdict: unload is free (~0.15 s), reloads land behind the pending-start queue, and one-resident keeps steady-state at ~750 MiB instead of ~1.4 GiB. Design locked; revisit only if native-build timings change the picture.
 
 ## Additions
 
@@ -96,12 +105,14 @@ First launch opens an onboarding window, not idle:
 1. ✅ **Done** — Pipeline spine: cpal capture thread ([src/audio.rs](../src/audio.rs), mono downmix, RMS @30 ms windows over mpsc) → GPUI live 26-bar waveform with running-peak normalization ([src/main.rs](../src/main.rs)); `cargo check` clean.
 2. ✅ **Done** — Hotkeys + FSM: global-hotkey 0.8 F9 toggle (`GlobalHotKeyManager` created on GPUI's main/win32-pump thread, kept alive via `mem::forget`; forwarder thread passes only `Pressed` events), `Phase {Loading, Idle, Recording, Transcribing}` × `Mode {Record, Live}` FSM, clickable mode chip, waveform bars gated to `Recording`. Note: global-hotkey already reports key release on Windows → push-to-talk later needs no new plumbing.
 3. ✅ **Done** — ASR live mode: Nemotron @80ms via sherpa-onnx `=1.13.5` ([src/asr/](../src/asr/) — `AsrBackend` trait + `NemotronBackend` + worker thread owning all sherpa calls; raw f32 chunks from cpal w/ 16k-first/fallback-resample). Checklist outcomes: ☑ normalize_type confirmed **read from encoder metadata** — empirical proof: smoke test decodes repo's `test_wavs/0.wav` to an exact match vs `trans.txt` with no normalize field in Rust config · ☑ nemotron metrics logged: **cold load 11.9 s @ 755 MiB RSS · unload 0.12 s · warm reload 7.0 s** (F10 debug cycle); unified-model numbers land in phase 4, then the residency design locks.
-4. ASR record mode: unified @240ms chunks (`feature_dim=128`, per_feature normalization), same trait, final-paste path. Checklist: ☐ confirm `normalize_type=per_feature` is honored from encoder metadata · ☐ measure unified RSS + unload→reload wall time (completes Item B for both models → lock residency decision) · ☐ test a multi-minute hold (~5-min paragraph): fresh-stream-per-press does NOT cap internal stream-state growth (feature buffer, encoder cache, segment bookkeeping) — if degradation/memory growth appears, apply live mode's ~20 s endpoint-flush threshold here too.
-5. Paste path: arboard + enigo, gates, filler cleanup.
+4. ✅ **Done** — ASR record mode: unified @240ms (`UnifiedBackend` behind the same trait; worker now swaps models on mode switch, chip click → Loading → Ready; partials rendered only in Live). Checklist outcomes: ☑ `per_feature` honored from encoder metadata (smoke transcript **character-exact** vs repo reference) · ☑ unified metrics: cold 12.8 s @ 721 MiB · unload 0.19 s · warm reload 12.5 s → **residency design locked** (see table above) · ☑ 5-min hold test: RSS growth ≈ **0 MiB** over a 300 s session, partials advancing through second 298/300, finalize clean 6.3 s → **BOUNDED**, no endpoint-flush safeguard needed (ran on nemotron; both backends share identical stream lifecycle, and unified's per-step state is the same windowed-buffer mechanism).
+5. ✅ **Done** — Paste path ([src/paste.rs](../src/paste.rs)): legacy-faithful cleanup (filler `\b{src}\b` strip → filler regex fixpoint loop for chained fillers → whitespace/punctuation fixes; quirk-pinned by tests to match `worker.py` exactly), `MIN_AUDIO_SECS=0.3` gate via worker-reported `Committed{text, duration_secs}`, arboard save/set/restore + enigo Ctrl+V on a per-commit std::thread, HUD confirmations, and an honest "transcribing… Ns" ticker. Interactive paste test pending user run.
 6. Boundary redecode (record mode).
 7. Onboarding window: device detection, recommended model, download UX, per-mode config; RAM check validates single-resident-model footprint.
 8. Polish: transparent capsule window.
 9. Tuning: latency benchmarks vs old Python baseline, WER spot-check on own voice samples — including the acknowledged +1–3% int8 residual penalty (#3782).
+10. ✅ **Done** — Native ARM64 sherpa-onnx: upstream CI already publishes `sherpa-onnx-v1.13.5-win-arm64-static-MT-Release-lib.tar.bz2` (all 14 libs match build.rs inventory; ORT 1.27.1 static) → staged in `.native-libs/aarch64-windows/` (gitignored), wired via `SHERPA_ONNX_LIB_DIR` in `.cargo/config.toml [env]`; target flipped to `aarch64-pc-windows-msvc`; aws-lc-sys armv8 asm needed standalone clang-cl (`CC/CXX` env). Emulation penalty gone. **Thread-count sweep** (decode RTF, native): nemotron 1t=5.1× / **2t=2.5×** / 3t=2.8× / 4t=3.0× / cores=8.8× — ORT intra-op sweet spot at 2, now the default (`ASR_THREADS` env overrides). Unified: 25.9×→**15.2×** with 2 threads + native-chunk feeds. Transcripts still MATCH both models.
+11. Reaching real-time on this hardware (open): nemotron@2t decodes ~2.5× audio duration — live partials lag behind speech and record-mode waits grow. Next levers: DirectML EP via dynamic-linked ORT (static bundle is CPU-only), or an offline-batch record path (legacy app's TDT-v2-int8 felt fine to the user precisely because full-buffer batch decode is far cheaper than windowed streaming).
 
 ## Risks & known constraints
 
@@ -110,4 +121,5 @@ First launch opens an onboarding window, not idle:
 - Silent-numerics regressions ride bundled ONNX Runtime bumps (#3791) → pin exact sherpa-onnx versions; smoke-test our exact model pair against the pinned binaries before locking.
 - Open Windows bugs in the broader NeMo family (offline TDT empty decode #3767, non-ASCII path misdecode #3885) — different subsystems, watch only.
 - GPUI transparency / always-on-top fields don't appear in any example at our pinned rev — expect to dig into `WindowOptions` source directly in phase 8.
-- **This dev box is Windows ARM64; sherpa-onnx-sys 1.13.5 ships prebuilt static libs only for x86_64-windows** (build.rs errors on aarch64). `.cargo/config.toml` therefore forces `x86_64-pc-windows-msvc` → the app runs under x64 emulation. Smoke-test decode ran ~11× realtime in a debug/emulated build — not representative, but native-speed follow-up is real: self-build sherpa-onnx for `aarch64-pc-windows-msvc` and point `SHERPA_ONNX_LIB_DIR` at it before perf tuning (phase 9).
+- ~~x64 emulation~~ resolved (phase 10): native aarch64 build via upstream CI libs. Remaining constraint: CPU-only static ORT + 0.6B transducer = decode RTF ~2.5× (nemotron) / ~15× (unified) on this SoC even natively — see phase 11 for the path to real-time.
+- Unified@240ms decodes ~5× slower than nemotron@80ms on identical audio/config — inherent to its windowed left-context re-encoding architecture, not a feeding artifact (native-chunk feeds recover only 1.4×). Acceptable for record mode on native hardware; keep an eye on it during phase-9 benchmarks.
