@@ -1,3 +1,4 @@
+use crate::log;
 use std::{error::Error, sync::mpsc::Sender, thread, time::Duration};
 
 use cpal::{
@@ -11,7 +12,7 @@ const CHUNK_SAMPLES: usize = 480;
 pub fn spawn(sender: Sender<Vec<f32>>) {
     thread::spawn(move || {
         if let Err(error) = run(sender) {
-            eprintln!("audio capture failed: {error}");
+            log!("audio", "ERROR: capture failed: {error}");
         }
     });
 }
@@ -21,7 +22,16 @@ fn run(sender: Sender<Vec<f32>>) -> Result<(), Box<dyn Error>> {
     let device = host
         .default_input_device()
         .ok_or("no default input device")?;
+    let device_name = device.name().map(|n| n.to_string()).unwrap_or_else(|_| "?".into());
     let supported = device.default_input_config()?;
+    log!(
+        "audio",
+        "device {:?}, native {} Hz ({} ch, {:?})",
+        device_name,
+        supported.sample_rate().0,
+        supported.channels(),
+        supported.sample_format()
+    );
 
     let preferred = StreamConfig {
         channels: 1,
@@ -30,15 +40,20 @@ fn run(sender: Sender<Vec<f32>>) -> Result<(), Box<dyn Error>> {
     };
     let stream =
         open_stream(&device, &preferred, None, sender.clone()).or_else(|preferred_error| {
+            log!(
+                "audio",
+                "16 kHz stream unavailable ({preferred_error}); falling back to native rate + resample"
+            );
             let native_rate = supported.sample_rate().0;
             let resample_from = (native_rate != TARGET_SAMPLE_RATE).then_some(native_rate);
             let config: StreamConfig = supported.into();
             open_stream(&device, &config, resample_from, sender).map_err(|error| {
-                eprintln!("native-rate stream also failed: {error}");
+                log!("audio", "ERROR: native-rate stream also failed: {error}");
                 preferred_error
             })
         })?;
     stream.play()?;
+    log!("audio", "capture running");
     loop {
         thread::sleep(Duration::from_secs(3600));
     }
@@ -62,9 +77,11 @@ fn open_stream(
             })
         })
         .map_err(|error| {
-            eprintln!(
-                "failed to open stream at {} Hz ({} ch): {error}",
-                config.sample_rate.0, config.channels
+            log!(
+                "audio",
+                "stream open failed at {} Hz ({} ch): {error}",
+                config.sample_rate.0,
+                config.channels
             );
             error
         })

@@ -15,7 +15,10 @@ use gpui::{
 use gpui_platform::application;
 use raycast_dictation_clone::asr::{self, Command, Event, Mode};
 use raycast_dictation_clone::audio;
+use raycast_dictation_clone::log;
+use raycast_dictation_clone::logging;
 use raycast_dictation_clone::paste::{clean_transcript, paste_text, MIN_AUDIO_SECS};
+use raycast_dictation_clone::win_focus::{self, FocusTarget};
 
 const BARS: usize = 26;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -82,10 +85,16 @@ struct Dictation {
     committed: String,
     pending_start: bool,
     transcribing_since: Option<Instant>,
+    focus: Option<FocusTarget>,
 }
 
 impl Dictation {
     fn begin_recording(&mut self) {
+        self.focus = win_focus::capture_foreground();
+        match &self.focus {
+            Some(target) => log!("app", "recording starts, target window: {target}"),
+            None => log!("app", "recording starts, no foreground window captured"),
+        }
         self.phase = Phase::Recording;
         self.partial.clear();
         self.transcribing_since = None;
@@ -93,6 +102,7 @@ impl Dictation {
     }
 
     fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        log!("app", "F9 toggle in phase {:?}", self.phase);
         match self.phase {
             Phase::Loading => self.pending_start = true,
             Phase::Idle => self.begin_recording(),
@@ -144,16 +154,28 @@ impl Dictation {
                     self.phase = Phase::Idle;
                     self.transcribing_since = None;
                     self.partial.clear();
+                    log!(
+                        "app",
+                        "committed {:.1}s audio, raw ({} chars): {text:?}",
+                        duration_secs,
+                        text.chars().count()
+                    );
                     let cleaned = clean_transcript(&text);
+                    if cleaned != text.trim() {
+                        log!("app", "cleanup: raw -> cleaned ({} chars): {cleaned:?}", cleaned.chars().count());
+                    }
                     if cleaned.is_empty() {
                         self.status = "empty".to_owned();
+                        log!("app", "gate: dropped (empty after cleanup)");
                     } else if duration_secs < MIN_AUDIO_SECS {
                         self.status = format!("discarded (<{MIN_AUDIO_SECS}s)");
+                        log!("app", "gate: dropped ({duration_secs:.2}s < {MIN_AUDIO_SECS}s min)");
                     } else {
                         self.committed = cleaned.clone();
                         let results = self.results.clone();
+                        let focus = self.focus;
                         thread::spawn(move || {
-                            let result = match paste_text(&cleaned) {
+                            let result = match paste_text(&cleaned, focus) {
                                 Ok(chars) => PasteResult::Pasted(chars),
                                 Err(error) => PasteResult::Failed(error),
                             };
@@ -179,8 +201,14 @@ impl Dictation {
 
     fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
         match result {
-            PasteResult::Pasted(chars) => self.status = format!("pasted {chars} chars"),
-            PasteResult::Failed(error) => self.status = format!("paste failed: {error}"),
+            PasteResult::Pasted(chars) => {
+                log!("app", "paste ok: {chars} chars");
+                self.status = format!("pasted {chars} chars");
+            }
+            PasteResult::Failed(error) => {
+                log!("app", "paste FAILED: {error}");
+                self.status = format!("paste failed: {error}");
+            }
         }
         cx.notify();
     }
@@ -273,6 +301,8 @@ impl Render for Dictation {
 }
 
 fn main() {
+    logging::init();
+    log!("app", "starting raycast-dictation-clone");
     application().run(|cx: &mut App| {
         let manager = GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
         let toggle_key = HotKey::new(None, Code::F9);
@@ -332,6 +362,7 @@ fn main() {
                     committed: String::new(),
                     pending_start: false,
                     transcribing_since: None,
+                    focus: None,
                 });
                 window
                     .spawn(cx, {
