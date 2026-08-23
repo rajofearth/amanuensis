@@ -103,6 +103,7 @@ pub fn paste_text(text: &str, focus: Option<FocusTarget>) -> Result<usize, Strin
         if let Err(error) = win_focus::restore_focus(target) {
             log!("paste", "WARN focus restore failed, keys may land on wrong window: {error}");
         }
+        thread::sleep(PASTE_SETTLE);
     } else {
         log!("paste", "no captured window; sending keys to current focus");
     }

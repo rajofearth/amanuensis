@@ -2,11 +2,10 @@ use std::fmt;
 
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::{
-        Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_MENU},
-        WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowTextW, IsWindow, SetForegroundWindow,
-        },
+    System::Threading::{AttachThreadInput, GetCurrentThreadId},
+    UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+        SetForegroundWindow,
     },
 };
 
@@ -36,8 +35,8 @@ pub fn capture_foreground() -> Option<FocusTarget> {
 }
 
 /// Bring the captured window back to the foreground so synthesized keys land there.
-/// Uses the ALT-key trick to bypass the foreground lock (background processes are
-/// normally denied SetForegroundWindow).
+/// Uses AttachThreadInput (no synthetic keys — an injected ALT tap would latch
+/// the target's menu bar and swallow the subsequent paste).
 pub fn restore_focus(target: &FocusTarget) -> Result<(), String> {
     if target.hwnd == 0 {
         return Err("no captured window".into());
@@ -45,25 +44,20 @@ pub fn restore_focus(target: &FocusTarget) -> Result<(), String> {
     if unsafe { IsWindow(target.hwnd as HWND) } == 0 {
         return Err(format!("captured window gone ({target})"));
     }
-    send_alt_tap();
-    let ok = unsafe { SetForegroundWindow(target.hwnd as HWND) };
-    if ok == 0 {
-        return Err(format!("SetForegroundWindow rejected for {target}"));
+    let foreground = unsafe { GetForegroundWindow() } as isize;
+    let foreground_thread =
+        unsafe { GetWindowThreadProcessId(foreground as HWND, std::ptr::null_mut()) };
+    let current_thread = unsafe { GetCurrentThreadId() };
+    let attached = foreground_thread != 0
+        && foreground_thread != current_thread
+        && unsafe { AttachThreadInput(current_thread, foreground_thread, 1) } != 0;
+    unsafe { SetForegroundWindow(target.hwnd as HWND) };
+    if attached {
+        unsafe { AttachThreadInput(current_thread, foreground_thread, 0) };
     }
-    crate::logging::log("focus", format!("restored {target}"));
+    crate::logging::log(
+        "focus",
+        format!("restored {target} (attached={attached}, was hwnd={foreground:#x})"),
+    );
     Ok(())
-}
-
-fn send_alt_tap() {
-    let mut down = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: unsafe { std::mem::zeroed() },
-    };
-    down.Anonymous.ki = KEYBDINPUT { wVk: VK_MENU, ..unsafe { std::mem::zeroed() } };
-    let mut up_input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: unsafe { std::mem::zeroed() },
-    };
-    up_input.Anonymous.ki = KEYBDINPUT { wVk: VK_MENU, dwFlags: KEYEVENTF_KEYUP, ..unsafe { std::mem::zeroed() } };
-    unsafe { SendInput(2, [down, up_input].as_ptr(), size_of::<INPUT>() as i32) };
 }
