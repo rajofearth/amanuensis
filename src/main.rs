@@ -9,8 +9,8 @@ use global_hotkey::{
     hotkey::{Code, HotKey},
 };
 use gpui::{
-    App, Bounds, Context, Entity, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    relative, rgb, size,
+    App, Bounds, Context, Div, Entity, Stateful, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, relative, rgb, size,
 };
 use gpui_platform::application;
 use raycast_dictation_clone::asr::{
@@ -385,6 +385,7 @@ enum SetupOrigin {
 }
 
 const RECOVERY_NOTICE: &str = "Cached model not found — download it below to continue.";
+const BLOCKED_NOTICE: &str = "Model not downloaded — download it in setup first.";
 
 struct OnboardingView {
     origin: SetupOrigin,
@@ -393,6 +394,7 @@ struct OnboardingView {
     cores: usize,
     status: Option<String>,
     error: Option<String>,
+    notice: Option<String>,
     busy: bool,
     start_queued: bool,
     download: mpsc::Sender<DownloadMessage>,
@@ -414,10 +416,22 @@ impl OnboardingView {
             cores: device.1,
             status: None,
             error: None,
+            notice: None,
             busy: false,
             start_queued: false,
             download,
             ui,
+        }
+    }
+
+    fn model_ready(&self) -> bool {
+        is_model_cached(self.model_id)
+    }
+
+    fn set_blocked_notice(&mut self, cx: &mut Context<Self>) {
+        if self.notice.is_none() {
+            self.notice = Some(BLOCKED_NOTICE.to_owned());
+            cx.notify();
         }
     }
 
@@ -461,6 +475,7 @@ impl OnboardingView {
 
     fn start_clicked(&mut self, cx: &mut Context<Self>) {
         if self.busy {
+            log!("app", "start ignored: operation already in progress");
             return;
         }
         let Some(spec) = spec_by_id(self.model_id) else {
@@ -468,14 +483,18 @@ impl OnboardingView {
         };
         self.busy = true;
         self.error = None;
+        self.notice = None;
         self.status = Some(format!("checking {} …", spec.display_name));
         log!("app", "download started: {}", spec.id);
-        let download = self.download.clone();
-        thread::spawn(move || run_download(spec, download));
+        spawn_model_download(spec, false, self.download.clone());
         cx.notify();
     }
 
     fn reveal_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            log!("app", "reveal ignored: operation already in progress");
+            return;
+        }
         let Some(kind) = kind_by_id(self.model_id) else {
             return;
         };
@@ -514,6 +533,7 @@ impl OnboardingView {
 
     fn delete_clicked(&mut self, cx: &mut Context<Self>) {
         if self.busy {
+            log!("app", "delete ignored: operation already in progress");
             return;
         }
         let Some(kind) = kind_by_id(self.model_id) else {
@@ -539,6 +559,10 @@ impl OnboardingView {
 
     fn redownload_clicked(&mut self, cx: &mut Context<Self>) {
         if self.busy {
+            log!(
+                "app",
+                "download-again ignored: operation already in progress"
+            );
             return;
         }
         let Some(spec) = spec_by_id(self.model_id) else {
@@ -547,28 +571,42 @@ impl OnboardingView {
         let Some(kind) = kind_by_id(spec.id) else {
             return;
         };
+        if repo_cache_dir_for(kind).is_none() {
+            return;
+        }
         self.busy = true;
         self.error = None;
+        self.notice = None;
         self.status = Some(format!("re-downloading {} …", spec.display_name));
         log!("app", "download-again started: {}", spec.id);
-        let download = self.download.clone();
-        thread::spawn(move || {
-            if let Some(repo_dir) = repo_cache_dir_for(kind) {
+        spawn_model_download(spec, true, self.download.clone());
+        cx.notify();
+    }
+}
+
+fn spawn_model_download(
+    spec: &'static ModelSpec,
+    purge_first: bool,
+    download: mpsc::Sender<DownloadMessage>,
+) {
+    thread::spawn(move || {
+        if purge_first {
+            let purged = kind_by_id(spec.id).and_then(repo_cache_dir_for);
+            if let Some(repo_dir) = purged {
                 match std::fs::remove_dir_all(&repo_dir) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         let text = format!("removing old cache: {error}");
-                        log!("app", "download-again FAILED: {text}");
+                        log!("app", "download FAILED: {text}");
                         let _ = download.send(DownloadMessage::Finished(Err(text)));
                         return;
                     }
                 }
             }
-            run_download(spec, download);
-        });
-        cx.notify();
-    }
+        }
+        run_download(spec, download);
+    });
 }
 
 fn run_download(spec: &'static ModelSpec, download: mpsc::Sender<DownloadMessage>) {
@@ -632,6 +670,12 @@ impl Render for OnboardingView {
                     .text_size(px(11.))
                     .text_color(rgb(0xcc9933))
                     .child(RECOVERY_NOTICE)
+            }))
+            .children(self.notice.clone().filter(|_| !cached_now).map(|notice| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xcc9933))
+                    .child(notice)
             }))
             .child(
                 div()
@@ -711,10 +755,19 @@ impl Render for OnboardingView {
                     .rounded_sm()
                     .px(px(16.))
                     .py(px(6.))
-                    .bg(rgb(0x1c1c1c))
+                    .bg(if self.busy {
+                        rgb(0x141414)
+                    } else {
+                        rgb(0x1c1c1c)
+                    })
                     .border_1()
                     .border_color(rgb(0x404040))
                     .text_size(px(13.))
+                    .text_color(if self.busy {
+                        rgb(0x606060)
+                    } else {
+                        rgb(0xcccccc)
+                    })
                     .child("Start dictating")
                     .on_click(cx.listener(|this, _, _, cx| this.start_clicked(cx))),
             )
@@ -725,63 +778,58 @@ impl Render for OnboardingView {
                     .gap(px(8.))
                     .text_size(px(13.))
                     .child(
-                        div()
-                            .id("reveal")
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgb(0x1c1c1c))
-                            .border_1()
-                            .border_color(rgb(0x404040))
-                            .child("Reveal in Explorer")
+                        action_button("reveal", "Reveal in Explorer", !self.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.reveal_clicked(cx))),
                     )
                     .child(
-                        div()
-                            .id("delete")
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgb(0x1c1c1c))
-                            .border_1()
-                            .border_color(rgb(0x404040))
-                            .child("Delete model")
+                        action_button("delete", "Delete model", !self.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.delete_clicked(cx))),
                     )
                     .child(
-                        div()
-                            .id("redownload")
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgb(0x1c1c1c))
-                            .border_1()
-                            .border_color(rgb(0x404040))
-                            .child("Download again")
+                        action_button("redownload", "Download again", !self.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.redownload_clicked(cx))),
                     )
                     .children((self.origin == SetupOrigin::Settings).then(|| {
-                        div()
-                            .id("reset-setup")
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgb(0x1c1c1c))
-                            .border_1()
-                            .border_color(rgb(0x404040))
-                            .child("Run setup again")
-                            .on_click(cx.listener(|this, _, _, _| {
+                        action_button("reset-setup", "Run setup again", !self.busy).on_click(
+                            cx.listener(|this, _, _, _| {
+                                if this.busy {
+                                    log!(
+                                        "app",
+                                        "setup reset ignored: operation already in progress"
+                                    );
+                                    return;
+                                }
                                 let _ = this.ui.send(UiMessage::ResetSetup {
                                     captured_model: this.model_id,
                                 });
-                            }))
+                            }),
+                        )
                     })),
             )
     }
+}
+
+fn action_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .rounded_sm()
+        .px(px(8.))
+        .py(px(2.))
+        .border_1()
+        .border_color(rgb(0x404040))
+        .text_size(px(13.))
+        .bg(if enabled {
+            rgb(0x1c1c1c)
+        } else {
+            rgb(0x141414)
+        })
+        .text_color(if enabled {
+            rgb(0xcccccc)
+        } else {
+            rgb(0x606060)
+        })
+        .child(label)
 }
 
 #[derive(Clone)]
@@ -824,9 +872,17 @@ impl AppRoot {
                         log!("app", "F9 ignored while settings open");
                     }
                     SetupOrigin::FirstRun | SetupOrigin::Recovery => {
-                        self.pending_start = true;
-                        log!("app", "F9 during setup: queued start after models load");
-                        view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                        if view.read(cx).model_ready() {
+                            self.pending_start = true;
+                            log!("app", "F9 during setup: queued start after models load");
+                            view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                        } else {
+                            log!(
+                                "app",
+                                "F9 blocked: model not fully cached and no worker loaded"
+                            );
+                            view.update(cx, |onboarding, cx| onboarding.set_blocked_notice(cx));
+                        }
                     }
                 },
                 HotkeyMessage::DebugReload => log!("app", "F10 ignored during setup"),

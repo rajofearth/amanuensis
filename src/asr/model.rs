@@ -80,7 +80,11 @@ fn complete_snapshot_dir(repo_dir: &Path) -> Option<PathBuf> {
     let snapshots = repo_dir.join("snapshots");
     for revision in std::fs::read_dir(snapshots).ok()?.flatten() {
         let path = revision.path();
-        if MODEL_FILES.iter().all(|file| path.join(file).is_file()) {
+        if MODEL_FILES.iter().all(|file| {
+            std::fs::metadata(path.join(file))
+                .map(|meta| meta.is_file() && meta.len() > 0)
+                .unwrap_or(false)
+        }) {
             return Some(path);
         }
     }
@@ -106,12 +110,12 @@ pub fn ensure_model_by_spec(
     let repo = client.model(REPO_OWNER, spec.repo);
     let mut paths: Vec<PathBuf> = Vec::with_capacity(MODEL_FILES.len());
     for file in MODEL_FILES {
+        on_file(file);
         let path = repo
             .download_file()
             .filename(file)
             .send()
             .map_err(|error| format!("downloading {file}: {error}"))?;
-        on_file(file);
         paths.push(path);
     }
     Ok(ModelPaths {
