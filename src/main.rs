@@ -15,7 +15,8 @@ use gpui::{
 use gpui_platform::application;
 use raycast_dictation_clone::asr::{
     self, Command, Event, Mode, ModelKind, ModelSelection, ModelSpec, cache_dir_for,
-    ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for, spec_by_id,
+    ensure_model_by_spec, is_model_cached, kind_by_id, progress_text, repo_cache_dir_for,
+    spec_by_id,
 };
 use raycast_dictation_clone::audio;
 use raycast_dictation_clone::config::{self, AppConfig};
@@ -614,9 +615,18 @@ fn run_download(spec: &'static ModelSpec, download: mpsc::Sender<DownloadMessage
         "checking {} …",
         spec.display_name
     )));
-    match ensure_model_by_spec(spec, &mut |file| {
-        log!("app", "download progress: {file}");
-        let _ = download.send(DownloadMessage::Progress(format!("downloading {file} …")));
+    match ensure_model_by_spec(spec, &mut |progress| {
+        log!(
+            "app",
+            "download progress: {} · {} B / {} B",
+            progress.file,
+            progress.done,
+            progress.total
+        );
+        let _ = download.send(DownloadMessage::Progress(progress_text(
+            spec.display_name,
+            &progress,
+        )));
     }) {
         Ok(_) => {
             if let Some(kind) = kind_by_id(spec.id) {

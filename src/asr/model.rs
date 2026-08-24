@@ -1,7 +1,4 @@
-use std::path::{Path, PathBuf};
-
-use hf_hub::HFClientSync;
-
+use super::fetch;
 pub const REPO_OWNER: &str = "csukuangfj2";
 const NEMOTRON_REPO: &str = "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
 
@@ -47,92 +44,40 @@ impl ModelKind {
             Self::Nemotron => &REGISTRY[0],
         }
     }
-
-    pub fn repo_name(self) -> &'static str {
-        self.spec().repo
-    }
 }
 
 #[derive(Clone)]
 pub struct ModelPaths {
-    pub encoder: PathBuf,
-    pub decoder: PathBuf,
-    pub joiner: PathBuf,
-    pub tokens: PathBuf,
+    pub encoder: std::path::PathBuf,
+    pub decoder: std::path::PathBuf,
+    pub joiner: std::path::PathBuf,
+    pub tokens: std::path::PathBuf,
 }
 
-const MODEL_FILES: [&str; 4] = [
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "joiner.int8.onnx",
-    "tokens.txt",
-];
+pub use fetch::{DownloadProgress, cached_model_dir, progress_text};
 
-fn repo_cache_dir(spec: &ModelSpec) -> PathBuf {
-    hf_hub::resolve_cache_dir().join(format!("models--{REPO_OWNER}--{}", spec.repo))
+pub fn cache_dir_for(kind: ModelKind) -> Option<std::path::PathBuf> {
+    Some(cached_model_dir(kind.spec()))
 }
 
-pub fn repo_cache_dir_for(kind: ModelKind) -> Option<PathBuf> {
-    Some(repo_cache_dir(kind.spec()))
-}
-
-fn complete_snapshot_dir(repo_dir: &Path) -> Option<PathBuf> {
-    let snapshots = repo_dir.join("snapshots");
-    for revision in std::fs::read_dir(snapshots).ok()?.flatten() {
-        let path = revision.path();
-        if MODEL_FILES.iter().all(|file| {
-            std::fs::metadata(path.join(file))
-                .map(|meta| meta.is_file() && meta.len() > 0)
-                .unwrap_or(false)
-        }) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-pub fn cache_dir_for(kind: ModelKind) -> Option<PathBuf> {
-    let repo_dir = repo_cache_dir(kind.spec());
-    if let Some(snapshot) = complete_snapshot_dir(&repo_dir) {
-        return Some(snapshot);
-    }
-    if repo_dir.is_dir() {
-        return Some(repo_dir);
-    }
-    Some(hf_hub::resolve_cache_dir())
+pub fn repo_cache_dir_for(kind: ModelKind) -> Option<std::path::PathBuf> {
+    Some(cached_model_dir(kind.spec()))
 }
 
 pub fn ensure_model_by_spec(
     spec: &ModelSpec,
-    on_file: &mut impl FnMut(&str),
+    on_progress: &mut dyn FnMut(DownloadProgress),
 ) -> Result<ModelPaths, String> {
-    let client = HFClientSync::new().map_err(|error| format!("hf client init failed: {error}"))?;
-    let repo = client.model(REPO_OWNER, spec.repo);
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(MODEL_FILES.len());
-    for file in MODEL_FILES {
-        on_file(file);
-        let path = repo
-            .download_file()
-            .filename(file)
-            .send()
-            .map_err(|error| format!("downloading {file}: {error}"))?;
-        paths.push(path);
-    }
-    Ok(ModelPaths {
-        encoder: paths[0].clone(),
-        decoder: paths[1].clone(),
-        joiner: paths[2].clone(),
-        tokens: paths[3].clone(),
-    })
+    fetch::ensure_model(spec, on_progress)
 }
 
-pub fn ensure_model(kind: ModelKind, on_file: &mut impl FnMut(&str)) -> Result<ModelPaths, String> {
-    ensure_model_by_spec(kind.spec(), on_file)
+pub fn ensure_model(
+    kind: ModelKind,
+    on_progress: &mut dyn FnMut(DownloadProgress),
+) -> Result<ModelPaths, String> {
+    ensure_model_by_spec(kind.spec(), on_progress)
 }
 
 pub fn is_model_cached(spec_id: &str) -> bool {
-    let Some(spec) = spec_by_id(spec_id) else {
-        return false;
-    };
-    complete_snapshot_dir(&repo_cache_dir(spec)).is_some()
+    spec_by_id(spec_id).is_some_and(fetch::is_spec_cached)
 }

@@ -1,10 +1,13 @@
+pub mod fetch;
 mod model;
 mod nemotron;
 pub mod worker;
 
+pub use fetch::DownloadProgress;
 pub use model::{
     ModelKind, ModelPaths, ModelSpec, REGISTRY, REPO_OWNER, cache_dir_for, ensure_model,
-    ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for, spec_by_id,
+    ensure_model_by_spec, is_model_cached, kind_by_id, progress_text, repo_cache_dir_for,
+    spec_by_id,
 };
 pub use nemotron::NemotronBackend;
 pub use worker::{Command, Event, ModelSelection, spawn_worker};

@@ -4,9 +4,8 @@ use std::{
 };
 
 use hound::{SampleFormat, WavReader};
-use raycast_dictation_clone::asr::{
-    AsrBackend, ModelKind, ModelPaths, NemotronBackend, REPO_OWNER,
-};
+use raycast_dictation_clone::asr::fetch;
+use raycast_dictation_clone::asr::{AsrBackend, ModelKind, ModelPaths, NemotronBackend};
 
 const SAMPLE_RATE: i32 = 16000;
 const CHUNK_SAMPLES: usize = 480;
@@ -52,45 +51,23 @@ fn main() {
 }
 
 fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
-    let client = hf_hub::HFClientSync::new().expect("failed to initialize hf-hub blocking client");
-    let repo = client.model(REPO_OWNER, kind.repo_name());
-
-    let mut model_paths: Vec<PathBuf> = Vec::with_capacity(4);
-    for file in [
-        "encoder.int8.onnx",
-        "decoder.int8.onnx",
-        "joiner.int8.onnx",
-        "tokens.txt",
-    ] {
-        print!("ensuring {file} ... ");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let path = repo
-            .download_file()
-            .filename(file)
-            .send()
-            .unwrap_or_else(|error| panic!("download {file} failed: {error}"));
-        println!("{}", path.display());
-        model_paths.push(path);
-    }
-    let wav_path = repo
-        .download_file()
-        .filename("test_wavs/0.wav")
-        .send()
+    let spec = kind.spec();
+    fetch::ensure_file(spec, "test_wavs/0.wav", None, &mut |_| {})
         .expect("download test_wavs/0.wav");
-
-    let trans_path = repo
-        .download_file()
-        .filename("test_wavs/trans.txt")
-        .send()
+    fetch::ensure_file(spec, "test_wavs/trans.txt", None, &mut |_| {})
         .expect("download test_wavs/trans.txt");
+
+    let dir = fetch::cached_model_dir(spec);
+    let wav_path = dir.join("test_wavs").join("0.wav");
+    let trans_path = dir.join("test_wavs").join("trans.txt");
     let expected = expected_for_zero(&trans_path);
 
     (
         ModelPaths {
-            encoder: model_paths[0].clone(),
-            decoder: model_paths[1].clone(),
-            joiner: model_paths[2].clone(),
-            tokens: model_paths[3].clone(),
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            joiner: dir.join("joiner.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
         },
         wav_path,
         expected,

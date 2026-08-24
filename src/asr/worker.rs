@@ -307,9 +307,15 @@ fn load_and_swap(
 }
 
 fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
-    let _ = events.send(Event::LoadingProgress(format!("fetching {kind:?} model")));
-    match model::ensure_model(kind, &mut |file| {
-        let _ = events.send(Event::LoadingProgress(format!("downloading {file}")));
+    let _ = events.send(Event::LoadingProgress(format!(
+        "checking {} model",
+        kind.spec().display_name
+    )));
+    match model::ensure_model(kind, &mut |progress| {
+        let _ = events.send(Event::LoadingProgress(model::progress_text(
+            kind.spec().display_name,
+            &progress,
+        )));
     }) {
         Ok(paths) => Some(paths),
         Err(error) => {
