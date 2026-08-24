@@ -62,6 +62,9 @@ enum UiMessage {
         purge: bool,
     },
     CancelDownload,
+    DeleteRequest {
+        captured_model: &'static str,
+    },
     ResetSetup {
         captured_model: &'static str,
     },
@@ -507,11 +510,10 @@ impl OnboardingView {
             Ok(()) => {
                 log!(
                     "app",
-                    "model deleted; app keeps running with the in-memory recognizer"
+                    "model deleted; any loaded recognizer was released first"
                 );
                 self.status = Some(
-                    "Deleted. Use Download again to re-fetch. The app keeps running with the in-memory model."
-                        .to_owned(),
+                    "Deleted. Use Download again or Start dictating to re-fetch it.".to_owned(),
                 );
             }
             Err(error) => {
@@ -592,23 +594,19 @@ impl OnboardingView {
             log!("app", "delete ignored: operation already in progress");
             return;
         }
-        let Some(kind) = kind_by_id(self.model_id) else {
-            return;
-        };
-        let Some(repo_dir) = repo_cache_dir_for(kind) else {
+        let Some(spec) = spec_by_id(self.model_id) else {
             return;
         };
         self.busy = true;
         self.error = None;
-        self.status = Some("deleting model files …".to_owned());
-        log!("app", "delete started: {}", repo_dir.display());
-        let ui = self.ui.clone();
-        thread::spawn(move || {
-            let result = match std::fs::remove_dir_all(&repo_dir) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(format!("{error}")),
-            };
-            let _ = ui.send(UiMessage::DeleteFinished(result));
+        self.status = Some(if self.model_ready() {
+            "releasing model and deleting files …".to_owned()
+        } else {
+            "deleting model files …".to_owned()
+        });
+        log!("app", "delete requested: {}", spec.id);
+        let _ = self.ui.send(UiMessage::DeleteRequest {
+            captured_model: self.model_id,
         });
         cx.notify();
     }
@@ -647,6 +645,24 @@ impl OnboardingView {
     }
 }
 
+fn remove_dir_all_retrying(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            let mut last = error;
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(250));
+                match std::fs::remove_dir_all(dir) {
+                    Ok(()) => return Ok(()),
+                    Err(retry_error) => last = retry_error,
+                }
+            }
+            Err(format!("removing {}: {last}", dir.display()))
+        }
+    }
+}
+
 fn spawn_model_download(
     spec: &'static ModelSpec,
     purge_first: bool,
@@ -658,18 +674,13 @@ fn spawn_model_download(
         if purge_first {
             let purged = kind_by_id(spec.id).and_then(repo_cache_dir_for);
             if let Some(repo_dir) = purged {
-                match std::fs::remove_dir_all(&repo_dir) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        let text = format!("removing old cache: {error}");
-                        log!("app", "download FAILED: {text}");
-                        let _ = download.send(DownloadMessage::Finished {
-                            generation,
-                            result: Err(text),
-                        });
-                        return;
-                    }
+                if let Err(text) = remove_dir_all_retrying(&repo_dir) {
+                    log!("app", "download FAILED: {text}");
+                    let _ = download.send(DownloadMessage::Finished {
+                        generation,
+                        result: Err(text),
+                    });
+                    return;
                 }
             }
         }
@@ -1001,6 +1012,7 @@ struct AppRoot {
     pending_start: bool,
     download_generation: u64,
     cancel_flag: Option<Arc<AtomicBool>>,
+    worker_live: bool,
 }
 
 impl AppRoot {
@@ -1023,7 +1035,7 @@ impl AppRoot {
                         log!("app", "F9 ignored while settings open");
                     }
                     SetupOrigin::FirstRun | SetupOrigin::Recovery => {
-                        if view.read(cx).model_ready() {
+                        if view.read(cx).model_ready() || self.worker_live {
                             self.pending_start = true;
                             log!("app", "F9 during setup: queued start after models load");
                             view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
@@ -1101,6 +1113,22 @@ impl AppRoot {
             log!("app", "download ignored: unknown model '{captured_model}'");
             return;
         };
+        if purge && self.worker_live {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::Shutdown);
+                    log!("app", "releasing loaded model before re-download purge");
+                    self.worker_live = false;
+                }
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel before purge"
+                    );
+                    self.worker_live = false;
+                }
+            }
+        }
         self.download_generation += 1;
         let generation = self.download_generation;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1177,6 +1205,7 @@ impl AppRoot {
                     log!("app", "cancel ignored: no download in flight");
                 }
             }
+            UiMessage::DeleteRequest { captured_model } => self.delete_model(captured_model),
             UiMessage::DeleteFinished(result) => {
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
                     view.update(cx, |onboarding, cx| onboarding.delete_finished(result, cx));
@@ -1184,6 +1213,34 @@ impl AppRoot {
             }
             UiMessage::ResetSetup { captured_model } => self.reset_setup(captured_model, cx),
         }
+    }
+
+    fn delete_model(&mut self, captured_model: &'static str) {
+        let kind = kind_by_id(captured_model).unwrap_or(ModelKind::Nemotron);
+        let Some(dir) = repo_cache_dir_for(kind) else {
+            return;
+        };
+        if self.worker_live {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::Shutdown);
+                    log!("app", "releasing loaded model before delete");
+                    self.worker_live = false;
+                }
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel before delete"
+                    );
+                    self.worker_live = false;
+                }
+            }
+        }
+        let ui = self.ui.clone();
+        thread::spawn(move || {
+            let result = remove_dir_all_retrying(&dir);
+            let _ = ui.send(UiMessage::DeleteFinished(result));
+        });
     }
 
     fn reset_setup(&mut self, captured_model: &'static str, cx: &mut Context<Self>) {
@@ -1213,26 +1270,27 @@ impl AppRoot {
             Ok(()) => log!("app", "config saved: model={}", config.model),
             Err(error) => log!("app", "config save FAILED: {error}"),
         }
-        if matches!(
-            self.screen,
-            Screen::Onboarding {
-                origin: SetupOrigin::Settings | SetupOrigin::Respawn,
-                ..
-            }
-        ) {
+        if self.worker_live {
             match self.commands.clone() {
                 Some(commands) => {
                     let _ = commands.send(Command::SetModel(model));
-                    log!("app", "SetModel sent to worker: {}", model.spec().id);
+                    log!("app", "SetModel sent to live worker: {}", model.spec().id);
                 }
-                None => log!("app", "ERROR: no worker channel for SetModel"),
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel; cannot send SetModel"
+                    );
+                }
             }
+            self.pending_start = false;
             self.screen = Screen::Dictation;
             cx.notify();
             return;
         }
         let selection = ModelSelection { model };
         let commands = asr::spawn_worker(self.events.clone(), selection);
+        self.worker_live = true;
         log!("app", "worker spawned with selection {selection:?}");
         let pending_start = std::mem::replace(&mut self.pending_start, false);
         let dictation = cx.new(|_| {
@@ -1425,6 +1483,7 @@ fn main() {
                 };
 
                 let app = cx.new(|_| AppRoot {
+                    worker_live: dictation.is_some(),
                     screen,
                     dictation,
                     commands,
