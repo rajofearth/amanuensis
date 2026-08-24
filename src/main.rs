@@ -2092,19 +2092,28 @@ fn main() {
 }
 
 fn acquire_single_instance_lock() -> bool {
-    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW, MUTEX_MODIFY_STATE};
     let name: Vec<u16> = "Local\\raycast-dictation-single-instance"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    let existing = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
+    if !existing.is_null() {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(existing) };
+        return false;
+    }
+    let missing = unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_FILE_NOT_FOUND;
+    if !missing {
+        log!("app", "single-instance mutex probe failed unexpectedly");
+        return false;
+    }
     let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if handle.is_null() {
         log!("app", "single-instance mutex creation failed");
         return false;
     }
-    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-    error == ERROR_ALREADY_EXISTS
+    true
 }
 
 fn rms_level(samples: &[f32]) -> f32 {
