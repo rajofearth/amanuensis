@@ -67,15 +67,17 @@ pub fn repo_cache_dir_for(kind: ModelKind) -> Option<std::path::PathBuf> {
 pub fn ensure_model_by_spec(
     spec: &ModelSpec,
     on_progress: &mut dyn FnMut(DownloadProgress),
-) -> Result<ModelPaths, String> {
-    fetch::ensure_model(spec, on_progress)
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<ModelPaths>, String> {
+    fetch::ensure_model(spec, on_progress, cancel)
 }
 
 pub fn ensure_model(
     kind: ModelKind,
     on_progress: &mut dyn FnMut(DownloadProgress),
-) -> Result<ModelPaths, String> {
-    ensure_model_by_spec(kind.spec(), on_progress)
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<ModelPaths>, String> {
+    ensure_model_by_spec(kind.spec(), on_progress, cancel)
 }
 
 pub fn is_model_cached(spec_id: &str) -> bool {

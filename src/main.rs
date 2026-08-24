@@ -1,5 +1,6 @@
 use std::{
-    sync::mpsc,
+    collections::VecDeque,
+    sync::{Arc, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -13,9 +14,10 @@ use gpui::{
     prelude::*, px, relative, rgb, size,
 };
 use gpui_platform::application;
+use raycast_dictation_clone::asr::fetch::{EtaSample, eta_left, progress_status};
 use raycast_dictation_clone::asr::{
-    self, Command, Event, Mode, ModelKind, ModelSelection, ModelSpec, cache_dir_for,
-    ensure_model_by_spec, is_model_cached, kind_by_id, progress_text, repo_cache_dir_for,
+    self, Command, DownloadProgress, Event, Mode, ModelKind, ModelSelection, ModelSpec,
+    cache_dir_for, ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
 };
 use raycast_dictation_clone::audio;
@@ -40,13 +42,29 @@ enum PasteResult {
 }
 
 enum DownloadMessage {
-    Progress(String),
-    Finished(Result<ModelKind, String>),
+    Progress {
+        generation: u64,
+        progress: DownloadProgress,
+    },
+    Finished {
+        generation: u64,
+        result: Result<ModelKind, String>,
+    },
+    Cancelled {
+        generation: u64,
+    },
 }
 
 enum UiMessage {
     OpenSettings,
-    ResetSetup { captured_model: &'static str },
+    StartDownload {
+        captured_model: &'static str,
+        purge: bool,
+    },
+    CancelDownload,
+    ResetSetup {
+        captured_model: &'static str,
+    },
     DeleteFinished(Result<(), String>),
 }
 
@@ -397,8 +415,11 @@ struct OnboardingView {
     error: Option<String>,
     notice: Option<String>,
     busy: bool,
+    downloading: bool,
+    cancel_requested: bool,
+    progress: Option<DownloadProgress>,
+    eta_samples: VecDeque<EtaSample>,
     start_queued: bool,
-    download: mpsc::Sender<DownloadMessage>,
     ui: mpsc::Sender<UiMessage>,
 }
 
@@ -407,7 +428,6 @@ impl OnboardingView {
         origin: SetupOrigin,
         device: (u32, usize),
         model_id: &'static str,
-        download: mpsc::Sender<DownloadMessage>,
         ui: mpsc::Sender<UiMessage>,
     ) -> Self {
         Self {
@@ -419,8 +439,11 @@ impl OnboardingView {
             error: None,
             notice: None,
             busy: false,
+            downloading: false,
+            cancel_requested: false,
+            progress: None,
+            eta_samples: VecDeque::new(),
             start_queued: false,
-            download,
             ui,
         }
     }
@@ -441,14 +464,39 @@ impl OnboardingView {
         cx.notify();
     }
 
-    fn set_status(&mut self, text: String, cx: &mut Context<Self>) {
-        self.status = Some(text);
+    fn download_progress(&mut self, progress: DownloadProgress, cx: &mut Context<Self>) {
+        self.eta_samples.push_back(EtaSample {
+            at: Instant::now(),
+            done: progress.done,
+        });
+        while self.eta_samples.len() > 32 {
+            self.eta_samples.pop_front();
+        }
+        self.progress = Some(progress);
+        cx.notify();
+    }
+
+    fn download_cancelled(&mut self, cx: &mut Context<Self>) {
+        log!("app", "download cancelled");
+        self.busy = false;
+        self.downloading = false;
+        self.cancel_requested = false;
+        self.progress = None;
+        self.eta_samples.clear();
+        self.status = Some(
+            "Cancelled — progress saved; the next Start resumes from the same byte offset."
+                .to_owned(),
+        );
         cx.notify();
     }
 
     fn download_failed(&mut self, error: String, cx: &mut Context<Self>) {
         log!("app", "download FAILED: {error}");
         self.busy = false;
+        self.downloading = false;
+        self.cancel_requested = false;
+        self.progress = None;
+        self.eta_samples.clear();
         self.error = Some(error);
         cx.notify();
     }
@@ -483,11 +531,18 @@ impl OnboardingView {
             return;
         };
         self.busy = true;
+        self.downloading = true;
+        self.cancel_requested = false;
         self.error = None;
         self.notice = None;
+        self.progress = None;
+        self.eta_samples.clear();
         self.status = Some(format!("checking {} …", spec.display_name));
-        log!("app", "download started: {}", spec.id);
-        spawn_model_download(spec, false, self.download.clone());
+        log!("app", "download requested: {}", spec.id);
+        let _ = self.ui.send(UiMessage::StartDownload {
+            captured_model: self.model_id,
+            purge: false,
+        });
         cx.notify();
     }
 
@@ -576,11 +631,18 @@ impl OnboardingView {
             return;
         }
         self.busy = true;
+        self.downloading = true;
+        self.cancel_requested = false;
         self.error = None;
         self.notice = None;
+        self.progress = None;
+        self.eta_samples.clear();
         self.status = Some(format!("re-downloading {} …", spec.display_name));
-        log!("app", "download-again started: {}", spec.id);
-        spawn_model_download(spec, true, self.download.clone());
+        log!("app", "download-again requested: {}", spec.id);
+        let _ = self.ui.send(UiMessage::StartDownload {
+            captured_model: self.model_id,
+            purge: true,
+        });
         cx.notify();
     }
 }
@@ -588,6 +650,8 @@ impl OnboardingView {
 fn spawn_model_download(
     spec: &'static ModelSpec,
     purge_first: bool,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
     download: mpsc::Sender<DownloadMessage>,
 ) {
     thread::spawn(move || {
@@ -600,42 +664,60 @@ fn spawn_model_download(
                     Err(error) => {
                         let text = format!("removing old cache: {error}");
                         log!("app", "download FAILED: {text}");
-                        let _ = download.send(DownloadMessage::Finished(Err(text)));
+                        let _ = download.send(DownloadMessage::Finished {
+                            generation,
+                            result: Err(text),
+                        });
                         return;
                     }
                 }
             }
         }
-        run_download(spec, download);
+        run_download(spec, generation, cancel, download);
     });
 }
 
-fn run_download(spec: &'static ModelSpec, download: mpsc::Sender<DownloadMessage>) {
-    let _ = download.send(DownloadMessage::Progress(format!(
-        "checking {} …",
-        spec.display_name
-    )));
-    match ensure_model_by_spec(spec, &mut |progress| {
-        log!(
-            "app",
-            "download progress: {} · {} B / {} B",
-            progress.file,
-            progress.done,
-            progress.total
-        );
-        let _ = download.send(DownloadMessage::Progress(progress_text(
-            spec.display_name,
-            &progress,
-        )));
-    }) {
-        Ok(_) => {
+fn run_download(
+    spec: &'static ModelSpec,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    download: mpsc::Sender<DownloadMessage>,
+) {
+    match ensure_model_by_spec(
+        spec,
+        &mut |progress| {
+            log!(
+                "app",
+                "download progress: {} · {} B / {} B",
+                progress.file,
+                progress.done,
+                progress.total
+            );
+            let _ = download.send(DownloadMessage::Progress {
+                generation,
+                progress,
+            });
+        },
+        Some(&cancel),
+    ) {
+        Ok(Some(_)) => {
             if let Some(kind) = kind_by_id(spec.id) {
                 log!("app", "download finished for {}", spec.id);
-                let _ = download.send(DownloadMessage::Finished(Ok(kind)));
+                let _ = download.send(DownloadMessage::Finished {
+                    generation,
+                    result: Ok(kind),
+                });
             }
         }
+        Ok(None) => {
+            log!("app", "download cancelled for {}", spec.id);
+            let _ = download.send(DownloadMessage::Cancelled { generation });
+        }
         Err(error) => {
-            let _ = download.send(DownloadMessage::Finished(Err(error)));
+            let _ = download.send(DownloadMessage::Finished {
+                generation,
+                result: Err(error),
+            });
         }
     }
 }
@@ -740,11 +822,49 @@ impl Render for OnboardingView {
                     .text_color(rgb(0xcc9933))
                     .child(warnings.join("; "))
             }))
-            .children(self.status.clone().map(|status| {
+            .children(match self.progress.clone() {
+                Some(progress) => {
+                    let eta = eta_left(
+                        self.eta_samples.make_contiguous(),
+                        progress.done,
+                        progress.total,
+                    );
+                    Some(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x33cc66))
+                            .child(progress_status(
+                                spec.display_name,
+                                &progress,
+                                eta.as_deref(),
+                            )),
+                    )
+                }
+                None => self.status.clone().map(|status| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0x33cc66))
+                        .child(status)
+                }),
+            })
+            .children(self.progress.as_ref().map(|progress| {
+                let fraction = if progress.total > 0 {
+                    (progress.done as f32 / progress.total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 div()
-                    .text_size(px(11.))
-                    .text_color(rgb(0x33cc66))
-                    .child(status)
+                    .w_full()
+                    .h(px(3.))
+                    .rounded_sm()
+                    .bg(rgb(0x1e1e1e))
+                    .child(
+                        div()
+                            .h(px(3.))
+                            .rounded_sm()
+                            .bg(rgb(0x33cc66))
+                            .w(relative(fraction)),
+                    )
             }))
             .children(self.error.clone().map(|error| {
                 div()
@@ -781,7 +901,26 @@ impl Render for OnboardingView {
                     .child("Start dictating")
                     .on_click(cx.listener(|this, _, _, cx| this.start_clicked(cx))),
             )
-            .child(
+            .children((self.busy && self.downloading).then(|| {
+                action_button(
+                    "cancel",
+                    if self.cancel_requested {
+                        "Cancelling…"
+                    } else {
+                        "Cancel"
+                    },
+                    !self.cancel_requested,
+                )
+                .on_click(cx.listener(|this, _, _, _| {
+                    if this.cancel_requested {
+                        log!("app", "cancel ignored: already requested");
+                        return;
+                    }
+                    log!("app", "cancel requested");
+                    let _ = this.ui.send(UiMessage::CancelDownload);
+                }))
+            }))
+            .children((!(self.busy && self.downloading)).then(|| {
                 div()
                     .flex()
                     .flex_wrap()
@@ -814,8 +953,8 @@ impl Render for OnboardingView {
                                 });
                             }),
                         )
-                    })),
-            )
+                    }))
+            }))
     }
 }
 
@@ -860,6 +999,8 @@ struct AppRoot {
     downloads: mpsc::Sender<DownloadMessage>,
     ui: mpsc::Sender<UiMessage>,
     pending_start: bool,
+    download_generation: u64,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl AppRoot {
@@ -946,15 +1087,8 @@ impl AppRoot {
         });
         log!("app", "opening settings: model={model_id}");
         let device = detect_device();
-        let view = cx.new(|_| {
-            OnboardingView::new(
-                SetupOrigin::Settings,
-                device,
-                model_id,
-                self.downloads.clone(),
-                self.ui.clone(),
-            )
-        });
+        let view = cx
+            .new(|_| OnboardingView::new(SetupOrigin::Settings, device, model_id, self.ui.clone()));
         self.screen = Screen::Onboarding {
             view,
             origin: SetupOrigin::Settings,
@@ -962,17 +1096,68 @@ impl AppRoot {
         cx.notify();
     }
 
+    fn start_download(&mut self, captured_model: &'static str, purge: bool) {
+        let Some(spec) = spec_by_id(captured_model) else {
+            log!("app", "download ignored: unknown model '{captured_model}'");
+            return;
+        };
+        self.download_generation += 1;
+        let generation = self.download_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_flag = Some(cancel.clone());
+        log!(
+            "app",
+            "download started: {} (generation {generation}, purge={purge})",
+            spec.id
+        );
+        spawn_model_download(spec, purge, generation, cancel, self.downloads.clone());
+    }
+
     fn handle_download_message(&mut self, message: DownloadMessage, cx: &mut Context<Self>) {
         match message {
-            DownloadMessage::Progress(text) => {
+            DownloadMessage::Progress {
+                generation,
+                progress,
+            } => {
+                if generation != self.download_generation {
+                    log!(
+                        "app",
+                        "stale download progress dropped (generation {generation})"
+                    );
+                    return;
+                }
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
-                    view.update(cx, |onboarding, cx| onboarding.set_status(text, cx));
+                    view.update(cx, |onboarding, cx| {
+                        onboarding.download_progress(progress, cx)
+                    });
                 }
             }
-            DownloadMessage::Finished(Ok(model)) => self.finish_onboarding(model, cx),
-            DownloadMessage::Finished(Err(error)) => {
+            DownloadMessage::Finished { generation, result } => {
+                if generation != self.download_generation {
+                    log!(
+                        "app",
+                        "stale download finish dropped (generation {generation})"
+                    );
+                    return;
+                }
+                self.cancel_flag = None;
+                match result {
+                    Ok(model) => self.finish_onboarding(model, cx),
+                    Err(error) => {
+                        if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                            view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
+                        }
+                    }
+                }
+            }
+            DownloadMessage::Cancelled { generation } => {
+                if generation != self.download_generation {
+                    log!("app", "stale cancel dropped (generation {generation})");
+                    return;
+                }
+                self.cancel_flag = None;
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
-                    view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
+                    view.update(cx, |onboarding, cx| onboarding.download_cancelled(cx));
                 }
             }
         }
@@ -981,6 +1166,17 @@ impl AppRoot {
     fn handle_ui_message(&mut self, message: UiMessage, cx: &mut Context<Self>) {
         match message {
             UiMessage::OpenSettings => self.open_settings(cx),
+            UiMessage::StartDownload {
+                captured_model,
+                purge,
+            } => self.start_download(captured_model, purge),
+            UiMessage::CancelDownload => {
+                if let Some(flag) = &self.cancel_flag {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    log!("app", "cancel ignored: no download in flight");
+                }
+            }
             UiMessage::DeleteFinished(result) => {
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
                     view.update(cx, |onboarding, cx| onboarding.delete_finished(result, cx));
@@ -1000,15 +1196,8 @@ impl AppRoot {
         let model_id = spec_by_id(captured_model).map_or(default_id, |spec| spec.id);
         log!("app", "re-entering setup with model={model_id}");
         let device = detect_device();
-        let view = cx.new(|_| {
-            OnboardingView::new(
-                SetupOrigin::Respawn,
-                device,
-                model_id,
-                self.downloads.clone(),
-                self.ui.clone(),
-            )
-        });
+        let view = cx
+            .new(|_| OnboardingView::new(SetupOrigin::Respawn, device, model_id, self.ui.clone()));
         self.screen = Screen::Onboarding {
             view,
             origin: SetupOrigin::Respawn,
@@ -1196,7 +1385,6 @@ fn main() {
                                     SetupOrigin::Recovery,
                                     device,
                                     model_id,
-                                    download_sender.clone(),
                                     ui_sender.clone(),
                                 )
                             });
@@ -1222,7 +1410,6 @@ fn main() {
                                 SetupOrigin::FirstRun,
                                 device,
                                 "nemotron",
-                                download_sender.clone(),
                                 ui_sender.clone(),
                             )
                         });
@@ -1246,6 +1433,8 @@ fn main() {
                     downloads: download_sender,
                     ui: ui_sender,
                     pending_start: false,
+                    download_generation: 0,
+                    cancel_flag: None,
                 });
 
                 window

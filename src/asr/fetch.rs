@@ -1,6 +1,8 @@
 use std::{
     io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
 };
 
 use crate::config;
@@ -118,12 +120,71 @@ pub fn progress_text(display_name: &str, progress: &DownloadProgress) -> String 
     )
 }
 
+pub fn progress_status(
+    display_name: &str,
+    progress: &DownloadProgress,
+    eta: Option<&str>,
+) -> String {
+    let eta_part = eta.map(|eta| format!(" · {eta}")).unwrap_or_default();
+    format!(
+        "Downloading {} — {}{} ({})",
+        display_name,
+        mb_summary(progress.done, progress.total),
+        eta_part,
+        progress.file
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EtaSample {
+    pub at: Instant,
+    pub done: u64,
+}
+
+pub fn eta_left(samples: &[EtaSample], done: u64, total: u64) -> Option<String> {
+    let last = *samples.last()?;
+    let window: Vec<EtaSample> = samples
+        .iter()
+        .copied()
+        .filter(|sample| last.at.duration_since(sample.at).as_secs_f64() <= 10.0)
+        .collect();
+    let first = *window.first()?;
+    let span = last.at.duration_since(first.at).as_secs_f64();
+    if window.len() < 2 || span < 2.0 {
+        return None;
+    }
+    let delta = last.done.saturating_sub(first.done);
+    if delta == 0 {
+        return None;
+    }
+    let rate = delta as f64 / span;
+    let remaining = total.saturating_sub(done) as f64 / rate;
+    Some(format_seconds(remaining))
+}
+
+fn format_seconds(seconds: f64) -> String {
+    let whole = seconds.round() as u64;
+    if whole < 60 {
+        format!("~{whole}s left")
+    } else {
+        format!("~{}m {}s left", whole / 60, whole % 60)
+    }
+}
+
+pub fn generation_is_current(message_generation: u64, current_generation: u64) -> bool {
+    message_generation == current_generation
+}
+
 pub fn ensure_file(
     spec: &ModelSpec,
     file: &str,
     expected_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
     on_chunk: &mut dyn FnMut(u64),
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Ok(false);
+    }
     let url = file_url(spec, file);
     let expected = match expected_size {
         Some(size) => Some(size),
@@ -146,7 +207,7 @@ pub fn ensure_file(
             None => meta.len() > 0,
         };
         if accepted {
-            return Ok(());
+            return Ok(true);
         }
     }
     let part_path = PathBuf::from(format!("{}.part", final_path.display()));
@@ -195,6 +256,9 @@ pub fn ensure_file(
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                    return Ok(false);
+                }
                 std::io::Write::write_all(&mut out, &buffer[..n])
                     .map_err(|error| format!("writing {}: {error}", part_path.display()))?;
                 done += n as u64;
@@ -215,13 +279,17 @@ pub fn ensure_file(
     }
     std::fs::rename(&part_path, &final_path)
         .map_err(|error| format!("promoting {file}: {error}"))?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn ensure_model(
     spec: &ModelSpec,
     on_progress: &mut dyn FnMut(DownloadProgress),
-) -> Result<ModelPaths, String> {
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<ModelPaths>, String> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Ok(None);
+    }
     let dir = cached_model_dir(spec);
     std::fs::create_dir_all(&dir).map_err(|error| format!("creating model dir: {error}"))?;
     let known_sizes: Vec<Option<u64>> = MODEL_FILES
@@ -233,11 +301,17 @@ pub fn ensure_model(
         .fold(0, |sum, size| sum + size.unwrap_or(0));
     let mut aggregate = Aggregate::new(total);
     for (index, file) in MODEL_FILES.iter().enumerate() {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Ok(None);
+        }
         let expected = known_sizes[index];
         let file_name = (*file).to_owned();
-        ensure_file(spec, file, expected, &mut |streamed| {
+        let completed = ensure_file(spec, file, expected, cancel, &mut |streamed| {
             on_progress(aggregate.current(&file_name, streamed));
         })?;
+        if !completed {
+            return Ok(None);
+        }
         let finished = expected.unwrap_or_else(|| {
             std::fs::metadata(dir.join(file))
                 .map(|meta| meta.len())
@@ -245,12 +319,12 @@ pub fn ensure_model(
         });
         aggregate.finish_file(finished);
     }
-    Ok(ModelPaths {
+    Ok(Some(ModelPaths {
         encoder: dir.join(MODEL_FILES[0]),
         decoder: dir.join(MODEL_FILES[1]),
         joiner: dir.join(MODEL_FILES[2]),
         tokens: dir.join(MODEL_FILES[3]),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -309,5 +383,61 @@ mod tests {
         assert!(!dir_complete(&dir, &["a.bin", "b.bin"]));
         assert!(!dir_complete(&dir, &["a.bin", "missing.bin"]));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn sample(seconds_ago: f64, done: u64) -> EtaSample {
+        EtaSample {
+            at: Instant::now() - std::time::Duration::from_secs_f64(seconds_ago),
+            done,
+        }
+    }
+
+    #[test]
+    fn eta_qualifies_after_two_second_window() {
+        let samples = [
+            sample(6.0, 100_000_000),
+            sample(3.0, 200_000_000),
+            sample(0.0, 300_000_000),
+        ];
+        assert_eq!(
+            eta_left(&samples, 300_000_000, 600_000_000),
+            Some("~9s left".to_owned())
+        );
+    }
+
+    #[test]
+    fn eta_none_until_window_spans_two_seconds() {
+        let samples = [sample(1.5, 100), sample(0.0, 200)];
+        assert_eq!(eta_left(&samples, 200, 600), None);
+        assert_eq!(eta_left(&[sample(0.0, 100)], 100, 600), None);
+        assert_eq!(eta_left(&[], 0, 600), None);
+    }
+
+    #[test]
+    fn eta_evicts_stale_samples() {
+        let samples = [sample(60.0, 10_000_000), sample(0.5, 11_000_000)];
+        assert_eq!(eta_left(&samples, 11_000_000, 700_000_000), None);
+    }
+
+    #[test]
+    fn eta_formats_minutes_and_seconds() {
+        let samples = [sample(4.0, 0), sample(0.0, 4_000_000)];
+        let eta = eta_left(&samples, 4_000_000, 1_000_000_000).unwrap();
+        assert_eq!(eta, "~16m 36s left");
+        let samples = [sample(4.0, 0), sample(0.0, 400_000_000)];
+        let eta = eta_left(&samples, 400_000_000, 1_000_000_000).unwrap();
+        assert_eq!(eta, "~6s left");
+    }
+
+    #[test]
+    fn eta_none_when_no_progress_in_window() {
+        let samples = [sample(6.0, 500), sample(0.0, 500)];
+        assert_eq!(eta_left(&samples, 500, 700_000_000), None);
+    }
+
+    #[test]
+    fn generation_guard_matches_only_current() {
+        assert!(generation_is_current(7, 7));
+        assert!(!generation_is_current(6, 7));
     }
 }

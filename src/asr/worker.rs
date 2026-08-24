@@ -311,13 +311,18 @@ fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
         "checking {} model",
         kind.spec().display_name
     )));
-    match model::ensure_model(kind, &mut |progress| {
-        let _ = events.send(Event::LoadingProgress(model::progress_text(
-            kind.spec().display_name,
-            &progress,
-        )));
-    }) {
-        Ok(paths) => Some(paths),
+    match model::ensure_model(
+        kind,
+        &mut |progress| {
+            let _ = events.send(Event::LoadingProgress(model::progress_text(
+                kind.spec().display_name,
+                &progress,
+            )));
+        },
+        None,
+    ) {
+        Ok(Some(paths)) => Some(paths),
+        Ok(None) => None,
         Err(error) => {
             log!("asr", "ERROR: model fetch failed: {error}");
             let _ = events.send(Event::LoadingProgress("model fetch failed".to_owned()));

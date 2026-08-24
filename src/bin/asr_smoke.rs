@@ -52,9 +52,9 @@ fn main() {
 
 fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
     let spec = kind.spec();
-    fetch::ensure_file(spec, "test_wavs/0.wav", None, &mut |_| {})
+    fetch::ensure_file(spec, "test_wavs/0.wav", None, None, &mut |_| {})
         .expect("download test_wavs/0.wav");
-    fetch::ensure_file(spec, "test_wavs/trans.txt", None, &mut |_| {})
+    fetch::ensure_file(spec, "test_wavs/trans.txt", None, None, &mut |_| {})
         .expect("download test_wavs/trans.txt");
 
     let dir = fetch::cached_model_dir(spec);
