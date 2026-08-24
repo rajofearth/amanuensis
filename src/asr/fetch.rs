@@ -135,10 +135,64 @@ pub fn progress_status(
     )
 }
 
+pub fn progress_summary(done: u64, total: u64, eta: Option<&str>) -> String {
+    let eta_part = eta.map(|eta| format!(" · {eta}")).unwrap_or_default();
+    format!("{}{}", mb_summary(done, total), eta_part)
+}
+
+pub fn path_is_dir(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EtaSample {
     pub at: Instant,
     pub done: u64,
+}
+
+pub struct EtaTracker {
+    samples: std::collections::VecDeque<EtaSample>,
+    min_interval: std::time::Duration,
+    capacity: usize,
+}
+
+impl Default for EtaTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EtaTracker {
+    pub fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            min_interval: std::time::Duration::from_millis(250),
+            capacity: 32,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn push(&mut self, done: u64, at: Instant) {
+        if let Some(last) = self.samples.back()
+            && at.duration_since(last.at) < self.min_interval
+        {
+            return;
+        }
+        self.samples.push_back(EtaSample { at, done });
+        while self.samples.len() > self.capacity {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn estimate(&self, done: u64, total: u64) -> Option<String> {
+        let snapshot: Vec<EtaSample> = self.samples.iter().copied().collect();
+        eta_left(&snapshot, done, total)
+    }
 }
 
 pub fn eta_left(samples: &[EtaSample], done: u64, total: u64) -> Option<String> {
@@ -439,5 +493,44 @@ mod tests {
     fn generation_guard_matches_only_current() {
         assert!(generation_is_current(7, 7));
         assert!(!generation_is_current(6, 7));
+    }
+
+    #[test]
+    fn eta_tracker_throttles_progress_flood_so_window_qualifies() {
+        let t0 = Instant::now();
+        let mut tracker = EtaTracker::new();
+        tracker.push(0, t0);
+        for step in 1..=200_u64 {
+            tracker.push(step * 100_000, t0 + std::time::Duration::from_millis(step));
+        }
+        assert_eq!(tracker.samples.len(), 1);
+        assert_eq!(tracker.estimate(200 * 100_000, 700_000_000), None);
+        tracker.push(300_000_000, t0 + std::time::Duration::from_secs(3));
+        let estimate = tracker
+            .estimate(300_000_000, 700_000_000)
+            .expect("window spans 3s after throttle");
+        assert!(estimate.ends_with("left"));
+    }
+
+    #[test]
+    fn eta_tracker_clear_resets_samples() {
+        let mut tracker = EtaTracker::new();
+        tracker.push(100, Instant::now());
+        assert!(!tracker.samples.is_empty());
+        tracker.clear();
+        assert!(tracker.samples.is_empty());
+        assert_eq!(tracker.estimate(100, 600), None);
+    }
+
+    #[test]
+    fn path_is_dir_distinguishes_dir_file_and_missing() {
+        let dir = temp_dir("isdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(path_is_dir(&dir));
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!path_is_dir(&file));
+        assert!(!path_is_dir(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

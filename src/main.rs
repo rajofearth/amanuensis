@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     sync::{Arc, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant},
@@ -14,7 +13,9 @@ use gpui::{
     prelude::*, px, relative, rgb, size,
 };
 use gpui_platform::application;
-use raycast_dictation_clone::asr::fetch::{EtaSample, eta_left, progress_status};
+use raycast_dictation_clone::asr::fetch::{
+    EtaTracker, path_is_dir, progress_status, progress_summary,
+};
 use raycast_dictation_clone::asr::{
     self, Command, DownloadProgress, Event, Mode, ModelKind, ModelSelection, ModelSpec,
     cache_dir_for, ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for,
@@ -25,6 +26,7 @@ use raycast_dictation_clone::config::{self, AppConfig};
 use raycast_dictation_clone::log;
 use raycast_dictation_clone::logging;
 use raycast_dictation_clone::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
+use raycast_dictation_clone::setup_steps::{SetupStep, StepEvent, next_step};
 use raycast_dictation_clone::win_focus::{self, FocusTarget};
 
 const BARS: usize = 26;
@@ -62,6 +64,9 @@ enum UiMessage {
         purge: bool,
     },
     CancelDownload,
+    FinishOnboarding {
+        captured_model: &'static str,
+    },
     DeleteRequest {
         captured_model: &'static str,
     },
@@ -421,7 +426,8 @@ struct OnboardingView {
     downloading: bool,
     cancel_requested: bool,
     progress: Option<DownloadProgress>,
-    eta_samples: VecDeque<EtaSample>,
+    eta: EtaTracker,
+    step: Option<SetupStep>,
     start_queued: bool,
     ui: mpsc::Sender<UiMessage>,
 }
@@ -445,7 +451,8 @@ impl OnboardingView {
             downloading: false,
             cancel_requested: false,
             progress: None,
-            eta_samples: VecDeque::new(),
+            eta: EtaTracker::new(),
+            step: (origin == SetupOrigin::FirstRun).then_some(SetupStep::Welcome),
             start_queued: false,
             ui,
         }
@@ -453,6 +460,16 @@ impl OnboardingView {
 
     fn model_ready(&self) -> bool {
         is_model_cached(self.model_id)
+    }
+
+    fn model_dir_exists(&self) -> bool {
+        kind_by_id(self.model_id)
+            .and_then(repo_cache_dir_for)
+            .is_some_and(|dir| path_is_dir(&dir))
+    }
+
+    fn step_active(&self) -> bool {
+        self.step.is_some()
     }
 
     fn set_blocked_notice(&mut self, cx: &mut Context<Self>) {
@@ -468,13 +485,7 @@ impl OnboardingView {
     }
 
     fn download_progress(&mut self, progress: DownloadProgress, cx: &mut Context<Self>) {
-        self.eta_samples.push_back(EtaSample {
-            at: Instant::now(),
-            done: progress.done,
-        });
-        while self.eta_samples.len() > 32 {
-            self.eta_samples.pop_front();
-        }
+        self.eta.push(progress.done, Instant::now());
         self.progress = Some(progress);
         cx.notify();
     }
@@ -485,11 +496,16 @@ impl OnboardingView {
         self.downloading = false;
         self.cancel_requested = false;
         self.progress = None;
-        self.eta_samples.clear();
-        self.status = Some(
-            "Cancelled — progress saved; the next Start resumes from the same byte offset."
-                .to_owned(),
-        );
+        self.eta.clear();
+        if let Some(step) = self.step {
+            self.step = next_step(step, StepEvent::DownloadCancelled);
+            self.status = Some("Cancelled — it will resume next time.".to_owned());
+        } else {
+            self.status = Some(
+                "Cancelled — progress saved; the next Start resumes from the same byte offset."
+                    .to_owned(),
+            );
+        }
         cx.notify();
     }
 
@@ -499,8 +515,25 @@ impl OnboardingView {
         self.downloading = false;
         self.cancel_requested = false;
         self.progress = None;
-        self.eta_samples.clear();
+        self.eta.clear();
+        if let Some(step) = self.step {
+            self.step = next_step(step, StepEvent::DownloadFailed);
+        }
         self.error = Some(error);
+        cx.notify();
+    }
+
+    fn download_finished_step(&mut self, cx: &mut Context<Self>) {
+        log!("app", "setup download finished");
+        self.busy = false;
+        self.downloading = false;
+        self.cancel_requested = false;
+        self.progress = None;
+        self.eta.clear();
+        if let Some(step) = self.step {
+            self.step = next_step(step, StepEvent::DownloadFinished);
+        }
+        self.status = None;
         cx.notify();
     }
 
@@ -538,9 +571,12 @@ impl OnboardingView {
         self.error = None;
         self.notice = None;
         self.progress = None;
-        self.eta_samples.clear();
+        self.eta.clear();
         self.status = Some(format!("checking {} …", spec.display_name));
         log!("app", "download requested: {}", spec.id);
+        if let Some(step) = self.step {
+            self.step = next_step(step, StepEvent::StartDownload);
+        }
         let _ = self.ui.send(UiMessage::StartDownload {
             captured_model: self.model_id,
             purge: false,
@@ -634,7 +670,7 @@ impl OnboardingView {
         self.error = None;
         self.notice = None;
         self.progress = None;
-        self.eta_samples.clear();
+        self.eta.clear();
         self.status = Some(format!("re-downloading {} …", spec.display_name));
         log!("app", "download-again requested: {}", spec.id);
         let _ = self.ui.send(UiMessage::StartDownload {
@@ -642,6 +678,134 @@ impl OnboardingView {
             purge: true,
         });
         cx.notify();
+    }
+
+    fn render_step(&self, step: SetupStep, spec: &ModelSpec, cx: &mut Context<Self>) -> Div {
+        let base = || {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .p(px(24.))
+                .bg(rgb(0x101010))
+                .text_color(rgb(0xcccccc))
+                .size_full()
+        };
+        match step {
+            SetupStep::Welcome => base()
+                .child(div().text_size(px(26.)).child("Dictation"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(14.))
+                        .child("Hold")
+                        .child(keycap("F9"))
+                        .child(", speak, and your words appear in any app."),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0x909090))
+                        .child(format!(
+                            "One-time setup downloads a voice model (~{} MB). After that, everything runs on your PC — nothing leaves it.",
+                            spec.size_mb
+                        )),
+                )
+                .children((spec.min_ram_gb > self.ram_gb).then(|| {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xcc9933))
+                        .child("Your PC has less memory than recommended — it may run slowly.")
+                }))
+                .children(self.error.clone().map(|error| {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xcc3333))
+                        .child(format!("Something went wrong: {error}"))
+                }))
+                .child(primary_button(
+                    "get-started",
+                    if self.error.is_some() {
+                        "Try again"
+                    } else {
+                        "Get started"
+                    },
+                    cx.listener(|this, _, _, cx| this.start_clicked(cx)),
+                )),
+            SetupStep::Downloading => {
+                let eta = self
+                    .progress
+                    .as_ref()
+                    .and_then(|progress| self.eta.estimate(progress.done, progress.total));
+                base()
+                    .child(div().text_size(px(20.)).child("Setting up your voice model…"))
+                    .children(self.progress.as_ref().map(progress_bar))
+                    .children(self.progress.as_ref().map(|progress| {
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(0x33cc66))
+                            .child(progress_summary(
+                                progress.done,
+                                progress.total,
+                                eta.as_deref(),
+                            ))
+                    }))
+                    .children((self.busy && self.downloading).then(|| {
+                        action_button(
+                            "cancel",
+                            if self.cancel_requested {
+                                "Cancelling…"
+                            } else {
+                                "Cancel"
+                            },
+                            !self.cancel_requested,
+                        )
+                        .on_click(cx.listener(|this, _, _, _| {
+                            if this.cancel_requested {
+                                log!("app", "cancel ignored: already requested");
+                                return;
+                            }
+                            log!("app", "cancel requested");
+                            let _ = this.ui.send(UiMessage::CancelDownload);
+                        }))
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0x909090))
+                            .child("You can cancel — it resumes where it left off."),
+                    )
+            }
+            SetupStep::Ready => base()
+                .child(div().text_size(px(24.)).child("You're all set."))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(14.))
+                        .child("Hold")
+                        .child(keycap("F9"))
+                        .child("and speak — text appears wherever your cursor is."),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0x909090))
+                        .child("Fine-tune anything later in settings."),
+                )
+                .child(primary_button(
+                    "begin",
+                    "Start dictating",
+                    cx.listener(|this, _, _, _| {
+                        let _ = this.ui.send(UiMessage::FinishOnboarding {
+                            captured_model: this.model_id,
+                        });
+                    }),
+                )),
+        }
     }
 }
 
@@ -742,14 +906,16 @@ impl Render for OnboardingView {
                 .text_color(rgb(0xcccccc))
                 .child("unknown model");
         };
-        let cached_now = is_model_cached(spec.id);
-        let mut warnings: Vec<String> = Vec::new();
-        if spec.min_ram_gb > self.ram_gb {
-            warnings.push(format!(
-                "{} recommends >= {} GB RAM (detected {} GB)",
-                spec.display_name, spec.min_ram_gb, self.ram_gb
-            ));
+        if let Some(step) = self.step {
+            return self.render_step(step, spec, cx);
         }
+        let cached_now = is_model_cached(spec.id);
+        let dir_exists = self.model_dir_exists();
+        let download_label = if cached_now {
+            "Download again"
+        } else {
+            "Download"
+        };
         div()
             .flex()
             .flex_col()
@@ -768,18 +934,25 @@ impl Render for OnboardingView {
                         self.ram_gb, self.cores
                     )),
             )
-            .children((self.origin == SetupOrigin::Recovery).then(|| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(0xcc9933))
-                    .child(RECOVERY_NOTICE)
-            }))
-            .children(self.notice.clone().filter(|_| !cached_now).map(|notice| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(0xcc9933))
-                    .child(notice)
-            }))
+            .children(
+                ((self.origin == SetupOrigin::Recovery) && !self.downloading).then(|| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xcc9933))
+                        .child(RECOVERY_NOTICE)
+                }),
+            )
+            .children(
+                self.notice
+                    .clone()
+                    .filter(|_| !cached_now && !self.downloading)
+                    .map(|notice| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xcc9933))
+                            .child(notice)
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -821,25 +994,26 @@ impl Render for OnboardingView {
                             .child(format!("{} MB · {} ms chunks", spec.size_mb, spec.chunk_ms))
                             .child(spec.wer_note),
                     )
-                    .children((!cached_now).then(|| {
+                    .children((!cached_now && !self.downloading).then(|| {
                         div().text_size(px(11.)).text_color(rgb(0xcc9933)).child(
                             "Model not on disk — dictation won't work until you download it.",
                         )
                     })),
             )
-            .children((!warnings.is_empty()).then(|| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(0xcc9933))
-                    .child(warnings.join("; "))
-            }))
+            .children(
+                (spec.min_ram_gb > self.ram_gb && !self.downloading).then(|| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xcc9933))
+                        .child(format!(
+                            "{} recommends >= {} GB RAM (detected {} GB)",
+                            spec.display_name, spec.min_ram_gb, self.ram_gb
+                        ))
+                }),
+            )
             .children(match self.progress.clone() {
                 Some(progress) => {
-                    let eta = eta_left(
-                        self.eta_samples.make_contiguous(),
-                        progress.done,
-                        progress.total,
-                    );
+                    let eta = self.eta.estimate(progress.done, progress.total);
                     Some(
                         div()
                             .text_size(px(11.))
@@ -858,25 +1032,7 @@ impl Render for OnboardingView {
                         .child(status)
                 }),
             })
-            .children(self.progress.as_ref().map(|progress| {
-                let fraction = if progress.total > 0 {
-                    (progress.done as f32 / progress.total as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                div()
-                    .w_full()
-                    .h(px(3.))
-                    .rounded_sm()
-                    .bg(rgb(0x1e1e1e))
-                    .child(
-                        div()
-                            .h(px(3.))
-                            .rounded_sm()
-                            .bg(rgb(0x33cc66))
-                            .w(relative(fraction)),
-                    )
-            }))
+            .children(self.progress.as_ref().map(progress_bar))
             .children(self.error.clone().map(|error| {
                 div()
                     .text_size(px(11.))
@@ -937,16 +1093,16 @@ impl Render for OnboardingView {
                     .flex_wrap()
                     .gap(px(8.))
                     .text_size(px(13.))
-                    .child(
+                    .children(dir_exists.then(|| {
                         action_button("reveal", "Reveal in Explorer", !self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.reveal_clicked(cx))),
-                    )
-                    .child(
+                            .on_click(cx.listener(|this, _, _, cx| this.reveal_clicked(cx)))
+                    }))
+                    .children(cached_now.then(|| {
                         action_button("delete", "Delete model", !self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.delete_clicked(cx))),
-                    )
+                            .on_click(cx.listener(|this, _, _, cx| this.delete_clicked(cx)))
+                    }))
                     .child(
-                        action_button("redownload", "Download again", !self.busy)
+                        action_button("redownload", download_label, !self.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.redownload_clicked(cx))),
                     )
                     .children((self.origin == SetupOrigin::Settings).then(|| {
@@ -967,6 +1123,56 @@ impl Render for OnboardingView {
                     }))
             }))
     }
+}
+
+fn keycap(label: &'static str) -> Div {
+    div()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(0x404040))
+        .bg(rgb(0x1c1c1c))
+        .px(px(10.))
+        .py(px(4.))
+        .text_size(px(14.))
+        .child(label)
+}
+
+fn primary_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .rounded_sm()
+        .px(px(16.))
+        .py(px(8.))
+        .bg(rgb(0x33cc66))
+        .text_color(rgb(0x101010))
+        .text_size(px(14.))
+        .child(label)
+        .on_click(move |event, window, app| on_click(event, window, app))
+}
+
+fn progress_bar(progress: &DownloadProgress) -> Div {
+    let fraction = if progress.total > 0 {
+        (progress.done as f32 / progress.total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    div()
+        .w_full()
+        .h(px(3.))
+        .rounded_sm()
+        .bg(rgb(0x1e1e1e))
+        .child(
+            div()
+                .h(px(3.))
+                .rounded_sm()
+                .bg(rgb(0x33cc66))
+                .w(relative(fraction)),
+        )
 }
 
 fn action_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<Div> {
@@ -1170,7 +1376,20 @@ impl AppRoot {
                 }
                 self.cancel_flag = None;
                 match result {
-                    Ok(model) => self.finish_onboarding(model, cx),
+                    Ok(model) => {
+                        let step_flow_view = match self.screen.clone() {
+                            Screen::Onboarding { view, .. } => Some(view),
+                            Screen::Dictation => None,
+                        };
+                        let in_step_flow = step_flow_view
+                            .as_ref()
+                            .is_some_and(|view| view.read(cx).step_active());
+                        if in_step_flow && let Some(view) = step_flow_view {
+                            view.update(cx, |onboarding, cx| onboarding.download_finished_step(cx));
+                        } else {
+                            self.finish_onboarding(model, cx);
+                        }
+                    }
                     Err(error) => {
                         if let Screen::Onboarding { view, .. } = self.screen.clone() {
                             view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
@@ -1204,6 +1423,10 @@ impl AppRoot {
                 } else {
                     log!("app", "cancel ignored: no download in flight");
                 }
+            }
+            UiMessage::FinishOnboarding { captured_model } => {
+                let kind = kind_by_id(captured_model).unwrap_or(ModelKind::Nemotron);
+                self.finish_onboarding(kind, cx);
             }
             UiMessage::DeleteRequest { captured_model } => self.delete_model(captured_model),
             UiMessage::DeleteFinished(result) => {
