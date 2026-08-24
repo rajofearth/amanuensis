@@ -8,7 +8,6 @@ use crate::log;
 
 use super::model;
 use super::nemotron::NemotronBackend;
-use super::unified::UnifiedBackend;
 use super::{AsrBackend, Mode, ModelKind, ModelPaths};
 
 #[derive(Debug)]
@@ -20,23 +19,18 @@ pub enum Command {
     Shutdown,
     ReloadForDebug,
     SwitchMode(Mode),
-    SetModels {
-        record: ModelKind,
-        live: ModelKind,
-    },
+    SetModel(ModelKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
-    pub record: ModelKind,
-    pub live: ModelKind,
+    pub model: ModelKind,
 }
 
 impl Default for ModelSelection {
     fn default() -> Self {
         Self {
-            record: ModelKind::Nemotron,
-            live: ModelKind::Nemotron,
+            model: ModelKind::Nemotron,
         }
     }
 }
@@ -62,13 +56,13 @@ pub fn spawn_worker(events: Sender<Event>, selection: ModelSelection) -> Sender<
 
 fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelSelection) {
     let mut mode = Mode::Record;
-    let Some(paths) = fetch_paths(kind_for(selection, mode), &events) else {
+    let Some(paths) = fetch_paths(selection.model, &events) else {
         return;
     };
 
     let _ = events.send(Event::LoadingProgress("loading recognizer".to_owned()));
     let started = Instant::now();
-    let Some(mut backend) = load_backend(kind_for(selection, mode), &paths) else {
+    let Some(mut backend) = load_backend(&paths) else {
         log!("asr", "ERROR: OnlineRecognizer::create returned None");
         let _ = events.send(Event::LoadingProgress("load failed".to_owned()));
         return;
@@ -83,10 +77,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
         return;
     }
 
-    let (mut record_paths, mut live_paths) = match mode {
-        Mode::Record => (Some(paths), None),
-        Mode::Live => (None, Some(paths)),
-    };
+    let mut cached_paths: Option<ModelPaths> = Some(paths);
 
     let mut active = false;
     let mut session_samples: usize = 0;
@@ -200,19 +191,15 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                     unload_started.elapsed().as_secs_f64(),
                     resident_mib()
                 );
-                let cached = match mode {
-                    Mode::Record => &mut record_paths,
-                    Mode::Live => &mut live_paths,
-                };
-                let Some(paths) = cached.take() else {
+                let Some(paths) = cached_paths.take() else {
                     log!("asr", "ERROR: no cached model paths for reload");
                     return;
                 };
                 let reload_started = Instant::now();
-                match load_backend(kind_for(selection, mode), &paths) {
+                match load_backend(&paths) {
                     Some(reloaded) => {
                         backend = reloaded;
-                        *cached = Some(paths);
+                        cached_paths = Some(paths);
                         log!(
                             "asr",
                             "warm reload {mode:?} in {:.2}s, resident {:.0} MiB",
@@ -228,76 +215,28 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                 }
             }
             Ok(Command::SwitchMode(target)) => {
-                if kind_for(selection, target) == kind_for(selection, mode) {
-                    log!(
-                        "asr",
-                        "switch to {target:?}: same underlying model, keeping recognizer"
-                    );
-                    mode = target;
-                    let _ = events.send(Event::ModelReady(mode));
-                    continue;
-                }
-                let target_kind = kind_for(selection, target);
-                let cached = match target {
-                    Mode::Record => &mut record_paths,
-                    Mode::Live => &mut live_paths,
-                };
-                match load_and_swap(
-                    target,
-                    target_kind,
-                    &mut active,
-                    &mut backend,
-                    &mut last_partial,
-                    cached,
-                    session_samples,
-                    &events,
-                ) {
-                    SwapOutcome::Swapped => mode = target,
-                    SwapOutcome::FetchFailed => {}
-                    SwapOutcome::Fatal => return,
-                }
+                log!(
+                    "asr",
+                    "switch to {target:?}: single resident model, keeping recognizer"
+                );
+                mode = target;
+                let _ = events.send(Event::ModelReady(mode));
             }
-            Ok(Command::SetModels { record, live }) => {
-                if record == selection.record && live == selection.live {
-                    log!(
-                        "asr",
-                        "set models: already {record:?}/{live:?}, nothing to do"
-                    );
+            Ok(Command::SetModel(kind)) => {
+                if kind == selection.model {
+                    log!("asr", "set model: already {kind:?}, nothing to do");
                     continue;
                 }
-                if record != selection.record {
-                    log!(
-                        "asr",
-                        "set models: record {:?} -> {:?}",
-                        selection.record,
-                        record
-                    );
-                    record_paths = None;
-                }
-                if live != selection.live {
-                    log!("asr", "set models: live {:?} -> {:?}", selection.live, live);
-                    live_paths = None;
-                }
-                let active_kind_changed = match mode {
-                    Mode::Record => record != selection.record,
-                    Mode::Live => live != selection.live,
-                };
-                selection = ModelSelection { record, live };
-                if !active_kind_changed {
-                    continue;
-                }
-                let new_kind = kind_for(selection, mode);
-                let cached = match mode {
-                    Mode::Record => &mut record_paths,
-                    Mode::Live => &mut live_paths,
-                };
+                log!("asr", "set model: {:?} -> {:?}", selection.model, kind);
+                selection.model = kind;
+                cached_paths = None;
                 match load_and_swap(
                     mode,
-                    new_kind,
+                    kind,
                     &mut active,
                     &mut backend,
                     &mut last_partial,
-                    cached,
+                    &mut cached_paths,
                     session_samples,
                     &events,
                 ) {
@@ -307,13 +246,6 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
             }
             Ok(Command::Shutdown) | Err(_) => break,
         }
-    }
-}
-
-fn kind_for(selection: ModelSelection, mode: Mode) -> ModelKind {
-    match mode {
-        Mode::Record => selection.record,
-        Mode::Live => selection.live,
     }
 }
 
@@ -352,7 +284,7 @@ fn load_and_swap(
         "loading {kind:?} recognizer"
     )));
     let load_started = Instant::now();
-    let Some(new_backend) = load_backend(kind, &new_paths) else {
+    let Some(new_backend) = load_backend(&new_paths) else {
         log!(
             "asr",
             "ERROR: swap to {kind:?} failed, create returned None"
@@ -388,11 +320,8 @@ fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
     }
 }
 
-fn load_backend(kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
-    match kind {
-        ModelKind::Unified => UnifiedBackend::load(paths).map(|backend| Box::new(backend) as _),
-        ModelKind::Nemotron => NemotronBackend::load(paths).map(|backend| Box::new(backend) as _),
-    }
+fn load_backend(paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
+    NemotronBackend::load(paths).map(|backend| Box::new(backend) as _)
 }
 
 fn resident_mib() -> f64 {

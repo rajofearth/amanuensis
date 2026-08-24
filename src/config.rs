@@ -2,10 +2,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::log;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub record_model: String,
-    pub live_model: String,
+    pub model: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            model: "nemotron".to_owned(),
+        }
+    }
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
@@ -25,9 +34,28 @@ pub fn save(config: &AppConfig) -> Result<(), String> {
     save_to(&config_path()?, config)
 }
 
+pub fn delete() -> Result<bool, String> {
+    let path = config_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("removing {}: {error}", path.display())),
+    }
+}
+
 fn load_from(path: &Path) -> Option<AppConfig> {
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    match serde_json::from_str(&text) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            log!(
+                "config",
+                "config at {} unreadable or schema changed, re-running setup ({error})",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn save_to(path: &Path, config: &AppConfig) -> Result<(), String> {
@@ -56,8 +84,7 @@ mod tests {
     fn save_then_load_roundtrips() {
         let path = temp_path("roundtrip");
         let written = AppConfig {
-            record_model: "nemotron".to_owned(),
-            live_model: "unified".to_owned(),
+            model: "nemotron".to_owned(),
         };
         save_to(&path, &written).expect("save");
         let loaded = load_from(&path).expect("load after save");
@@ -76,6 +103,18 @@ mod tests {
     fn load_corrupt_returns_none() {
         let path = temp_path("corrupt");
         std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_from(&path), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_old_two_slot_schema_returns_none() {
+        let path = temp_path("oldschema");
+        std::fs::write(
+            &path,
+            r#"{"record_model":"nemotron","live_model":"nemotron"}"#,
+        )
+        .unwrap();
         assert_eq!(load_from(&path), None);
         let _ = std::fs::remove_file(path);
     }

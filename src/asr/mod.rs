@@ -1,14 +1,12 @@
 mod model;
 mod nemotron;
-mod unified;
 pub mod worker;
 
 pub use model::{
-    ModelKind, ModelPaths, ModelSpec, REGISTRY, REPO_OWNER, ensure_model, ensure_model_by_spec,
-    is_model_cached, kind_by_id, spec_by_id,
+    ModelKind, ModelPaths, ModelSpec, REGISTRY, REPO_OWNER, cache_dir_for, ensure_model,
+    ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for, spec_by_id,
 };
 pub use nemotron::NemotronBackend;
-pub use unified::UnifiedBackend;
 pub use worker::{Command, Event, ModelSelection, spawn_worker};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

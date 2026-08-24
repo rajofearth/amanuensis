@@ -11,8 +11,7 @@ decode RTF (wall time / audio duration), release build:
 
 | Model | 1 thread | 2 threads (current default) | notes |
 |---|---|---|---|
-| Nemotron (Live)   | ~5.1x | **~2.5x** | ORT intra-op sweet spot at 2; more threads regress (sync overhead on small per-chunk matmuls) |
-| Canary unified (Record) | ~25.9x | **~15.2x** | with native-chunk feeds |
+| Nemotron (both modes) | ~5.1x | **~2.5x** | ORT intra-op sweet spot at 2; more threads regress (sync overhead on small per-chunk matmuls). ~~Canary unified (Record)~~ removed from the app 2026-08-24 (empty-output collapse on real mic audio + ~15x RTF); its row is history. |
 
 Consequences: Live partials lag behind speech (~1.5s behind per second spoken);
 Record mode waits ~15x the recording length after stop before pasting.

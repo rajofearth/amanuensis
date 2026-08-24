@@ -14,8 +14,8 @@ use gpui::{
 };
 use gpui_platform::application;
 use raycast_dictation_clone::asr::{
-    self, Command, Event, Mode, ModelKind, ModelSelection, ModelSpec, REGISTRY,
-    ensure_model_by_spec, is_model_cached, kind_by_id, spec_by_id,
+    self, Command, Event, Mode, ModelKind, ModelSelection, ModelSpec, cache_dir_for,
+    ensure_model_by_spec, is_model_cached, kind_by_id, repo_cache_dir_for, spec_by_id,
 };
 use raycast_dictation_clone::audio;
 use raycast_dictation_clone::config::{self, AppConfig};
@@ -40,11 +40,13 @@ enum PasteResult {
 
 enum DownloadMessage {
     Progress(String),
-    Finished(Result<(ModelKind, ModelKind), String>),
+    Finished(Result<ModelKind, String>),
 }
 
 enum UiMessage {
     OpenSettings,
+    ResetSetup { captured_model: &'static str },
+    DeleteFinished(Result<(), String>),
 }
 
 struct Waveform {
@@ -374,67 +376,49 @@ impl Render for Dictation {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Slot {
-    Record,
-    Live,
+#[derive(Clone, Copy, PartialEq)]
+enum SetupOrigin {
+    FirstRun,
+    Recovery,
+    Settings,
+    Respawn,
 }
 
+const RECOVERY_NOTICE: &str = "Cached model not found — download it below to continue.";
+
 struct OnboardingView {
-    record_id: &'static str,
-    live_id: &'static str,
+    origin: SetupOrigin,
+    model_id: &'static str,
     ram_gb: u32,
     cores: usize,
-    cached: Vec<bool>,
     status: Option<String>,
     error: Option<String>,
-    downloading: bool,
+    busy: bool,
     start_queued: bool,
     download: mpsc::Sender<DownloadMessage>,
+    ui: mpsc::Sender<UiMessage>,
 }
 
 impl OnboardingView {
     fn new(
+        origin: SetupOrigin,
         device: (u32, usize),
+        model_id: &'static str,
         download: mpsc::Sender<DownloadMessage>,
-        record_id: &'static str,
-        live_id: &'static str,
+        ui: mpsc::Sender<UiMessage>,
     ) -> Self {
         Self {
-            record_id,
-            live_id,
+            origin,
+            model_id,
             ram_gb: device.0,
             cores: device.1,
-            cached: REGISTRY
-                .iter()
-                .map(|spec| is_model_cached(spec.id))
-                .collect(),
             status: None,
             error: None,
-            downloading: false,
+            busy: false,
             start_queued: false,
             download,
+            ui,
         }
-    }
-
-    fn refresh_cached(&mut self) {
-        for (index, spec) in REGISTRY.iter().enumerate() {
-            self.cached[index] = is_model_cached(spec.id);
-        }
-    }
-
-    fn assign(&mut self, slot: Slot, id: &'static str, cx: &mut Context<Self>) {
-        match slot {
-            Slot::Record => self.record_id = id,
-            Slot::Live => self.live_id = id,
-        }
-        log!(
-            "app",
-            "model assigned: record={} live={}",
-            self.record_id,
-            self.live_id
-        );
-        cx.notify();
     }
 
     fn queue_start(&mut self, cx: &mut Context<Self>) {
@@ -449,179 +433,160 @@ impl OnboardingView {
 
     fn download_failed(&mut self, error: String, cx: &mut Context<Self>) {
         log!("app", "download FAILED: {error}");
-        self.downloading = false;
+        self.busy = false;
         self.error = Some(error);
-        self.refresh_cached();
+        cx.notify();
+    }
+
+    fn delete_finished(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        self.busy = false;
+        match result {
+            Ok(()) => {
+                log!(
+                    "app",
+                    "model deleted; app keeps running with the in-memory recognizer"
+                );
+                self.status = Some(
+                    "Deleted. Use Download again to re-fetch. The app keeps running with the in-memory model."
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                log!("app", "delete FAILED: {error}");
+                self.error = Some(error);
+            }
+        }
         cx.notify();
     }
 
     fn start_clicked(&mut self, cx: &mut Context<Self>) {
-        if self.downloading {
+        if self.busy {
             return;
         }
-        let Some(record_spec) = spec_by_id(self.record_id) else {
+        let Some(spec) = spec_by_id(self.model_id) else {
             return;
         };
-        let Some(live_spec) = spec_by_id(self.live_id) else {
-            return;
-        };
-        self.downloading = true;
+        self.busy = true;
         self.error = None;
-        self.status = Some(format!("checking {} …", record_spec.display_name));
-        log!(
-            "app",
-            "download started: record={} live={}",
-            record_spec.id,
-            live_spec.id
-        );
+        self.status = Some(format!("checking {} …", spec.display_name));
+        log!("app", "download started: {}", spec.id);
         let download = self.download.clone();
+        thread::spawn(move || run_download(spec, download));
+        cx.notify();
+    }
+
+    fn reveal_clicked(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = kind_by_id(self.model_id) else {
+            return;
+        };
+        let Some(dir) = cache_dir_for(kind) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        log!("app", "revealing model dir: {}", dir.display());
+        if let Err(error) = std::process::Command::new("explorer.exe").arg(&dir).spawn() {
+            log!("app", "explorer launch FAILED: {error}");
+            self.error = Some(format!("explorer launch failed: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn delete_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(kind) = kind_by_id(self.model_id) else {
+            return;
+        };
+        let Some(repo_dir) = repo_cache_dir_for(kind) else {
+            return;
+        };
+        self.busy = true;
+        self.error = None;
+        self.status = Some("deleting model files …".to_owned());
+        log!("app", "delete started: {}", repo_dir.display());
+        let ui = self.ui.clone();
         thread::spawn(move || {
-            let fetch = |spec, label| {
-                let _ = download.send(DownloadMessage::Progress(format!("checking {label} …")));
-                ensure_model_by_spec(spec, &mut |file| {
-                    log!("app", "download progress: {file}");
-                    let _ =
-                        download.send(DownloadMessage::Progress(format!("downloading {file} …")));
-                })
+            let result = match std::fs::remove_dir_all(&repo_dir) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(format!("{error}")),
             };
-            let record_result = fetch(record_spec, record_spec.display_name);
-            let live_result = fetch(live_spec, live_spec.display_name);
-            match (record_result, live_result) {
-                (Ok(_), Ok(_)) => {
-                    if let (Some(record), Some(live)) =
-                        (kind_by_id(record_spec.id), kind_by_id(live_spec.id))
-                    {
-                        log!("app", "download finished for both models");
-                        let _ = download.send(DownloadMessage::Finished(Ok((record, live))));
-                    }
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    let _ = download.send(DownloadMessage::Finished(Err(error)));
-                }
-            }
+            let _ = ui.send(UiMessage::DeleteFinished(result));
         });
         cx.notify();
     }
 
-    fn model_row(
-        &self,
-        index: usize,
-        spec: &ModelSpec,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let selected_record = self.record_id == spec.id;
-        let selected_live = self.live_id == spec.id;
-        let cached = self.cached[index];
-        let record_id = spec.id;
-        let live_id = spec.id;
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .border_1()
-            .border_color(rgb(0x404040))
-            .rounded_sm()
-            .p(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_size(px(13.))
-                    .child(spec.display_name)
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(if cached { rgb(0x33cc66) } else { rgb(0x909090) })
-                            .child(if cached { "cached" } else { "needs download" }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(12.))
-                    .text_size(px(11.))
-                    .text_color(rgb(0x909090))
-                    .child(format!("{} MB · {} ms chunks", spec.size_mb, spec.chunk_ms))
-                    .child(spec.wer_note),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .id(2 * index)
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(if selected_record {
-                                rgb(0x33cc66)
-                            } else {
-                                rgb(0x1c1c1c)
-                            })
-                            .text_color(if selected_record {
-                                rgb(0x101010)
-                            } else {
-                                rgb(0xcccccc)
-                            })
-                            .child("use for record")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.assign(Slot::Record, record_id, cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(2 * index + 1)
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(if selected_live {
-                                rgb(0x33cc66)
-                            } else {
-                                rgb(0x1c1c1c)
-                            })
-                            .text_color(if selected_live {
-                                rgb(0x101010)
-                            } else {
-                                rgb(0xcccccc)
-                            })
-                            .child("use for live")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.assign(Slot::Live, live_id, cx)
-                            })),
-                    ),
-            )
+    fn redownload_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(spec) = spec_by_id(self.model_id) else {
+            return;
+        };
+        let Some(kind) = kind_by_id(spec.id) else {
+            return;
+        };
+        self.busy = true;
+        self.error = None;
+        self.status = Some(format!("re-downloading {} …", spec.display_name));
+        log!("app", "download-again started: {}", spec.id);
+        let download = self.download.clone();
+        thread::spawn(move || {
+            if let Some(repo_dir) = repo_cache_dir_for(kind) {
+                match std::fs::remove_dir_all(&repo_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        let text = format!("removing old cache: {error}");
+                        log!("app", "download-again FAILED: {text}");
+                        let _ = download.send(DownloadMessage::Finished(Err(text)));
+                        return;
+                    }
+                }
+            }
+            run_download(spec, download);
+        });
+        cx.notify();
+    }
+}
+
+fn run_download(spec: &'static ModelSpec, download: mpsc::Sender<DownloadMessage>) {
+    let _ = download.send(DownloadMessage::Progress(format!(
+        "checking {} …",
+        spec.display_name
+    )));
+    match ensure_model_by_spec(spec, &mut |file| {
+        log!("app", "download progress: {file}");
+        let _ = download.send(DownloadMessage::Progress(format!("downloading {file} …")));
+    }) {
+        Ok(_) => {
+            if let Some(kind) = kind_by_id(spec.id) {
+                log!("app", "download finished for {}", spec.id);
+                let _ = download.send(DownloadMessage::Finished(Ok(kind)));
+            }
+        }
+        Err(error) => {
+            let _ = download.send(DownloadMessage::Finished(Err(error)));
+        }
     }
 }
 
 impl Render for OnboardingView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut warning_specs: Vec<&ModelSpec> = Vec::new();
-        for id in [self.record_id, self.live_id] {
-            if let Some(spec) = spec_by_id(id)
-                && !warning_specs.iter().any(|existing| existing.id == id)
-                && spec.min_ram_gb > self.ram_gb
-            {
-                warning_specs.push(spec);
-            }
-        }
-        let warnings: Vec<String> = warning_specs
-            .iter()
-            .map(|spec| {
-                format!(
-                    "{} recommends >= {} GB RAM (detected {} GB)",
-                    spec.display_name, spec.min_ram_gb, self.ram_gb
-                )
-            })
-            .collect();
-        let mut rows = Vec::new();
-        for (index, spec) in REGISTRY.iter().enumerate() {
-            rows.push(self.model_row(index, spec, cx));
+        let Some(spec) = spec_by_id(self.model_id) else {
+            return div()
+                .size_full()
+                .bg(rgb(0x101010))
+                .text_color(rgb(0xcccccc))
+                .child("unknown model");
+        };
+        let cached_now = is_model_cached(spec.id);
+        let mut warnings: Vec<String> = Vec::new();
+        if spec.min_ram_gb > self.ram_gb {
+            warnings.push(format!(
+                "{} recommends >= {} GB RAM (detected {} GB)",
+                spec.display_name, spec.min_ram_gb, self.ram_gb
+            ));
         }
         div()
             .flex()
@@ -641,7 +606,59 @@ impl Render for OnboardingView {
                         self.ram_gb, self.cores
                     )),
             )
-            .children(rows)
+            .children((self.origin == SetupOrigin::Recovery).then(|| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xcc9933))
+                    .child(RECOVERY_NOTICE)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .border_1()
+                    .border_color(rgb(0x404040))
+                    .rounded_sm()
+                    .p(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(13.))
+                            .child(spec.display_name)
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(if cached_now {
+                                        rgb(0x33cc66)
+                                    } else {
+                                        rgb(0x909090)
+                                    })
+                                    .child(if cached_now {
+                                        "cached"
+                                    } else {
+                                        "not downloaded"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(12.))
+                            .text_size(px(11.))
+                            .text_color(rgb(0x909090))
+                            .child(format!("{} MB · {} ms chunks", spec.size_mb, spec.chunk_ms))
+                            .child(spec.wer_note),
+                    )
+                    .children((!cached_now).then(|| {
+                        div().text_size(px(11.)).text_color(rgb(0xcc9933)).child(
+                            "Model not on disk — dictation won't work until you download it.",
+                        )
+                    })),
+            )
             .children((!warnings.is_empty()).then(|| {
                 div()
                     .text_size(px(11.))
@@ -658,7 +675,7 @@ impl Render for OnboardingView {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0xcc3333))
-                    .child(format!("download failed: {error}"))
+                    .child(format!("failed: {error}"))
             }))
             .children(self.start_queued.then(|| {
                 div()
@@ -680,6 +697,69 @@ impl Render for OnboardingView {
                     .child("Start dictating")
                     .on_click(cx.listener(|this, _, _, cx| this.start_clicked(cx))),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .child(
+                        div()
+                            .id("reveal")
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(rgb(0x1c1c1c))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .child("Reveal in Explorer")
+                            .on_click(cx.listener(|this, _, _, cx| this.reveal_clicked(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("delete")
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(rgb(0x1c1c1c))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .child("Delete model")
+                            .on_click(cx.listener(|this, _, _, cx| this.delete_clicked(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("redownload")
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(rgb(0x1c1c1c))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .child("Download again")
+                            .on_click(cx.listener(|this, _, _, cx| this.redownload_clicked(cx))),
+                    )
+                    .children((self.origin == SetupOrigin::Settings).then(|| {
+                        div()
+                            .id("reset-setup")
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .bg(rgb(0x1c1c1c))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .child("Run setup again")
+                            .on_click(cx.listener(|this, _, _, _| {
+                                let _ = this.ui.send(UiMessage::ResetSetup {
+                                    captured_model: this.model_id,
+                                });
+                            }))
+                    })),
+            )
     }
 }
 
@@ -687,7 +767,7 @@ impl Render for OnboardingView {
 enum Screen {
     Onboarding {
         view: Entity<OnboardingView>,
-        from_hud: bool,
+        origin: SetupOrigin,
     },
     Dictation,
 }
@@ -717,17 +797,18 @@ impl AppRoot {
                     dictation.update(cx, |dictation, cx| dictation.handle_hotkey(message, cx));
                 }
             }
-            Screen::Onboarding { view, from_hud } => match message {
-                HotkeyMessage::ToggleRecording => {
-                    if from_hud {
+            Screen::Onboarding { view, origin } => match message {
+                HotkeyMessage::ToggleRecording => match origin {
+                    SetupOrigin::Settings | SetupOrigin::Respawn => {
                         log!("app", "F9 ignored while settings open");
-                    } else {
+                    }
+                    SetupOrigin::FirstRun | SetupOrigin::Recovery => {
                         self.pending_start = true;
-                        log!("app", "F9 during onboarding: queued start after setup");
+                        log!("app", "F9 during setup: queued start after models load");
                         view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
                     }
-                }
-                HotkeyMessage::DebugReload => log!("app", "F10 ignored during onboarding"),
+                },
+                HotkeyMessage::DebugReload => log!("app", "F10 ignored during setup"),
             },
         }
     }
@@ -772,26 +853,24 @@ impl AppRoot {
         if let Some(dictation) = self.dictation.clone() {
             dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
         }
-        let config = config::load();
         let default_id = ModelKind::Nemotron.spec().id;
-        let resolve =
-            |id: &str| -> &'static str { spec_by_id(id).map_or(default_id, |spec| spec.id) };
-        let record_id = config
-            .as_ref()
-            .map_or(default_id, |config| resolve(&config.record_model));
-        let live_id = config
-            .as_ref()
-            .map_or(default_id, |config| resolve(&config.live_model));
-        log!(
-            "app",
-            "opening settings from HUD: record={record_id} live={live_id}"
-        );
+        let model_id = config::load().map_or(default_id, |config| {
+            spec_by_id(&config.model).map_or(default_id, |spec| spec.id)
+        });
+        log!("app", "opening settings: model={model_id}");
         let device = detect_device();
-        let view =
-            cx.new(|_| OnboardingView::new(device, self.downloads.clone(), record_id, live_id));
+        let view = cx.new(|_| {
+            OnboardingView::new(
+                SetupOrigin::Settings,
+                device,
+                model_id,
+                self.downloads.clone(),
+                self.ui.clone(),
+            )
+        });
         self.screen = Screen::Onboarding {
             view,
-            from_hud: true,
+            origin: SetupOrigin::Settings,
         };
         cx.notify();
     }
@@ -803,9 +882,7 @@ impl AppRoot {
                     view.update(cx, |onboarding, cx| onboarding.set_status(text, cx));
                 }
             }
-            DownloadMessage::Finished(Ok((record, live))) => {
-                self.finish_onboarding(record, live, cx)
-            }
+            DownloadMessage::Finished(Ok(model)) => self.finish_onboarding(model, cx),
             DownloadMessage::Finished(Err(error)) => {
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
                     view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
@@ -814,38 +891,71 @@ impl AppRoot {
         }
     }
 
-    fn finish_onboarding(&mut self, record: ModelKind, live: ModelKind, cx: &mut Context<Self>) {
+    fn handle_ui_message(&mut self, message: UiMessage, cx: &mut Context<Self>) {
+        match message {
+            UiMessage::OpenSettings => self.open_settings(cx),
+            UiMessage::DeleteFinished(result) => {
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| onboarding.delete_finished(result, cx));
+                }
+            }
+            UiMessage::ResetSetup { captured_model } => self.reset_setup(captured_model, cx),
+        }
+    }
+
+    fn reset_setup(&mut self, captured_model: &'static str, cx: &mut Context<Self>) {
+        match config::delete() {
+            Ok(true) => log!("app", "setup reset: config deleted"),
+            Ok(false) => log!("app", "setup reset: no config file present"),
+            Err(error) => log!("app", "setup reset FAILED: {error}"),
+        }
+        let default_id = ModelKind::Nemotron.spec().id;
+        let model_id = spec_by_id(captured_model).map_or(default_id, |spec| spec.id);
+        log!("app", "re-entering setup with model={model_id}");
+        let device = detect_device();
+        let view = cx.new(|_| {
+            OnboardingView::new(
+                SetupOrigin::Respawn,
+                device,
+                model_id,
+                self.downloads.clone(),
+                self.ui.clone(),
+            )
+        });
+        self.screen = Screen::Onboarding {
+            view,
+            origin: SetupOrigin::Respawn,
+        };
+        cx.notify();
+    }
+
+    fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
         let config = AppConfig {
-            record_model: record.spec().id.to_owned(),
-            live_model: live.spec().id.to_owned(),
+            model: model.spec().id.to_owned(),
         };
         match config::save(&config) {
-            Ok(()) => log!(
-                "app",
-                "config saved: record={} live={}",
-                config.record_model,
-                config.live_model
-            ),
+            Ok(()) => log!("app", "config saved: model={}", config.model),
             Err(error) => log!("app", "config save FAILED: {error}"),
         }
-        if matches!(self.screen, Screen::Onboarding { from_hud: true, .. }) {
+        if matches!(
+            self.screen,
+            Screen::Onboarding {
+                origin: SetupOrigin::Settings | SetupOrigin::Respawn,
+                ..
+            }
+        ) {
             match self.commands.clone() {
                 Some(commands) => {
-                    let _ = commands.send(Command::SetModels { record, live });
-                    log!(
-                        "app",
-                        "SetModels sent to worker: record={} live={}",
-                        record.spec().id,
-                        live.spec().id
-                    );
+                    let _ = commands.send(Command::SetModel(model));
+                    log!("app", "SetModel sent to worker: {}", model.spec().id);
                 }
-                None => log!("app", "ERROR: no worker channel for SetModels"),
+                None => log!("app", "ERROR: no worker channel for SetModel"),
             }
             self.screen = Screen::Dictation;
             cx.notify();
             return;
         }
-        let selection = ModelSelection { record, live };
+        let selection = ModelSelection { model };
         let commands = asr::spawn_worker(self.events.clone(), selection);
         log!("app", "worker spawned with selection {selection:?}");
         let pending_start = std::mem::replace(&mut self.pending_start, false);
@@ -902,19 +1012,16 @@ fn build_dictation(
 }
 
 fn selection_from_config(config: &AppConfig) -> ModelSelection {
-    let resolve = |id: &str, fallback: ModelKind| {
-        kind_by_id(id).unwrap_or_else(|| {
-            log!(
-                "app",
-                "unknown model id '{id}' in config; using default instead"
-            );
-            fallback
-        })
-    };
-    ModelSelection {
-        record: resolve(&config.record_model, ModelKind::Nemotron),
-        live: resolve(&config.live_model, ModelKind::Nemotron),
-    }
+    let fallback = ModelKind::Nemotron;
+    let model = kind_by_id(&config.model).unwrap_or_else(|| {
+        log!(
+            "app",
+            "unknown model id '{}' in config; using default instead",
+            config.model
+        );
+        fallback
+    });
+    ModelSelection { model }
 }
 
 fn detect_device() -> (u32, usize) {
@@ -976,50 +1083,70 @@ fn main() {
                 let loaded_config = config::load();
                 let device = detect_device();
 
-                let (dictation, commands) = match &loaded_config {
+                let (dictation, commands, screen) = match loaded_config {
                     Some(config) => {
-                        let selection = selection_from_config(config);
-                        log!(
-                            "app",
-                            "config found: record={} live={}",
-                            config.record_model,
-                            config.live_model
-                        );
-                        let commands = asr::spawn_worker(event_sender.clone(), selection);
-                        let dictation = cx.new(|_| {
-                            build_dictation(
-                                commands.clone(),
-                                paste_sender.clone(),
-                                ui_sender.clone(),
-                                false,
+                        let selection = selection_from_config(&config);
+                        let model_id = selection.model.spec().id;
+                        if is_model_cached(model_id) {
+                            log!("app", "config found: model={}", config.model);
+                            let commands = asr::spawn_worker(event_sender.clone(), selection);
+                            let dictation = cx.new(|_| {
+                                build_dictation(
+                                    commands.clone(),
+                                    paste_sender.clone(),
+                                    ui_sender.clone(),
+                                    false,
+                                )
+                            });
+                            (Some(dictation), Some(commands), Screen::Dictation)
+                        } else {
+                            log!(
+                                "app",
+                                "config found but cached model '{model_id}' missing; entering recovery setup"
+                            );
+                            let view = cx.new(|_| {
+                                OnboardingView::new(
+                                    SetupOrigin::Recovery,
+                                    device,
+                                    model_id,
+                                    download_sender.clone(),
+                                    ui_sender.clone(),
+                                )
+                            });
+                            (
+                                None,
+                                None,
+                                Screen::Onboarding {
+                                    view,
+                                    origin: SetupOrigin::Recovery,
+                                },
                             )
-                        });
-                        (Some(dictation), Some(commands))
+                        }
                     }
                     None => {
                         log!(
                             "app",
-                            "no config; showing onboarding (device: {} GB RAM, {} logical cores)",
+                            "no config; showing first-run setup (device: {} GB RAM, {} logical cores)",
                             device.0,
                             device.1
                         );
-                        (None, None)
-                    }
-                };
-
-                let screen = if dictation.is_some() {
-                    Screen::Dictation
-                } else {
-                    Screen::Onboarding {
-                        view: cx.new(|_| {
+                        let view = cx.new(|_| {
                             OnboardingView::new(
+                                SetupOrigin::FirstRun,
                                 device,
+                                "nemotron",
                                 download_sender.clone(),
-                                "nemotron",
-                                "nemotron",
+                                ui_sender.clone(),
                             )
-                        }),
-                        from_hud: false,
+                        });
+                        (
+                            None,
+                            None,
+                            Screen::Onboarding {
+                                view,
+                                origin: SetupOrigin::FirstRun,
+                            },
+                        )
                     }
                 };
 
@@ -1075,8 +1202,8 @@ fn main() {
                                 }
                                 while let Ok(message) = ui_receiver.try_recv() {
                                     cx.update(|_, cx| {
-                                        app.update(cx, |app, cx| match message {
-                                            UiMessage::OpenSettings => app.open_settings(cx),
+                                        app.update(cx, |app, cx| {
+                                            app.handle_ui_message(message, cx)
                                         });
                                     })
                                     .ok();

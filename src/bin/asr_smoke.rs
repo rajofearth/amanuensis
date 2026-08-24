@@ -5,7 +5,7 @@ use std::{
 
 use hound::{SampleFormat, WavReader};
 use raycast_dictation_clone::asr::{
-    AsrBackend, ModelKind, ModelPaths, NemotronBackend, REPO_OWNER, UnifiedBackend,
+    AsrBackend, ModelKind, ModelPaths, NemotronBackend, REPO_OWNER,
 };
 
 const SAMPLE_RATE: i32 = 16000;
@@ -14,7 +14,6 @@ const HOLD_SECONDS: usize = 300;
 const SAMPLE_INTERVAL_SECONDS: usize = 30;
 const SPEECH_SECONDS: f64 = 6.0;
 const GAP_SECONDS: f64 = 1.5;
-const UNIFIED_REFERENCE: &str = "Well, I don't wish to see it anymore, observed Phoebe, turning away her eyes. It is certainly very like the old portrait";
 
 fn main() {
     let mut kind = ModelKind::Nemotron;
@@ -24,7 +23,6 @@ fn main() {
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "nemotron" => kind = ModelKind::Nemotron,
-            "unified" => kind = ModelKind::Unified,
             "--reload-metrics" => reload_metrics = true,
             "--hold-test" => hold_test = true,
             other => {
@@ -32,7 +30,7 @@ fn main() {
                     hold_seconds = value.parse().expect("--hold-seconds must be an integer");
                 } else {
                     panic!(
-                        "unknown argument '{other}' (expected nemotron|unified|--reload-metrics|--hold-test|--hold-seconds=N)"
+                        "unknown argument '{other}' (expected nemotron|--reload-metrics|--hold-test|--hold-seconds=N)"
                     );
                 }
             }
@@ -80,17 +78,12 @@ fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
         .send()
         .expect("download test_wavs/0.wav");
 
-    let expected = match kind {
-        ModelKind::Nemotron => {
-            let trans_path = repo
-                .download_file()
-                .filename("test_wavs/trans.txt")
-                .send()
-                .expect("download test_wavs/trans.txt");
-            expected_for_zero(&trans_path)
-        }
-        ModelKind::Unified => UNIFIED_REFERENCE.to_owned(),
-    };
+    let trans_path = repo
+        .download_file()
+        .filename("test_wavs/trans.txt")
+        .send()
+        .expect("download test_wavs/trans.txt");
+    let expected = expected_for_zero(&trans_path);
 
     (
         ModelPaths {
@@ -104,22 +97,17 @@ fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
     )
 }
 
-fn make_backend(kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
-    match kind {
-        ModelKind::Nemotron => NemotronBackend::load(paths).map(|backend| Box::new(backend) as _),
-        ModelKind::Unified => UnifiedBackend::load(paths).map(|backend| Box::new(backend) as _),
-    }
+fn make_backend(_kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
+    NemotronBackend::load(paths).map(|backend| Box::new(backend) as _)
 }
 
-fn feed_chunk_samples(kind: ModelKind) -> usize {
+fn feed_chunk_samples(_kind: ModelKind) -> usize {
     if let Ok(value) = std::env::var("ASR_SMOKE_FEED_SAMPLES") {
-        return value
+        value
             .parse()
-            .expect("ASR_SMOKE_FEED_SAMPLES must be an integer");
-    }
-    match kind {
-        ModelKind::Nemotron => CHUNK_SAMPLES,
-        ModelKind::Unified => CHUNK_SAMPLES * 8,
+            .expect("ASR_SMOKE_FEED_SAMPLES must be an integer")
+    } else {
+        CHUNK_SAMPLES
     }
 }
 

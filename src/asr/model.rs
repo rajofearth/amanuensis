@@ -1,12 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hf_hub::HFClientSync;
 
-use super::Mode;
-
 pub const REPO_OWNER: &str = "csukuangfj2";
 const NEMOTRON_REPO: &str = "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
-const UNIFIED_REPO: &str = "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-240ms";
 
 pub struct ModelSpec {
     pub id: &'static str,
@@ -18,26 +15,15 @@ pub struct ModelSpec {
     pub wer_note: &'static str,
 }
 
-pub const REGISTRY: [ModelSpec; 2] = [
-    ModelSpec {
-        id: "nemotron",
-        display_name: "Nemotron Streaming (Live)",
-        repo: NEMOTRON_REPO,
-        size_mb: 632,
-        min_ram_gb: 4,
-        chunk_ms: 80,
-        wer_note: "~7.2\u{2013}7.8% WER, tracks voice closely",
-    },
-    ModelSpec {
-        id: "unified",
-        display_name: "Parakeet Unified (Record)",
-        repo: UNIFIED_REPO,
-        size_mb: 632,
-        min_ram_gb: 4,
-        chunk_ms: 240,
-        wer_note: "higher accuracy, slow on this device",
-    },
-];
+pub const REGISTRY: [ModelSpec; 1] = [ModelSpec {
+    id: "nemotron",
+    display_name: "Nemotron Streaming",
+    repo: NEMOTRON_REPO,
+    size_mb: 632,
+    min_ram_gb: 4,
+    chunk_ms: 80,
+    wer_note: "~7.2\u{2013}7.8% WER, tracks voice closely",
+}];
 
 pub fn spec_by_id(id: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().find(|spec| spec.id == id)
@@ -46,7 +32,6 @@ pub fn spec_by_id(id: &str) -> Option<&'static ModelSpec> {
 pub fn kind_by_id(id: &str) -> Option<ModelKind> {
     match id {
         "nemotron" => Some(ModelKind::Nemotron),
-        "unified" => Some(ModelKind::Unified),
         _ => None,
     }
 }
@@ -54,30 +39,17 @@ pub fn kind_by_id(id: &str) -> Option<ModelKind> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelKind {
     Nemotron,
-    Unified,
 }
 
 impl ModelKind {
     pub fn spec(self) -> &'static ModelSpec {
         match self {
             Self::Nemotron => &REGISTRY[0],
-            Self::Unified => &REGISTRY[1],
         }
     }
 
     pub fn repo_name(self) -> &'static str {
         self.spec().repo
-    }
-}
-
-impl From<Mode> for ModelKind {
-    fn from(mode: Mode) -> Self {
-        // Record used the unified (240ms-window) model, but its windowed decode
-        // runs ~15x realtime on this SoC vs nemotron's ~2.5x. Nemotron handles
-        // short record-mode utterances fine and gives legacy-parity latency.
-        // See docs/PHASE11-NOTES.md for the offline-batch endgame.
-        let _ = mode;
-        Self::Nemotron
     }
 }
 
@@ -95,6 +67,36 @@ const MODEL_FILES: [&str; 4] = [
     "joiner.int8.onnx",
     "tokens.txt",
 ];
+
+fn repo_cache_dir(spec: &ModelSpec) -> PathBuf {
+    hf_hub::resolve_cache_dir().join(format!("models--{REPO_OWNER}--{}", spec.repo))
+}
+
+pub fn repo_cache_dir_for(kind: ModelKind) -> Option<PathBuf> {
+    Some(repo_cache_dir(kind.spec()))
+}
+
+fn complete_snapshot_dir(repo_dir: &Path) -> Option<PathBuf> {
+    let snapshots = repo_dir.join("snapshots");
+    for revision in std::fs::read_dir(snapshots).ok()?.flatten() {
+        let path = revision.path();
+        if MODEL_FILES.iter().all(|file| path.join(file).is_file()) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+pub fn cache_dir_for(kind: ModelKind) -> Option<PathBuf> {
+    let repo_dir = repo_cache_dir(kind.spec());
+    if let Some(snapshot) = complete_snapshot_dir(&repo_dir) {
+        return Some(snapshot);
+    }
+    if repo_dir.is_dir() {
+        return Some(repo_dir);
+    }
+    Some(hf_hub::resolve_cache_dir())
+}
 
 pub fn ensure_model_by_spec(
     spec: &ModelSpec,
@@ -128,17 +130,5 @@ pub fn is_model_cached(spec_id: &str) -> bool {
     let Some(spec) = spec_by_id(spec_id) else {
         return false;
     };
-    let repo_dir = hf_hub::resolve_cache_dir().join(format!("models--{REPO_OWNER}--{}", spec.repo));
-    let Ok(snapshots) = std::fs::read_dir(repo_dir.join("snapshots")) else {
-        return false;
-    };
-    for revision in snapshots.flatten() {
-        if MODEL_FILES
-            .iter()
-            .all(|file| revision.path().join(file).is_file())
-        {
-            return true;
-        }
-    }
-    false
+    complete_snapshot_dir(&repo_cache_dir(spec)).is_some()
 }
