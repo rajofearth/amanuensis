@@ -1334,9 +1334,19 @@ struct AppRoot {
 impl AppRoot {
     fn hwnd_resolved(&mut self) -> Option<pw::HWND> {
         if self.hwnd.is_none() {
-            self.hwnd = pw::find_by_title(&window_title_utf16()).map(|hwnd| hwnd as isize);
-            if self.hwnd.is_none() {
-                log!("app", "ERROR: main window not found by title");
+            match pw::find_by_title(&window_title_utf16()) {
+                Some(hwnd) if pw::process_owns_window(hwnd) => {
+                    self.hwnd = Some(hwnd as isize);
+                }
+                Some(_) => {
+                    log!(
+                        "app",
+                        "ERROR: window with our title belongs to another process; not touching it"
+                    );
+                }
+                None => {
+                    log!("app", "ERROR: main window not found by title");
+                }
             }
         }
         self.hwnd.map(|value| value as pw::HWND)
@@ -1852,6 +1862,10 @@ fn detect_device() -> (u32, usize) {
 
 fn main() {
     logging::init();
+    if !acquire_single_instance_lock() {
+        log!("app", "another instance is running; exiting");
+        return;
+    }
     log!("app", "starting raycast-dictation-clone");
     application().run(|cx: &mut App| {
         let manager = GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
@@ -2075,6 +2089,22 @@ fn main() {
             }
         });
     });
+}
+
+fn acquire_single_instance_lock() -> bool {
+    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\raycast-dictation-single-instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+    if handle.is_null() {
+        log!("app", "single-instance mutex creation failed");
+        return false;
+    }
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    error == ERROR_ALREADY_EXISTS
 }
 
 fn rms_level(samples: &[f32]) -> f32 {

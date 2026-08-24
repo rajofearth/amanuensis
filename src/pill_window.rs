@@ -1,13 +1,15 @@
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
+    System::Threading::GetCurrentProcessId,
     UI::{
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
             AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
-            GetWindowRect, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW,
-            ShowWindow, SystemParametersInfoW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            GetWindowRect, GetWindowThreadProcessId, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
+            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW,
+            SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, WS_CAPTION,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+            WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
         },
     },
 };
@@ -54,6 +56,14 @@ pub fn panel_style(style: u32) -> u32 {
 pub fn find_by_title(title_utf16: &[u16]) -> Option<HWND> {
     let hwnd = unsafe { FindWindowW(std::ptr::null(), title_utf16.as_ptr()) };
     (!hwnd.is_null()).then_some(hwnd)
+}
+
+pub fn process_owns_window(hwnd: HWND) -> bool {
+    let mut pid = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    pid == unsafe { GetCurrentProcessId() }
 }
 
 pub fn styles(hwnd: HWND) -> (u32, u32) {
