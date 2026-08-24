@@ -9,8 +9,9 @@ use global_hotkey::{
     hotkey::{Code, HotKey},
 };
 use gpui::{
-    App, Bounds, Context, Div, Entity, Stateful, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, relative, rgb, size,
+    App, Bounds, Context, Div, Entity, MouseButton, Stateful, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px,
+    relative, rgb, size,
 };
 use gpui_platform::application;
 use raycast_dictation_clone::asr::fetch::{
@@ -26,12 +27,15 @@ use raycast_dictation_clone::config::{self, AppConfig};
 use raycast_dictation_clone::log;
 use raycast_dictation_clone::logging;
 use raycast_dictation_clone::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
+use raycast_dictation_clone::pill_window as pw;
 use raycast_dictation_clone::setup_steps::{SetupStep, StepEvent, next_step};
 use raycast_dictation_clone::win_focus::{self, FocusTarget};
 
 const BARS: usize = 26;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const WINDOW_TITLE: &str = "raycast-dictation-window";
+const FLASH_SECS: u64 = 1;
 
 enum HotkeyMessage {
     ToggleRecording,
@@ -59,6 +63,8 @@ enum DownloadMessage {
 
 enum UiMessage {
     OpenSettings,
+    ShowPill,
+    HidePill,
     StartDownload {
         captured_model: &'static str,
         purge: bool,
@@ -114,6 +120,7 @@ enum Phase {
     Idle,
     Recording,
     Transcribing,
+    Flash,
 }
 
 struct Dictation {
@@ -129,6 +136,11 @@ struct Dictation {
     pending_start: bool,
     transcribing_since: Option<Instant>,
     focus: Option<FocusTarget>,
+    recording_started: Option<Instant>,
+    discard_requested: bool,
+    flash_since: Option<Instant>,
+    hovered: bool,
+    drag_grab: Option<(i32, i32)>,
 }
 
 impl Dictation {
@@ -141,7 +153,17 @@ impl Dictation {
         self.phase = Phase::Recording;
         self.partial.clear();
         self.transcribing_since = None;
+        self.flash_since = None;
+        self.recording_started = Some(Instant::now());
         let _ = self.commands.send(Command::Start);
+        let _ = self.ui.send(UiMessage::ShowPill);
+    }
+
+    fn stop_recording(&mut self) {
+        self.phase = Phase::Transcribing;
+        self.transcribing_since = Some(Instant::now());
+        self.recording_started = None;
+        let _ = self.commands.send(Command::Stop);
     }
 
     fn toggle_recording(&mut self, cx: &mut Context<Self>) {
@@ -149,27 +171,55 @@ impl Dictation {
         match self.phase {
             Phase::Loading => self.pending_start = true,
             Phase::Idle => self.begin_recording(),
-            Phase::Recording => {
-                self.phase = Phase::Transcribing;
-                self.transcribing_since = Some(Instant::now());
-                let _ = self.commands.send(Command::Stop);
+            Phase::Recording => self.stop_recording(),
+            Phase::Transcribing => self.pending_start = true,
+            Phase::Flash => {
+                log!("app", "F9 during done-flash: starting next recording");
+                self.begin_recording();
             }
-            Phase::Transcribing => {}
         }
         cx.notify();
     }
 
-    fn cycle_mode(&mut self, cx: &mut Context<Self>) {
-        if self.phase != Phase::Idle {
+    fn discard_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.phase != Phase::Recording {
             return;
         }
-        self.mode = match self.mode {
-            Mode::Record => Mode::Live,
-            Mode::Live => Mode::Record,
-        };
-        self.phase = Phase::Loading;
-        self.status = format!("switching to {:?}", self.mode);
-        let _ = self.commands.send(Command::SwitchMode(self.mode));
+        log!("app", "recording discarded by user");
+        self.discard_requested = true;
+        self.stop_recording();
+        cx.notify();
+    }
+
+    fn done_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.phase != Phase::Recording {
+            return;
+        }
+        log!("app", "recording finished by user");
+        self.stop_recording();
+        cx.notify();
+    }
+
+    fn tick_flash(&mut self, cx: &mut Context<Self>) {
+        if self.phase != Phase::Flash {
+            return;
+        }
+        let expired = self
+            .flash_since
+            .is_some_and(|since| since.elapsed().as_secs() >= FLASH_SECS);
+        if !expired {
+            return;
+        }
+        if self.pending_start {
+            log!("app", "flash skipped: queued start consumed");
+            self.pending_start = false;
+            self.begin_recording();
+        } else {
+            self.phase = Phase::Idle;
+            self.flash_since = None;
+            self.committed.clear();
+            let _ = self.ui.send(UiMessage::HidePill);
+        }
         cx.notify();
     }
 
@@ -197,9 +247,22 @@ impl Dictation {
                 duration_secs,
             } => {
                 if self.phase == Phase::Transcribing {
-                    self.phase = Phase::Idle;
                     self.transcribing_since = None;
                     self.partial.clear();
+                    if self.discard_requested {
+                        log!(
+                            "app",
+                            "commit discarded by user ({} chars)",
+                            text.chars().count()
+                        );
+                        self.discard_requested = false;
+                        self.phase = Phase::Flash;
+                        self.flash_since = Some(Instant::now());
+                        cx.notify();
+                        return;
+                    }
+                    self.phase = Phase::Flash;
+                    self.flash_since = Some(Instant::now());
                     log!(
                         "app",
                         "committed {:.1}s audio, raw ({} chars): {text:?}",
@@ -290,6 +353,24 @@ impl Dictation {
         let _ = self.ui.send(UiMessage::OpenSettings);
     }
 
+    fn drag_started(&mut self, cx: &mut Context<Self>) {
+        if let (Some(hwnd), Some((cx_pos, cy_pos))) =
+            (pw::find_by_title(&window_title_utf16()), pw::cursor_pos())
+            && let Some((wx, wy)) = pw::window_rect(hwnd)
+        {
+            self.drag_grab = Some((cx_pos - wx, cy_pos - wy));
+            log!("app", "pill drag started");
+            cx.notify();
+        }
+    }
+
+    fn drag_ended(&mut self, cx: &mut Context<Self>) {
+        if self.drag_grab.take().is_some() {
+            log!("app", "pill drag ended");
+            cx.notify();
+        }
+    }
+
     fn cancel_pending_start(&mut self, cx: &mut Context<Self>) {
         if self.pending_start {
             log!("app", "opening settings: cancelled queued start");
@@ -300,104 +381,131 @@ impl Dictation {
 }
 
 impl Render for Dictation {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tick_flash(cx);
+        if matches!(
+            self.phase,
+            Phase::Recording | Phase::Transcribing | Phase::Flash
+        ) {
+            window.request_animation_frame();
+        }
+        if !matches!(
+            self.phase,
+            Phase::Recording | Phase::Transcribing | Phase::Flash
+        ) {
+            return div().id("pill-hidden").size_full();
+        }
+        let expanded = self.hovered && self.phase == Phase::Recording;
+        let duration_text = match self.phase {
+            Phase::Recording => self
+                .recording_started
+                .map(|started| {
+                    let total_secs = started.elapsed().as_secs();
+                    format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
+                })
+                .unwrap_or_else(|| "00:00".to_owned()),
+            Phase::Transcribing => "transcribing…".to_owned(),
+            Phase::Flash => "done ✓".to_owned(),
+            _ => String::new(),
+        };
+        let bar_levels: Vec<f32> = match self.phase {
+            Phase::Transcribing | Phase::Flash => {
+                let elapsed = self
+                    .transcribing_since
+                    .map_or(0.0_f64, |since| since.elapsed().as_secs_f64());
+                (0..BARS)
+                    .map(|index| {
+                        let wave = (elapsed * 3.0 + index as f64 * 0.7).sin().abs();
+                        ((0.2 + 0.5 * wave).clamp(0.08, 1.0)) as f32
+                    })
+                    .collect()
+            }
+            _ => self.waveform.levels().collect(),
+        };
+        let bar_color = if self.phase == Phase::Flash {
+            rgb(0x606060)
+        } else {
+            rgb(0x33cc66)
+        };
         div()
+            .id("pill-root")
+            .size_full()
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(12.))
-            .bg(rgb(0x101010))
-            .border_1()
-            .border_color(rgb(0x404040))
-            .size_full()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .text_size(px(11.))
-                    .text_color(rgb(0x909090))
-                    .child(if self.phase == Phase::Transcribing {
-                        let elapsed = self
-                            .transcribing_since
-                            .map_or(0, |started| started.elapsed().as_secs());
-                        format!("{:?} (F9): transcribing… {elapsed}s", self.phase)
-                    } else if self.phase == Phase::Loading || !self.status.is_empty() {
-                        format!("{:?} (F9): {}", self.phase, self.status)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = *hovered;
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, _| {
+                    if this.phase == Phase::Recording {
+                        log!("app", "settings ignored while recording");
                     } else {
-                        format!("{:?} (F9)", self.phase)
-                    })
-                    .child(
-                        div()
-                            .id("mode")
-                            .cursor_pointer()
-                            .rounded_sm()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgb(0x1c1c1c))
-                            .text_color(if self.mode == Mode::Live {
-                                rgb(0xcc3333)
-                            } else {
-                                rgb(0x33cc66)
-                            })
-                            .child(format!("{:?}", self.mode))
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_mode(cx))),
-                    )
-                    .children(
-                        (self.phase != Phase::Recording && self.phase != Phase::Transcribing).then(
-                            || {
-                                div()
-                                    .id("settings")
-                                    .cursor_pointer()
-                                    .rounded_sm()
-                                    .px(px(8.))
-                                    .py(px(2.))
-                                    .bg(rgb(0x1c1c1c))
-                                    .text_color(rgb(0x909090))
-                                    .child("settings")
-                                    .on_click(cx.listener(|this, _, _, _| this.open_settings()))
-                            },
-                        ),
-                    ),
-            )
-            .children(
-                (self.phase == Phase::Recording
-                    && self.mode == Mode::Live
-                    && !self.partial.is_empty())
-                .then(|| {
-                    div()
-                        .max_w(px(720.))
-                        .text_size(px(12.))
-                        .text_color(rgb(0xcccccc))
-                        .child(format!("partial: {}", self.partial))
+                        this.open_settings();
+                    }
                 }),
             )
-            .children((!self.committed.is_empty()).then(|| {
-                div()
-                    .max_w(px(720.))
-                    .text_size(px(12.))
-                    .text_color(rgb(0x33cc66))
-                    .child(format!("committed: {}", self.committed))
-            }))
             .child(
                 div()
+                    .id("pill")
                     .flex()
                     .items_center()
-                    .gap(px(4.))
-                    .h(relative(0.7))
-                    .w_full()
-                    .px(px(24.))
-                    .children(self.waveform.levels().map(|level| {
+                    .gap(px(10.))
+                    .rounded_full()
+                    .bg(rgb(0x161616))
+                    .border_1()
+                    .border_color(rgb(0x333333))
+                    .px(px(16.))
+                    .py(px(10.))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.drag_started(cx)),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.drag_ended(cx)),
+                    )
+                    .children(expanded.then(|| {
                         div()
-                            .flex_1()
-                            .h(relative(level.clamp(0.02, 1.0)))
-                            .rounded_sm()
-                            .bg(if self.phase == Phase::Recording {
-                                rgb(0x33cc66)
-                            } else {
-                                rgb(0x404040)
-                            })
+                            .id("discard-recording")
+                            .cursor_pointer()
+                            .text_size(px(14.))
+                            .text_color(rgb(0xcc3333))
+                            .child("✕")
+                            .on_click(cx.listener(|this, _, _, cx| this.discard_clicked(cx)))
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap(px(2.))
+                            .h(px(18.))
+                            .w(px(110.))
+                            .children(bar_levels.iter().map(|level| {
+                                div()
+                                    .flex_1()
+                                    .h(relative(*level))
+                                    .rounded_sm()
+                                    .bg(bar_color)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(52.))
+                            .text_size(px(13.))
+                            .text_color(rgb(0xcccccc))
+                            .child(duration_text),
+                    )
+                    .children(expanded.then(|| {
+                        div()
+                            .id("done-recording")
+                            .cursor_pointer()
+                            .text_size(px(14.))
+                            .text_color(rgb(0x33cc66))
+                            .child("✓")
+                            .on_click(cx.listener(|this, _, _, cx| this.done_clicked(cx)))
                     })),
             )
     }
@@ -1292,6 +1400,51 @@ impl AppRoot {
         }
     }
 
+    fn show_pill_window(&self) {
+        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
+            let (ax, ay, aw, ah) = pw::primary_work_area();
+            let x = ax + (aw - pw::PILL_WIDTH) / 2;
+            let y = ay + ah - pw::PILL_HEIGHT - 12;
+            pw::set_bounds(hwnd, x, y, pw::PILL_WIDTH, pw::PILL_HEIGHT);
+            pw::show_no_activate(hwnd);
+            log!("app", "pill shown at {x},{y}");
+        } else {
+            log!("app", "ERROR: pill window not found by title");
+        }
+    }
+
+    fn hide_pill_window(&self) {
+        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
+            pw::hide(hwnd);
+            log!("app", "pill hidden");
+        }
+    }
+
+    fn show_panel_window(&self) {
+        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
+            let (ax, ay, aw, ah) = pw::primary_work_area();
+            let x = ax + (aw - pw::PANEL_WIDTH) / 2;
+            let y = ay + (ah - pw::PANEL_HEIGHT) / 2;
+            pw::set_bounds(hwnd, x, y, pw::PANEL_WIDTH, pw::PANEL_HEIGHT);
+            pw::show_no_activate(hwnd);
+            log!("app", "panel shown at {x},{y}");
+        }
+    }
+
+    fn pump_pill(&mut self, _cx: &mut Context<Self>) {
+        let Some(dictation) = self.dictation.clone() else {
+            return;
+        };
+        let grab = dictation.read(_cx).drag_grab;
+        if let (Some(hwnd), Some((gx, gy)), Some((cx_pos, cy_pos))) = (
+            pw::find_by_title(&window_title_utf16()),
+            grab,
+            pw::cursor_pos(),
+        ) {
+            pw::move_to(hwnd, cx_pos - gx, cy_pos - gy);
+        }
+    }
+
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.screen, Screen::Dictation) {
             return;
@@ -1311,6 +1464,7 @@ impl AppRoot {
             view,
             origin: SetupOrigin::Settings,
         };
+        self.show_panel_window();
         cx.notify();
     }
 
@@ -1413,6 +1567,8 @@ impl AppRoot {
     fn handle_ui_message(&mut self, message: UiMessage, cx: &mut Context<Self>) {
         match message {
             UiMessage::OpenSettings => self.open_settings(cx),
+            UiMessage::ShowPill => self.show_pill_window(),
+            UiMessage::HidePill => self.hide_pill_window(),
             UiMessage::StartDownload {
                 captured_model,
                 purge,
@@ -1508,6 +1664,7 @@ impl AppRoot {
             }
             self.pending_start = false;
             self.screen = Screen::Dictation;
+            self.hide_pill_window();
             cx.notify();
             return;
         }
@@ -1527,6 +1684,7 @@ impl AppRoot {
         self.dictation = Some(dictation);
         self.commands = Some(commands);
         self.screen = Screen::Dictation;
+        self.hide_pill_window();
         cx.notify();
     }
 }
@@ -1541,6 +1699,13 @@ impl Render for AppRoot {
             },
         }
     }
+}
+
+fn window_title_utf16() -> Vec<u16> {
+    WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn build_dictation(
@@ -1565,6 +1730,11 @@ fn build_dictation(
         pending_start,
         transcribing_since: None,
         focus: None,
+        recording_started: None,
+        discard_requested: false,
+        flash_since: None,
+        hovered: false,
+        drag_grab: None,
     }
 }
 
@@ -1623,9 +1793,19 @@ fn main() {
         });
 
         let bounds = Bounds::centered(None, size(px(800.), px(600.0)), cx);
-        cx.open_window(
+        let handle = cx
+            .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(WINDOW_TITLE.to_owned().into()),
+                    ..Default::default()
+                }),
+                focus: false,
+                show: false,
+                is_resizable: false,
+                kind: WindowKind::PopUp,
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             |window, cx| {
@@ -1768,7 +1948,12 @@ fn main() {
                                 }
                                 cx.update(|_, cx| {
                                     app.update(cx, |app, cx| {
-                                        app.pump_audio(&mut pending_levels, &mut pending_chunks, cx)
+                                        app.pump_audio(
+                                            &mut pending_levels,
+                                            &mut pending_chunks,
+                                            cx,
+                                        );
+                                        app.pump_pill(cx);
                                     });
                                 })
                                 .ok();
@@ -1781,7 +1966,11 @@ fn main() {
             },
         )
         .unwrap();
-        cx.activate(true);
+        let _ = handle.update(cx, |app, _, _| {
+            if matches!(app.screen, Screen::Onboarding { .. }) {
+                app.show_panel_window();
+            }
+        });
     });
 }
 
