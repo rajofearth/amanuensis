@@ -65,6 +65,7 @@ enum UiMessage {
     OpenSettings,
     ShowPill,
     HidePill,
+    PanelClosed,
     StartDownload {
         captured_model: &'static str,
         purge: bool,
@@ -1327,6 +1328,108 @@ struct AppRoot {
     download_generation: u64,
     cancel_flag: Option<Arc<AtomicBool>>,
     worker_live: bool,
+    hwnd: Option<isize>,
+}
+
+impl AppRoot {
+    fn hwnd_resolved(&mut self) -> Option<pw::HWND> {
+        if self.hwnd.is_none() {
+            self.hwnd = pw::find_by_title(&window_title_utf16()).map(|hwnd| hwnd as isize);
+            if self.hwnd.is_none() {
+                log!("app", "ERROR: main window not found by title");
+            }
+        }
+        self.hwnd.map(|value| value as pw::HWND)
+    }
+
+    fn apply_pill_chrome(&mut self) {
+        let Some(hwnd) = self.hwnd_resolved() else {
+            return;
+        };
+        let (style, ex) = pw::styles(hwnd);
+        let style = pw::pill_style(style);
+        let ex = (ex & !pw::EX_CLEAR_MASK) | pw::EX_PILL;
+        pw::set_styles(hwnd, style, ex);
+        pw::set_text(hwnd, &window_title_utf16());
+        let (frame_w, frame_h) =
+            pw::frame_size_for_client(pw::PILL_WIDTH, pw::PILL_HEIGHT, style, ex);
+        let (ax, ay, aw, ah) = pw::primary_work_area();
+        let x = ax + (aw - frame_w) / 2;
+        let y = ay + ah - frame_h - 12;
+        pw::place(hwnd, x, y, frame_w, frame_h, true);
+    }
+
+    fn apply_panel_chrome(&mut self) {
+        let Some(hwnd) = self.hwnd_resolved() else {
+            return;
+        };
+        let (style, ex) = pw::styles(hwnd);
+        let style = pw::panel_style(style);
+        let ex = ex & !pw::EX_CLEAR_MASK;
+        pw::set_styles(hwnd, style, ex);
+        pw::set_text(hwnd, &panel_title_utf16());
+        let (frame_w, frame_h) =
+            pw::frame_size_for_client(pw::PANEL_WIDTH, pw::PANEL_HEIGHT, style, ex);
+        let (ax, ay, aw, ah) = pw::primary_work_area();
+        let x = ax + (aw - frame_w) / 2;
+        let y = ay + (ah - frame_h) / 2;
+        pw::place(hwnd, x, y, frame_w, frame_h, true);
+    }
+
+    fn close_panel_to_pill(&mut self, cx: &mut Context<Self>) {
+        log!("app", "panel closed; returning to idle pill");
+        match self.screen.clone() {
+            Screen::Onboarding { origin, .. } => {
+                if matches!(origin, SetupOrigin::Settings)
+                    && let Some(dictation) = self.dictation.clone()
+                {
+                    dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
+                }
+                if self.dictation.is_some() {
+                    self.screen = Screen::Dictation;
+                    self.hide_pill_window();
+                } else {
+                    log!("app", "onboarding not completed; hiding until restart");
+                    self.hide_pill_window();
+                }
+            }
+            Screen::Dictation => self.hide_pill_window(),
+        }
+        cx.notify();
+    }
+
+    fn show_pill_window(&mut self) {
+        match self.hwnd_resolved() {
+            Some(_) => {
+                self.apply_pill_chrome();
+                if let Some(hwnd) = self.hwnd_resolved() {
+                    pw::show_no_activate(hwnd);
+                    log!("app", "pill shown");
+                }
+            }
+            None => log!("app", "ERROR: pill window not found by title"),
+        }
+    }
+
+    fn hide_pill_window(&mut self) {
+        if let Some(hwnd) = self.hwnd_resolved() {
+            pw::hide(hwnd);
+            log!("app", "pill hidden");
+        }
+    }
+
+    fn show_panel_window(&mut self) {
+        match self.hwnd_resolved() {
+            Some(_) => {
+                self.apply_panel_chrome();
+                if let Some(hwnd) = self.hwnd_resolved() {
+                    pw::show_no_activate(hwnd);
+                    log!("app", "panel shown");
+                }
+            }
+            None => log!("app", "ERROR: panel window not found by title"),
+        }
+    }
 }
 
 impl AppRoot {
@@ -1397,37 +1500,6 @@ impl AppRoot {
         } else {
             levels.clear();
             chunks.clear();
-        }
-    }
-
-    fn show_pill_window(&self) {
-        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
-            let (ax, ay, aw, ah) = pw::primary_work_area();
-            let x = ax + (aw - pw::PILL_WIDTH) / 2;
-            let y = ay + ah - pw::PILL_HEIGHT - 12;
-            pw::set_bounds(hwnd, x, y, pw::PILL_WIDTH, pw::PILL_HEIGHT);
-            pw::show_no_activate(hwnd);
-            log!("app", "pill shown at {x},{y}");
-        } else {
-            log!("app", "ERROR: pill window not found by title");
-        }
-    }
-
-    fn hide_pill_window(&self) {
-        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
-            pw::hide(hwnd);
-            log!("app", "pill hidden");
-        }
-    }
-
-    fn show_panel_window(&self) {
-        if let Some(hwnd) = pw::find_by_title(&window_title_utf16()) {
-            let (ax, ay, aw, ah) = pw::primary_work_area();
-            let x = ax + (aw - pw::PANEL_WIDTH) / 2;
-            let y = ay + (ah - pw::PANEL_HEIGHT) / 2;
-            pw::set_bounds(hwnd, x, y, pw::PANEL_WIDTH, pw::PANEL_HEIGHT);
-            pw::show_no_activate(hwnd);
-            log!("app", "panel shown at {x},{y}");
         }
     }
 
@@ -1569,6 +1641,7 @@ impl AppRoot {
             UiMessage::OpenSettings => self.open_settings(cx),
             UiMessage::ShowPill => self.show_pill_window(),
             UiMessage::HidePill => self.hide_pill_window(),
+            UiMessage::PanelClosed => self.close_panel_to_pill(cx),
             UiMessage::StartDownload {
                 captured_model,
                 purge,
@@ -1708,6 +1781,13 @@ fn window_title_utf16() -> Vec<u16> {
         .collect()
 }
 
+fn panel_title_utf16() -> Vec<u16> {
+    "Dictation Setup"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 fn build_dictation(
     commands: mpsc::Sender<Command>,
     results: mpsc::Sender<PasteResult>,
@@ -1799,6 +1879,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(WINDOW_TITLE.to_owned().into()),
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 focus: false,
@@ -1897,6 +1978,7 @@ fn main() {
                     pending_start: false,
                     download_generation: 0,
                     cancel_flag: None,
+                    hwnd: None,
                 });
 
                 window
@@ -1966,7 +2048,13 @@ fn main() {
             },
         )
         .unwrap();
-        let _ = handle.update(cx, |app, _, _| {
+        let _ = handle.update(cx, |app, window, cx| {
+            let close_ui = app.ui.clone();
+            window.on_window_should_close(cx, move |_, _| {
+                log!("app", "panel close requested");
+                let _ = close_ui.send(UiMessage::PanelClosed);
+                false
+            });
             if matches!(app.screen, Screen::Onboarding { .. }) {
                 app.show_panel_window();
             }

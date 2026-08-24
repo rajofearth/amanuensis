@@ -1,32 +1,85 @@
 use windows_sys::Win32::{
-    Foundation::{HWND, POINT, RECT},
+    Foundation::{POINT, RECT},
     UI::WindowsAndMessaging::{
-        FindWindowW, GetCursorPos, GetWindowRect, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow, SystemParametersInfoW,
+        AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
+        GetWindowRect, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW,
+        ShowWindow, SystemParametersInfoW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
     },
 };
+
+pub use windows_sys::Win32::Foundation::HWND;
 
 pub const PILL_WIDTH: i32 = 340;
 pub const PILL_HEIGHT: i32 = 64;
 pub const PANEL_WIDTH: i32 = 800;
 pub const PANEL_HEIGHT: i32 = 600;
 
+pub const CHROME_CLEAR_MASK: u32 =
+    WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
+pub const EX_CLEAR_MASK: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+pub const EX_PILL: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+
+pub fn pill_style(style: u32) -> u32 {
+    (style & !CHROME_CLEAR_MASK) | WS_POPUP
+}
+
+pub fn panel_style(style: u32) -> u32 {
+    (style & !(CHROME_CLEAR_MASK | WS_POPUP)) | (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+}
+
 pub fn find_by_title(title_utf16: &[u16]) -> Option<HWND> {
     let hwnd = unsafe { FindWindowW(std::ptr::null(), title_utf16.as_ptr()) };
     (!hwnd.is_null()).then_some(hwnd)
 }
 
-pub fn set_bounds(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+pub fn styles(hwnd: HWND) -> (u32, u32) {
     unsafe {
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        );
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        (style as u32, ex_style as u32)
+    }
+}
+
+pub fn set_styles(hwnd: HWND, style: u32, ex_style: u32) {
+    unsafe {
+        SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
+    }
+}
+
+pub fn frame_size_for_client(
+    client_width: i32,
+    client_height: i32,
+    style: u32,
+    ex_style: u32,
+) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_width,
+        bottom: client_height,
+    };
+    unsafe {
+        AdjustWindowRectEx(&mut rect, style, 0, ex_style);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+pub fn set_text(hwnd: HWND, title_utf16: &[u16]) {
+    unsafe {
+        SetWindowTextW(hwnd, title_utf16.as_ptr());
+    }
+}
+
+pub fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, frame_changed: bool) {
+    let mut flags = SWP_NOACTIVATE | SWP_NOZORDER;
+    if frame_changed {
+        flags |= SWP_FRAMECHANGED;
+    }
+    unsafe {
+        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, flags);
     }
 }
 
