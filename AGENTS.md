@@ -26,3 +26,12 @@ Subagent instructions
 - Before writing any GPUI code, read the relevant example file(s) above, not just this summary.
 - Prefer gpui-component over raw GPUI primitives unless the task specifically requires low-level control.
 - If an API doesn't match what's in the examples, trust the examples over memory.
+
+Change impact discipline
+Before modifying any function, module, or shared resource:
+1. Trace its `blast radius`: what calls it, what it calls, what shares state or config with it.
+2. State any invariants the surrounding code relies on (data always sorted, auth always checked first, cache always invalidated on write, etc) and confirm the change doesn't break them.
+3. Note anything at the edges that's affected: security boundaries, memory/perf-sensitive paths, or anywhere untrusted input touches this code.
+4. If the blast radius or invariant list is non-trivial, say so explicitly before writing the diff.
+
+This applies to subagents and to you directly, no exceptions for "small" changes.
