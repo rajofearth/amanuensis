@@ -1,11 +1,14 @@
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
-    UI::WindowsAndMessaging::{
-        AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
-        GetWindowRect, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW,
-        ShowWindow, SystemParametersInfoW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    UI::{
+        HiDpi::GetDpiForWindow,
+        WindowsAndMessaging::{
+            AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
+            GetWindowRect, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+            SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW,
+            ShowWindow, SystemParametersInfoW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+        },
     },
 };
 
@@ -18,8 +21,27 @@ pub const PANEL_HEIGHT: i32 = 600;
 
 pub const CHROME_CLEAR_MASK: u32 =
     WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
-pub const EX_CLEAR_MASK: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-pub const EX_PILL: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+pub const EX_CLEAR_MASK: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+pub const EX_PILL: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+
+pub fn dpi(hwnd: HWND) -> u32 {
+    unsafe { GetDpiForWindow(hwnd) }
+}
+
+pub fn window_rect_full(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe { GetWindowRect(hwnd, &mut rect) };
+    if ok != 0 {
+        Some((rect.left, rect.top, rect.right, rect.bottom))
+    } else {
+        None
+    }
+}
 
 pub fn pill_style(style: u32) -> u32 {
     (style & !CHROME_CLEAR_MASK) | WS_POPUP

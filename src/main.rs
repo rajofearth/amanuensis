@@ -1353,9 +1353,9 @@ impl AppRoot {
         pw::set_text(hwnd, &window_title_utf16());
         let (frame_w, frame_h) =
             pw::frame_size_for_client(pw::PILL_WIDTH, pw::PILL_HEIGHT, style, ex);
-        let (ax, ay, aw, ah) = pw::primary_work_area();
-        let x = ax + (aw - frame_w) / 2;
-        let y = ay + ah - frame_h - 12;
+        let (wx, wy, ww, wh) = pw::primary_work_area();
+        let x = wx + (ww - frame_w) / 2;
+        let y = wy + wh - frame_h - 12;
         pw::place(hwnd, x, y, frame_w, frame_h, true);
     }
 
@@ -1400,12 +1400,24 @@ impl AppRoot {
 
     fn show_pill_window(&mut self) {
         match self.hwnd_resolved() {
-            Some(_) => {
+            Some(hwnd) => {
                 self.apply_pill_chrome();
-                if let Some(hwnd) = self.hwnd_resolved() {
-                    pw::show_no_activate(hwnd);
-                    log!("app", "pill shown");
-                }
+                pw::show_no_activate(hwnd);
+                let rect = pw::window_rect_full(hwnd)
+                    .map(|(l, t, r, b)| format!("({l},{t})-({r},{b})"))
+                    .unwrap_or_else(|| "unavailable".to_owned());
+                let (wax, way, waw, wah) = pw::primary_work_area();
+                log!(
+                    "app",
+                    "pill shown: rect={rect} work=({},{},{},{}) dpi={} client={}x{}",
+                    wax,
+                    way,
+                    waw,
+                    wah,
+                    pw::dpi(hwnd),
+                    pw::PILL_WIDTH,
+                    pw::PILL_HEIGHT
+                );
             }
             None => log!("app", "ERROR: pill window not found by title"),
         }
@@ -1883,7 +1895,7 @@ fn main() {
                     ..Default::default()
                 }),
                 focus: false,
-                show: false,
+                show: true,
                 is_resizable: false,
                 kind: WindowKind::PopUp,
                 window_background: WindowBackgroundAppearance::Transparent,
@@ -2057,6 +2069,9 @@ fn main() {
             });
             if matches!(app.screen, Screen::Onboarding { .. }) {
                 app.show_panel_window();
+            } else if let Some(hwnd) = app.hwnd_resolved() {
+                pw::hide(hwnd);
+                log!("app", "window hidden at startup (idle pill)");
             }
         });
     });

@@ -21,6 +21,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_System_Threading",
 ] }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7" }
