@@ -483,8 +483,29 @@ impl OnboardingView {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
-        log!("app", "revealing model dir: {}", dir.display());
-        if let Err(error) = std::process::Command::new("explorer.exe").arg(&dir).spawn() {
+        let dir = match std::path::absolute(&dir) {
+            Ok(absolute) => absolute,
+            Err(error) => {
+                log!(
+                    "app",
+                    "explorer launch FAILED: cannot absolutize {}: {error}",
+                    dir.display()
+                );
+                self.error = Some(format!("cannot resolve model dir: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(dir_str) = dir.to_str() else {
+            self.error = Some("model dir path is not valid Unicode".to_owned());
+            cx.notify();
+            return;
+        };
+        log!("app", "revealing model dir: {dir_str}");
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg(dir_str)
+            .spawn()
+        {
             log!("app", "explorer launch FAILED: {error}");
             self.error = Some(format!("explorer launch failed: {error}"));
         }
