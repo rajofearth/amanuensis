@@ -1,0 +1,74 @@
+name: Draft Release
+
+on:
+  push:
+    tags:
+      - "v1.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create
+        required: true
+        default: v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            artifact: amanuensis-windows-x64
+          - target: aarch64-pc-windows-msvc
+            artifact: amanuensis-windows-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        shell: pwsh
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\amanuensis.exe" "$dir\amanuensis.exe"
+          Copy-Item README.md, THIRD_PARTY_NOTICES.md "$dir\"
+          Compress-Archive -Path "$dir\*" -DestinationPath "$dir.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+  draft-release:
+    name: Create Draft Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: amanuensis-windows-*
+          merge-multiple: true
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Amanuensis ${{ inputs.tag || github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: release-assets/*.zip
