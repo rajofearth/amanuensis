@@ -3,24 +3,25 @@ use std::{
     thread,
 };
 
-use gpui::{Context, Entity, Window, div, prelude::*};
-use raycast_dictation_clone::asr::{
+use amanuensis::asr::{
     Command, Event, ModelKind, ModelSelection, kind_by_id, repo_cache_dir_for, spec_by_id,
 };
-use raycast_dictation_clone::config::{self, AppConfig};
-use raycast_dictation_clone::log;
-use raycast_dictation_clone::pill_win32::PillCommand;
-use raycast_dictation_clone::pill_window as pw;
+use amanuensis::config::{self, AppConfig};
+use amanuensis::log;
+use amanuensis::pill_win32::PillCommand;
+use amanuensis::pill_window as pw;
+use gpui::{Context, Entity, KeyDownEvent, Window, div, prelude::*};
 
 use crate::dictation_view::{Dictation, Phase};
 use crate::download_runner::{remove_dir_all_retrying, spawn_model_download};
 use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
+use crate::tray::TrayCommand;
 
 const LOW_SIGNAL_PEAK: f32 = 0.05;
 const LOW_SIGNAL_GAIN: f32 = 8.0;
 use crate::onboarding_view::{OnboardingView, SetupOrigin};
 
-pub(crate) const WINDOW_TITLE: &str = "raycast-dictation-window";
+pub(crate) const WINDOW_TITLE: &str = "amanuensis-window";
 #[derive(Clone)]
 pub(crate) enum Screen {
     Onboarding {
@@ -39,6 +40,7 @@ pub(crate) struct AppRoot {
     pub(crate) downloads: mpsc::Sender<DownloadMessage>,
     pub(crate) ui: mpsc::Sender<UiMessage>,
     pub(crate) pill_cmd: mpsc::Sender<PillCommand>,
+    pub(crate) tray_commands: mpsc::Sender<TrayCommand>,
     pub(crate) pending_start: bool,
     pub(crate) download_generation: u64,
     pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
@@ -90,8 +92,10 @@ impl AppRoot {
         };
         let (style, ex) = pw::styles(hwnd);
         let style = pw::panel_style(style);
-        let ex = ex & !pw::EX_CLEAR_MASK;
+        let ex = (ex & !pw::EX_CLEAR_MASK)
+            | windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_APPWINDOW;
         pw::set_styles(hwnd, style, ex);
+        pw::demote_from_topmost(hwnd);
         pw::set_text(hwnd, &panel_title_utf16());
         let (frame_w, frame_h) =
             pw::frame_size_for_client(pw::PANEL_WIDTH, pw::PANEL_HEIGHT, style, ex);
@@ -135,7 +139,7 @@ impl AppRoot {
             Some(_) => {
                 self.apply_panel_chrome();
                 if let Some(hwnd) = self.hwnd_resolved() {
-                    pw::show_no_activate(hwnd);
+                    pw::show_panel(hwnd);
                     log!("app", "panel shown");
                 }
             }
@@ -161,7 +165,14 @@ impl AppRoot {
             Screen::Onboarding { view, origin } => match message {
                 HotkeyMessage::ToggleRecording => match origin {
                     SetupOrigin::Settings | SetupOrigin::Respawn => {
-                        log!("app", "F9 ignored while settings open");
+                        if self.dictation.is_some() {
+                            log!("app", "F9 while settings open: returning to dictation");
+                            self.close_panel_to_pill(cx);
+                            if let Some(dictation) = self.dictation.clone() {
+                                dictation
+                                    .update(cx, |dictation, cx| dictation.toggle_recording(cx));
+                            }
+                        }
                     }
                     SetupOrigin::FirstRun | SetupOrigin::Recovery => {
                         if view.read(cx).model_ready() || self.worker_live {
@@ -179,6 +190,20 @@ impl AppRoot {
                 },
                 HotkeyMessage::DebugReload => log!("app", "F10 ignored during setup"),
             },
+        }
+    }
+
+    fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        match self.screen.clone() {
+            Screen::Dictation => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| dictation.discard_clicked(cx));
+                }
+            }
+            Screen::Onboarding { origin, .. } if origin == SetupOrigin::Settings => {
+                self.close_panel_to_pill(cx);
+            }
+            Screen::Onboarding { .. } => {}
         }
     }
 
@@ -217,7 +242,6 @@ impl AppRoot {
         }
     }
 
-
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.screen, Screen::Dictation) {
             return;
@@ -231,8 +255,15 @@ impl AppRoot {
         });
         log!("app", "opening settings: model={model_id}");
         let device = detect_device();
-        let view = cx
-            .new(|_| OnboardingView::new(SetupOrigin::Settings, device, model_id, self.ui.clone()));
+        let view = cx.new(|_| {
+            OnboardingView::new(
+                SetupOrigin::Settings,
+                device,
+                model_id,
+                config::load().map_or(true, |config| config.tray_enabled),
+                self.ui.clone(),
+            )
+        });
         self.screen = Screen::Onboarding {
             view,
             origin: SetupOrigin::Settings,
@@ -274,7 +305,11 @@ impl AppRoot {
         spawn_model_download(spec, purge, generation, cancel, self.downloads.clone());
     }
 
-    pub(crate) fn handle_download_message(&mut self, message: DownloadMessage, cx: &mut Context<Self>) {
+    pub(crate) fn handle_download_message(
+        &mut self,
+        message: DownloadMessage,
+        cx: &mut Context<Self>,
+    ) {
         match message {
             DownloadMessage::Progress {
                 generation,
@@ -340,6 +375,20 @@ impl AppRoot {
     pub(crate) fn handle_ui_message(&mut self, message: UiMessage, cx: &mut Context<Self>) {
         match message {
             UiMessage::OpenSettings => self.open_settings(cx),
+            UiMessage::TrayToggleRecording => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| {
+                        dictation.toggle_recording(cx);
+                    });
+                }
+            }
+            UiMessage::TraySetEnabled(enabled) => {
+                if let Err(error) = config::set_tray_enabled(enabled) {
+                    log!("app", "tray preference save FAILED: {error}");
+                }
+                let _ = self.tray_commands.send(TrayCommand::SetEnabled(enabled));
+            }
+            UiMessage::Quit => std::process::exit(0),
             UiMessage::PanelClosed => self.close_panel_to_pill(cx),
             UiMessage::StartDownload {
                 captured_model,
@@ -414,8 +463,15 @@ impl AppRoot {
         let model_id = spec_by_id(captured_model).map_or(default_id, |spec| spec.id);
         log!("app", "re-entering setup with model={model_id}");
         let device = detect_device();
-        let view = cx
-            .new(|_| OnboardingView::new(SetupOrigin::Respawn, device, model_id, self.ui.clone()));
+        let view = cx.new(|_| {
+            OnboardingView::new(
+                SetupOrigin::Respawn,
+                device,
+                model_id,
+                config::load().map_or(true, |config| config.tray_enabled),
+                self.ui.clone(),
+            )
+        });
         self.screen = Screen::Onboarding {
             view,
             origin: SetupOrigin::Respawn,
@@ -426,6 +482,7 @@ impl AppRoot {
     pub(crate) fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
         let config = AppConfig {
             model: model.spec().id.to_owned(),
+            tray_enabled: config::load().map_or(true, |existing| existing.tray_enabled),
         };
         match config::save(&config) {
             Ok(()) => log!("app", "config saved: model={}", config.model),
@@ -451,7 +508,7 @@ impl AppRoot {
             return;
         }
         let selection = ModelSelection { model };
-        let commands = raycast_dictation_clone::asr::spawn_worker(self.events.clone(), selection);
+        let commands = amanuensis::asr::spawn_worker(self.events.clone(), selection);
         self.worker_live = true;
         log!("app", "worker spawned with selection {selection:?}");
         let pending_start = std::mem::replace(&mut self.pending_start, false);
@@ -473,13 +530,18 @@ impl AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match self.screen.clone() {
+        let content = match self.screen.clone() {
             Screen::Onboarding { view, .. } => div().size_full().child(view),
             Screen::Dictation => match self.dictation.clone() {
                 Some(dictation) => div().size_full().child(dictation),
                 None => div().size_full(),
             },
-        }
+        };
+        content.on_key_down(_cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                this.handle_escape(cx);
+            }
+        }))
     }
 }
 pub(crate) fn window_title_utf16() -> Vec<u16> {
@@ -490,7 +552,7 @@ pub(crate) fn window_title_utf16() -> Vec<u16> {
 }
 
 pub(crate) fn panel_title_utf16() -> Vec<u16> {
-    "Dictation Setup"
+    "Amanuensis Settings"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()

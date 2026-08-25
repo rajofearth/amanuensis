@@ -3,9 +3,18 @@ mod dictation_view;
 mod download_runner;
 mod messages;
 mod onboarding_view;
+mod tray;
 
 use std::{sync::mpsc, thread, time::Duration};
 
+use amanuensis::asr::{self, Event, is_model_cached};
+use amanuensis::audio;
+use amanuensis::config;
+use amanuensis::log;
+use amanuensis::logging;
+use amanuensis::pill_win32::PillButton;
+use amanuensis::pill_win32::PillOverlay;
+use amanuensis::pill_window as pw;
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey},
@@ -15,23 +24,16 @@ use gpui::{
     WindowKind, WindowOptions, px, size,
 };
 use gpui_platform::application;
-use raycast_dictation_clone::asr::{self, Event, is_model_cached};
-use raycast_dictation_clone::audio;
-use raycast_dictation_clone::config;
-use raycast_dictation_clone::log;
-use raycast_dictation_clone::logging;
-use raycast_dictation_clone::pill_win32::PillButton;
-use raycast_dictation_clone::pill_win32::PillOverlay;
-use raycast_dictation_clone::pill_window as pw;
 
 use crate::app_root::{AppRoot, Screen, detect_device, rms_level, selection_from_config};
 use crate::dictation_view::Dictation;
 use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
 use crate::onboarding_view::{OnboardingView, SetupOrigin};
+use crate::tray::TrayController;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const WINDOW_TITLE: &str = "raycast-dictation-window";
+const WINDOW_TITLE: &str = "amanuensis-window";
 
 fn main() {
     logging::init();
@@ -39,7 +41,7 @@ fn main() {
         log!("app", "another instance is running; exiting");
         return;
     }
-    log!("app", "starting raycast-dictation-clone");
+    log!("app", "starting Amanuensis");
     application().run(|cx: &mut App| {
         let manager = GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
         let toggle_key = HotKey::new(None, Code::F9);
@@ -81,10 +83,10 @@ fn main() {
                     appears_transparent: true,
                     ..Default::default()
                 }),
-                focus: false,
-                show: true,
-                is_resizable: false,
-                kind: WindowKind::PopUp,
+                 focus: false,
+                 show: true,
+                 is_resizable: false,
+                 kind: WindowKind::PopUp,
                 window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
@@ -100,6 +102,10 @@ fn main() {
                 let loop_ui = ui_sender.clone();
 
                 let loaded_config = config::load();
+                let tray_enabled = loaded_config
+                    .as_ref()
+                    .map_or(true, |config| config.tray_enabled);
+                let tray = TrayController::spawn(ui_sender.clone(), tray_enabled);
                 let device = detect_device();
 
                 let (dictation, commands, screen) = match loaded_config {
@@ -128,6 +134,7 @@ fn main() {
                                     SetupOrigin::Recovery,
                                     device,
                                     model_id,
+                                    tray_enabled,
                                     ui_sender.clone(),
                                 )
                             });
@@ -153,6 +160,7 @@ fn main() {
                                 SetupOrigin::FirstRun,
                                 device,
                                 "nemotron",
+                                tray_enabled,
                                 ui_sender.clone(),
                             )
                         });
@@ -177,6 +185,7 @@ fn main() {
                     downloads: download_sender,
                     ui: ui_sender,
                     pill_cmd: pill.command_tx(),
+                    tray_commands: tray.sender(),
                     pending_start: false,
                     download_generation: 0,
                     cancel_flag: None,
@@ -277,8 +286,8 @@ fn main() {
 
 fn acquire_single_instance_lock() -> bool {
     use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
-    use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW, MUTEX_MODIFY_STATE};
-    let name: Vec<u16> = "Local\\raycast-dictation-single-instance"
+    use windows_sys::Win32::System::Threading::{CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW};
+    let name: Vec<u16> = "Local\\amanuensis-single-instance"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();

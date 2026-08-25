@@ -1,4 +1,4 @@
-use raycast_dictation_clone::asr::{DownloadProgress, ModelKind};
+use amanuensis::asr::{DownloadProgress, ModelKind};
 
 pub(crate) enum HotkeyMessage {
     ToggleRecording,
@@ -26,6 +26,9 @@ pub(crate) enum DownloadMessage {
 
 pub(crate) enum UiMessage {
     OpenSettings,
+    TrayToggleRecording,
+    TraySetEnabled(bool),
+    Quit,
     PanelClosed,
     StartDownload {
         captured_model: &'static str,

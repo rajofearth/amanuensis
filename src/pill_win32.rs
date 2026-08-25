@@ -4,11 +4,11 @@ use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateFontIndirectW,
-    CreateRoundRectRgn, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, DrawTextW, FillRgn, FrameRgn, GetDC, GetDeviceCaps,
-    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, BLENDFUNCTION, HBITMAP, HDC,
-    HRGN, LOGFONTW,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
+    CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FillRgn, FrameRgn, GetDC,
+    GetDeviceCaps, HBITMAP, HDC, HRGN, InvalidateRect, LOGFONTW, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -17,12 +17,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GWLP_USERDATA, GetWindowLongPtrW, HTCAPTION, IDC_HAND, KillTimer, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SPI_GETWORKAREA, SendMessageW,
-    SetCursor, SetTimer, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    UpdateLayeredWindow, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONUP,
-    WM_TIMER, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HTCAPTION, IDC_HAND, KillTimer, LoadCursorW,
+    MSG, PostQuitMessage, RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
+    SendMessageW, SetCursor, SetTimer, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, UpdateLayeredWindow, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::log;
@@ -41,8 +41,8 @@ const TIMER_MS: u32 = 33;
 
 const BARS: usize = 26; // level count arriving from the Waveform ring
 const WAVE_BARS: usize = 31; // thin bars actually drawn (resampled from BARS)
-const BAR_W: i32 = 1;
-const BAR_MAX_H: i32 = 18;
+const BAR_W: i32 = 2;
+const BAR_MAX_H: i32 = 20;
 const MIN_BAR_H: i32 = 1;
 const INNER_PAD: i32 = 6;
 const BTN_SIZE: i32 = 22;
@@ -52,8 +52,8 @@ const PILL_RADIUS: i32 = 0;
 // ---- Colors (COLORREF = 0x00BBGGRR) — monochrome, like the reference ----
 const COLOR_BG: COLORREF = 0x00101010; // #101010
 const COLOR_BORDER: COLORREF = 0x002E2E2E; // #2E2E2E
-const COLOR_WAVE: COLORREF = 0x00909090; // dim waveform behind hover controls
-const COLOR_WAVE_HOVER: COLORREF = 0x00484848; // quieter while controls are overlaid
+const COLOR_WAVE: COLORREF = 0x00D8D8D8; // bright Raycast-style waveform
+const COLOR_WAVE_HOVER: COLORREF = 0x005A5A5A; // quieter while controls are overlaid
 const COLOR_TEXT: COLORREF = 0x00F2F2F2; // #F2F2F2
 const COLOR_BTN_IDLE: COLORREF = 0x001A1A1A; // #1A1A1A
 const COLOR_BTN_HOVER: COLORREF = 0x00262626; // #262626
@@ -236,8 +236,8 @@ fn synthesized_levels(mode: PillMode, elapsed: f64) -> Vec<f32> {
         PillMode::Flash => vec![0.0; BARS],
         _ => (0..BARS)
             .map(|index| {
-                let wave = (elapsed * 3.0 + index as f64 * 0.7).sin().abs();
-                (0.15 + 0.55 * wave).clamp(0.05, 1.0) as f32
+                let wave = (elapsed * 4.0 + index as f64 * 0.7).sin().abs();
+                (0.20 + 0.60 * wave).clamp(0.05, 1.0) as f32
             })
             .collect(),
     }
@@ -367,14 +367,26 @@ fn fill_round(hdc: HDC, r: &RECT, radius: i32, color: COLORREF) {
     }
 }
 
-fn draw_button(pill: &PillWindow, hdc: HDC, r: &RECT, glyph: &[u16], glyph_color: COLORREF, hovered: bool) {
-    let bg = if hovered { COLOR_BTN_HOVER } else { COLOR_BTN_IDLE };
-    let radius = pill.s(14);
+fn draw_button(
+    pill: &PillWindow,
+    hdc: HDC,
+    r: &RECT,
+    glyph: &[u16],
+    glyph_color: COLORREF,
+    hovered: bool,
+) {
+    let bg = if hovered {
+        COLOR_BTN_HOVER
+    } else {
+        COLOR_BTN_IDLE
+    };
+    let radius = pill.s(PILL_RADIUS * 2);
     fill_round(hdc, r, radius, bg);
     unsafe {
         // 1px border, like the original window's action buttons.
         let brush = CreateSolidBrush(COLOR_BORDER);
-        let rgn: HRGN = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
+        let rgn: HRGN =
+            CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
         FrameRgn(hdc, rgn, brush, 1, 1);
         DeleteObject(brush as _);
         DeleteObject(rgn as _);
@@ -418,7 +430,10 @@ fn render_pill(pill: &PillWindow) {
 
         SetBkMode(hdc, 1);
 
-        let segoe: Vec<u16> = "Segoe UI".encode_utf16().chain(std::iter::once(0)).collect();
+        let segoe: Vec<u16> = "Segoe UI"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let font = CreateFontIndirectW(&LOGFONTW {
             lfHeight: (-(14.0 * pill.dpi_scale)) as i32,
             lfWeight: 600,
@@ -493,8 +508,14 @@ fn render_pill(pill: &PillWindow) {
 
         // Hover controls sit over the dim waveform.
         if pill.buttons_visible() {
-            let cross: Vec<u16> = "\u{2715}".encode_utf16().chain(std::iter::once(0)).collect();
-            let check: Vec<u16> = "\u{2713}".encode_utf16().chain(std::iter::once(0)).collect();
+            let cross: Vec<u16> = "\u{2715}"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let check: Vec<u16> = "\u{2713}"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             draw_button(
                 pill,
                 hdc,
@@ -524,7 +545,10 @@ fn render_pill(pill: &PillWindow) {
             _ => String::new(),
         };
         if !right_text.is_empty() {
-            let utf16: Vec<u16> = right_text.encode_utf16().chain(std::iter::once(0)).collect();
+            let utf16: Vec<u16> = right_text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let mut text_rect = RECT {
                 left: pill.text_x(),
                 top: controls_rect.top,
@@ -623,13 +647,17 @@ unsafe extern "system" fn pill_wnd_proc(
                 0
             }
             WM_SETCURSOR => {
-                if (lparam & 0xFFFF) as u16 == 1 /* HTCLIENT */ {
+                if (lparam & 0xFFFF) as u16 == 1
+                /* HTCLIENT */
+                {
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PillWindow;
                     if !ptr.is_null() {
                         let pill = &*ptr;
                         let (x, y) = client_cursor_pos(hwnd);
-                        if matches!(hit_test(pill, x, y), HoverTarget::Discard | HoverTarget::Finish)
-                        {
+                        if matches!(
+                            hit_test(pill, x, y),
+                            HoverTarget::Discard | HoverTarget::Finish
+                        ) {
                             SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
                             return 1;
                         }
@@ -688,7 +716,12 @@ unsafe extern "system" fn pill_wnd_proc(
                     }
                     HoverTarget::Body => {
                         ReleaseCapture();
-                        SendMessageW(hwnd, 0x00A1 /* WM_NCLBUTTONDOWN */, HTCAPTION as WPARAM, 0);
+                        SendMessageW(
+                            hwnd,
+                            0x00A1, /* WM_NCLBUTTONDOWN */
+                            HTCAPTION as WPARAM,
+                            0,
+                        );
                     }
                     HoverTarget::None => {}
                 }
@@ -743,7 +776,7 @@ fn create_backing(hwnd: HWND, w: i32, h: i32) -> (HDC, HBITMAP, *mut u8) {
 
 fn pill_thread(cmd_rx: mpsc::Receiver<PillCommand>, click_tx: mpsc::Sender<PillButton>) {
     let hwnd = unsafe {
-        let class_name: Vec<u16> = "RaycastDictationPill"
+        let class_name: Vec<u16> = "AmanuensisPill"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();

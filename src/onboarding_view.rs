@@ -1,16 +1,16 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
-use gpui::{
-    App, Context, Div, IntoElement, Render, Stateful, Window, div, prelude::*, px, relative, rgb,
-};
-use raycast_dictation_clone::asr::fetch::{EtaTracker, path_is_dir, progress_status, progress_summary};
-use raycast_dictation_clone::asr::{
+use amanuensis::asr::fetch::{EtaTracker, path_is_dir, progress_status, progress_summary};
+use amanuensis::asr::{
     DownloadProgress, ModelSpec, cache_dir_for, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
 };
-use raycast_dictation_clone::log;
-use raycast_dictation_clone::setup_steps::{SetupStep, StepEvent, next_step};
+use amanuensis::log;
+use amanuensis::setup_steps::{SetupStep, StepEvent, next_step};
+use gpui::{
+    App, Context, Div, IntoElement, Render, Stateful, Window, div, prelude::*, px, relative, rgb,
+};
 
 use crate::messages::UiMessage;
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +39,7 @@ pub(crate) struct OnboardingView {
     eta: EtaTracker,
     step: Option<SetupStep>,
     start_queued: bool,
+    tray_enabled: bool,
     ui: mpsc::Sender<UiMessage>,
 }
 
@@ -47,6 +48,7 @@ impl OnboardingView {
         origin: SetupOrigin,
         device: (u32, usize),
         model_id: &'static str,
+        tray_enabled: bool,
         ui: mpsc::Sender<UiMessage>,
     ) -> Self {
         Self {
@@ -64,8 +66,15 @@ impl OnboardingView {
             eta: EtaTracker::new(),
             step: (origin == SetupOrigin::FirstRun).then_some(SetupStep::Welcome),
             start_queued: false,
+            tray_enabled,
             ui,
         }
+    }
+
+    fn toggle_tray(&mut self, cx: &mut Context<Self>) {
+        self.tray_enabled = !self.tray_enabled;
+        let _ = self.ui.send(UiMessage::TraySetEnabled(self.tray_enabled));
+        cx.notify();
     }
 
     pub(crate) fn model_ready(&self) -> bool {
@@ -290,20 +299,25 @@ impl OnboardingView {
         cx.notify();
     }
 
-    pub(crate) fn render_step(&self, step: SetupStep, spec: &ModelSpec, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_step(
+        &self,
+        step: SetupStep,
+        spec: &ModelSpec,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let base = || {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
                 .p(px(24.))
-                .bg(rgb(0x101010))
-                .text_color(rgb(0xcccccc))
+                .bg(rgb(0x0d0e10))
+                .text_color(rgb(0xe5e7eb))
                 .size_full()
         };
         match step {
             SetupStep::Welcome => base()
-                .child(div().text_size(px(26.)).child("Dictation"))
+                .child(div().text_size(px(26.)).child("Amanuensis"))
                 .child(
                     div()
                         .flex()
@@ -355,7 +369,7 @@ impl OnboardingView {
                     .children(self.progress.as_ref().map(|progress| {
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(0x33cc66))
+                            .text_color(rgb(0xd8d8d8))
                             .child(progress_summary(
                                 progress.done,
                                 progress.total,
@@ -423,8 +437,8 @@ impl Render for OnboardingView {
         let Some(spec) = spec_by_id(self.model_id) else {
             return div()
                 .size_full()
-                .bg(rgb(0x101010))
-                .text_color(rgb(0xcccccc))
+                .bg(rgb(0x0d0e10))
+                .text_color(rgb(0xe5e7eb))
                 .child("unknown model");
         };
         if let Some(step) = self.step {
@@ -442,10 +456,10 @@ impl Render for OnboardingView {
             .flex_col()
             .gap(px(12.))
             .p(px(24.))
-            .bg(rgb(0x101010))
-            .text_color(rgb(0xcccccc))
+            .bg(rgb(0x0d0e10))
+            .text_color(rgb(0xe5e7eb))
             .size_full()
-            .child(div().text_size(px(18.)).child("Dictation setup"))
+            .child(div().text_size(px(18.)).child("Amanuensis settings"))
             .child(
                 div()
                     .text_size(px(11.))
@@ -454,6 +468,51 @@ impl Render for OnboardingView {
                         "detected: {} GB RAM, {} logical cores",
                         self.ram_gb, self.cores
                     )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Windows tray icon"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x808080))
+                                    .child("Left-click opens settings; right-click shows actions."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("tray-toggle")
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(0x505050))
+                            .px(px(10.))
+                            .py(px(4.))
+                            .bg(if self.tray_enabled {
+                                rgb(0x2a2a2a)
+                            } else {
+                                rgb(0x171717)
+                            })
+                            .text_size(px(11.))
+                            .text_color(if self.tray_enabled {
+                                rgb(0xf2f2f2)
+                            } else {
+                                rgb(0x707070)
+                            })
+                            .child(if self.tray_enabled { "ON" } else { "OFF" })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_tray(cx))),
+                    ),
             )
             .children(
                 ((self.origin == SetupOrigin::Recovery) && !self.downloading).then(|| {
@@ -480,8 +539,7 @@ impl Render for OnboardingView {
                     .flex_col()
                     .gap(px(6.))
                     .border_1()
-                    .border_color(rgb(0x404040))
-                    .rounded_sm()
+                    .border_color(rgb(0x2e2e2e))
                     .p(px(12.))
                     .child(
                         div()
@@ -494,7 +552,7 @@ impl Render for OnboardingView {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(if cached_now {
-                                        rgb(0x33cc66)
+                                        rgb(0xd8d8d8)
                                     } else {
                                         rgb(0x909090)
                                     })
@@ -538,7 +596,7 @@ impl Render for OnboardingView {
                     Some(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(0x33cc66))
+                            .text_color(rgb(0xd8d8d8))
                             .child(progress_status(
                                 spec.display_name,
                                 &progress,
@@ -549,7 +607,7 @@ impl Render for OnboardingView {
                 None => self.status.clone().map(|status| {
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0x33cc66))
+                        .text_color(rgb(0xd8d8d8))
                         .child(status)
                 }),
             })
@@ -566,29 +624,6 @@ impl Render for OnboardingView {
                     .text_color(rgb(0xcc9933))
                     .child("F9 pressed — recording will begin once models load")
             }))
-            .child(
-                div()
-                    .id("start")
-                    .cursor_pointer()
-                    .rounded_sm()
-                    .px(px(16.))
-                    .py(px(6.))
-                    .bg(if self.busy {
-                        rgb(0x141414)
-                    } else {
-                        rgb(0x1c1c1c)
-                    })
-                    .border_1()
-                    .border_color(rgb(0x404040))
-                    .text_size(px(13.))
-                    .text_color(if self.busy {
-                        rgb(0x606060)
-                    } else {
-                        rgb(0xcccccc)
-                    })
-                    .child("Start dictating")
-                    .on_click(cx.listener(|this, _, _, cx| this.start_clicked(cx))),
-            )
             .children((self.busy && self.downloading).then(|| {
                 action_button(
                     "cancel",
@@ -648,10 +683,9 @@ impl Render for OnboardingView {
 
 pub(crate) fn keycap(label: &'static str) -> Div {
     div()
-        .rounded_sm()
         .border_1()
-        .border_color(rgb(0x404040))
-        .bg(rgb(0x1c1c1c))
+        .border_color(rgb(0x2e2e2e))
+        .bg(rgb(0x17191d))
         .px(px(10.))
         .py(px(4.))
         .text_size(px(14.))
@@ -666,11 +700,10 @@ pub(crate) fn primary_button(
     div()
         .id(id)
         .cursor_pointer()
-        .rounded_sm()
         .px(px(16.))
         .py(px(8.))
-        .bg(rgb(0x33cc66))
-        .text_color(rgb(0x101010))
+        .bg(rgb(0xd8d8d8))
+        .text_color(rgb(0x0d0e10))
         .text_size(px(14.))
         .child(label)
         .on_click(move |event, window, app| on_click(event, window, app))
@@ -685,34 +718,26 @@ pub(crate) fn progress_bar(progress: &DownloadProgress) -> Div {
     div()
         .w_full()
         .h(px(3.))
-        .rounded_sm()
-        .bg(rgb(0x1e1e1e))
-        .child(
-            div()
-                .h(px(3.))
-                .rounded_sm()
-                .bg(rgb(0x33cc66))
-                .w(relative(fraction)),
-        )
+        .bg(rgb(0x17191d))
+        .child(div().h(px(3.)).bg(rgb(0xd8d8d8)).w(relative(fraction)))
 }
 
 pub(crate) fn action_button(id: &'static str, label: &'static str, enabled: bool) -> Stateful<Div> {
     div()
         .id(id)
         .cursor_pointer()
-        .rounded_sm()
         .px(px(8.))
         .py(px(2.))
         .border_1()
-        .border_color(rgb(0x404040))
+        .border_color(rgb(0x2e2e2e))
         .text_size(px(13.))
         .bg(if enabled {
-            rgb(0x1c1c1c)
+            rgb(0x17191d)
         } else {
             rgb(0x141414)
         })
         .text_color(if enabled {
-            rgb(0xcccccc)
+            rgb(0xe5e7eb)
         } else {
             rgb(0x606060)
         })

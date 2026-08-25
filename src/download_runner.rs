@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use raycast_dictation_clone::asr::{ensure_model_by_spec, kind_by_id, repo_cache_dir_for, ModelSpec};
-use raycast_dictation_clone::log;
+use amanuensis::asr::{ModelSpec, ensure_model_by_spec, kind_by_id, repo_cache_dir_for};
+use amanuensis::log;
 
 use crate::messages::DownloadMessage;
 pub(crate) fn remove_dir_all_retrying(dir: &std::path::Path) -> Result<(), String> {

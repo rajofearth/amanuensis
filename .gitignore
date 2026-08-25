@@ -2,5 +2,6 @@
 /.native-libs
 
 *.log
+amanuensis.log
 dictation.log
 /dist

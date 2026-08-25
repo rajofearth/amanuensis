@@ -5,11 +5,12 @@ use windows_sys::Win32::{
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
             AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
-            GetWindowRect, GetWindowThreadProcessId, PostMessageW, SPI_GETWORKAREA, SW_HIDE,
-            SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-            SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
-            SystemParametersInfoW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, PostMessageW, SPI_GETWORKAREA,
+            SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongW, SetWindowPos,
+            SetWindowTextW, ShowWindow, SystemParametersInfoW, WS_CAPTION, WS_EX_APPWINDOW,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX,
+            WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
         },
     },
 };
@@ -23,7 +24,8 @@ pub const PANEL_HEIGHT: i32 = 600;
 
 pub const CHROME_CLEAR_MASK: u32 =
     WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
-pub const EX_CLEAR_MASK: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+pub const EX_CLEAR_MASK: u32 =
+    WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
 pub const EX_PILL: u32 = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
 
 pub fn dpi(hwnd: HWND) -> u32 {
@@ -50,7 +52,8 @@ pub fn pill_style(style: u32) -> u32 {
 }
 
 pub fn panel_style(style: u32) -> u32 {
-    (style & !(CHROME_CLEAR_MASK | WS_POPUP)) | (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+    (style & !(CHROME_CLEAR_MASK | WS_POPUP))
+        | (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME)
 }
 
 pub fn find_by_title(title_utf16: &[u16]) -> Option<HWND> {
@@ -133,7 +136,7 @@ pub fn show_no_activate(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         use windows_sys::Win32::Graphics::Gdi::{
-            RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+            RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
         };
         RedrawWindow(
             hwnd,
@@ -151,6 +154,28 @@ pub fn show_no_activate(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
         );
         PostMessageW(hwnd, WM_GPUI_FORCE_UPDATE_WINDOW, 0, 0);
+    }
+}
+
+pub fn show_panel(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
+    show_no_activate(hwnd);
+}
+
+pub fn demote_from_topmost(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
 

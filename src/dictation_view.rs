@@ -1,12 +1,13 @@
 use std::{sync::mpsc, thread, time::Instant};
 
-use gpui::{Context, IntoElement, Render, Window, div, prelude::*};
-use raycast_dictation_clone::asr::{Command, Event, Mode};
-use raycast_dictation_clone::log;
-use raycast_dictation_clone::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
-use raycast_dictation_clone::pill_win32::{PillCommand, PillMode};
 use crate::messages::{HotkeyMessage, PasteResult};
-use raycast_dictation_clone::win_focus::{self, FocusTarget};
+use amanuensis::asr::{Command, Event, Mode};
+use amanuensis::audio::{self, Sound};
+use amanuensis::log;
+use amanuensis::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
+use amanuensis::pill_win32::{PillCommand, PillMode};
+use amanuensis::win_focus::{self, FocusTarget};
+use gpui::{Context, IntoElement, Render, Window, div, prelude::*};
 
 pub(crate) const BARS: usize = 26;
 const FLASH_SECS: u64 = 1;
@@ -103,16 +104,24 @@ impl Dictation {
         self.transcribing_since = None;
         self.flash_since = None;
         self.recording_started = Some(Instant::now());
+        audio::play(Sound::Start);
         let _ = self.commands.send(Command::Start);
         let _ = self.pill_cmd.send(PillCommand::Show(PillMode::Recording));
-        let _ = self.pill_cmd.send(PillCommand::RecordingStarted(Instant::now()));
+        let _ = self
+            .pill_cmd
+            .send(PillCommand::RecordingStarted(Instant::now()));
     }
 
-    fn stop_recording(&mut self) {
+    fn stop_recording(&mut self, play_sound: bool) {
         self.phase = Phase::Transcribing;
         self.transcribing_since = Some(Instant::now());
+        if play_sound {
+            audio::play(Sound::Stop);
+        }
         self.recording_started = None;
-        let _ = self.pill_cmd.send(PillCommand::Show(PillMode::Transcribing));
+        let _ = self
+            .pill_cmd
+            .send(PillCommand::Show(PillMode::Transcribing));
         let _ = self
             .pill_cmd
             .send(PillCommand::TranscribingStarted(Instant::now()));
@@ -124,7 +133,7 @@ impl Dictation {
         match self.phase {
             Phase::Loading => self.pending_start = true,
             Phase::Idle => self.begin_recording(),
-            Phase::Recording => self.stop_recording(),
+            Phase::Recording => self.stop_recording(true),
             Phase::Transcribing => self.pending_start = true,
             Phase::Flash => {
                 log!("app", "F9 during done-flash: starting next recording");
@@ -140,7 +149,8 @@ impl Dictation {
         }
         log!("app", "recording discarded by user");
         self.discard_requested = true;
-        self.stop_recording();
+        audio::play(Sound::Cancel);
+        self.stop_recording(false);
         cx.notify();
     }
 
@@ -149,7 +159,7 @@ impl Dictation {
             return;
         }
         log!("app", "recording finished by user");
-        self.stop_recording();
+        self.stop_recording(true);
         cx.notify();
     }
 
@@ -235,7 +245,10 @@ impl Dictation {
                     if cleaned.is_empty() {
                         log!("app", "gate: dropped (empty after cleanup)");
                     } else if duration_secs < MIN_AUDIO_SECS {
-                        log!("app", "gate: dropped ({duration_secs:.2}s < {MIN_AUDIO_SECS}s min)");
+                        log!(
+                            "app",
+                            "gate: dropped ({duration_secs:.2}s < {MIN_AUDIO_SECS}s min)"
+                        );
                     } else {
                         let results = self.results.clone();
                         // Follow the user's live focus: if they switched apps during
@@ -286,8 +299,14 @@ impl Dictation {
 
     pub(crate) fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
         match result {
-            PasteResult::Pasted(chars) => log!("app", "paste ok: {chars} chars"),
-            PasteResult::Failed(error) => log!("app", "paste FAILED: {error}"),
+            PasteResult::Pasted(chars) => {
+                audio::play(Sound::Success);
+                log!("app", "paste ok: {chars} chars");
+            }
+            PasteResult::Failed(error) => {
+                audio::play(Sound::Failure);
+                log!("app", "paste FAILED: {error}");
+            }
         }
         cx.notify();
     }

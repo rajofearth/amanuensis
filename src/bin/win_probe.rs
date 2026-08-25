@@ -1,13 +1,13 @@
 use std::{sync::mpsc, time::Duration};
 
+use amanuensis::log;
+use amanuensis::logging;
+use amanuensis::pill_window as pw;
 use gpui::{
     App, Context, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
-use raycast_dictation_clone::log;
-use raycast_dictation_clone::logging;
-use raycast_dictation_clone::pill_window as pw;
 use windows_sys::Win32::{
     Foundation::COLORREF,
     Graphics::Gdi::{

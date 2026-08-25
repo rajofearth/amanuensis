@@ -51,7 +51,13 @@ impl Aggregate {
 }
 
 fn models_root() -> Result<PathBuf, String> {
-    Ok(config::config_dir()?.join("models"))
+    let current = config::config_dir()?.join("models");
+    if current.exists() {
+        return Ok(current);
+    }
+    let appdata = std::env::var_os("APPDATA").ok_or("APPDATA not set")?;
+    let legacy = PathBuf::from(appdata).join("raycast-dictation/models");
+    Ok(if legacy.exists() { legacy } else { current })
 }
 
 pub fn cached_model_dir(spec: &ModelSpec) -> PathBuf {
@@ -389,7 +395,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "raycast-dictation-fetch-test-{}-{unique}-{name}",
+            "amanuensis-fetch-test-{}-{unique}-{name}",
             std::process::id()
         ))
     }

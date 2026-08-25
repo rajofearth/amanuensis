@@ -12,7 +12,7 @@ pub fn init() {
     let _ = START.set(Instant::now());
     let path = std::env::current_dir()
         .unwrap_or_default()
-        .join("dictation.log");
+        .join("amanuensis.log");
     if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = FILE.set(Mutex::new(file));
         log(
@@ -20,7 +20,7 @@ pub fn init() {
             format!("session start, logging to {}", path.display()),
         );
     } else {
-        eprintln!("[log] failed to open dictation.log; stderr only");
+        eprintln!("[log] failed to open amanuensis.log; stderr only");
     }
 }
 

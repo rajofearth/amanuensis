@@ -3,9 +3,9 @@ use std::{
     time::Instant,
 };
 
+use amanuensis::asr::fetch;
+use amanuensis::asr::{AsrBackend, ModelKind, ModelPaths, NemotronBackend};
 use hound::{SampleFormat, WavReader};
-use raycast_dictation_clone::asr::fetch;
-use raycast_dictation_clone::asr::{AsrBackend, ModelKind, ModelPaths, NemotronBackend};
 
 const SAMPLE_RATE: i32 = 16000;
 const CHUNK_SAMPLES: usize = 480;

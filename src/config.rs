@@ -7,17 +7,29 @@ use crate::log;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub model: String,
+    #[serde(default = "default_tray_enabled")]
+    pub tray_enabled: bool,
+}
+
+fn default_tray_enabled() -> bool {
+    true
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             model: "nemotron".to_owned(),
+            tray_enabled: true,
         }
     }
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
+    let base = PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA not set")?);
+    Ok(base.join("amanuensis"))
+}
+
+fn legacy_config_dir() -> Result<PathBuf, String> {
     let base = PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA not set")?);
     Ok(base.join("raycast-dictation"))
 }
@@ -27,7 +39,13 @@ fn config_path() -> Result<PathBuf, String> {
 }
 
 pub fn load() -> Option<AppConfig> {
-    load_from(&config_path().ok()?)
+    let current = config_path().ok()?;
+    load_from(&current).or_else(|| {
+        legacy_config_dir()
+            .ok()
+            .map(|dir| dir.join("config.json"))
+            .and_then(|path| load_from(&path))
+    })
 }
 
 pub fn save(config: &AppConfig) -> Result<(), String> {
@@ -41,6 +59,12 @@ pub fn delete() -> Result<bool, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("removing {}: {error}", path.display())),
     }
+}
+
+pub fn set_tray_enabled(enabled: bool) -> Result<(), String> {
+    let mut config = load().unwrap_or_default();
+    config.tray_enabled = enabled;
+    save(&config)
 }
 
 fn load_from(path: &Path) -> Option<AppConfig> {
@@ -75,7 +99,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "raycast-dictation-test-{}-{unique}-{name}.json",
+            "amanuensis-test-{}-{unique}-{name}.json",
             std::process::id()
         ))
     }
@@ -85,6 +109,7 @@ mod tests {
         let path = temp_path("roundtrip");
         let written = AppConfig {
             model: "nemotron".to_owned(),
+            tray_enabled: true,
         };
         save_to(&path, &written).expect("save");
         let loaded = load_from(&path).expect("load after save");
