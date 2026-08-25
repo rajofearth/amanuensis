@@ -1,0 +1,519 @@
+use std::{
+    sync::{Arc, atomic::AtomicBool, mpsc},
+    thread,
+};
+
+use gpui::{Context, Entity, Window, div, prelude::*};
+use raycast_dictation_clone::asr::{
+    Command, Event, ModelKind, ModelSelection, kind_by_id, repo_cache_dir_for, spec_by_id,
+};
+use raycast_dictation_clone::config::{self, AppConfig};
+use raycast_dictation_clone::log;
+use raycast_dictation_clone::pill_win32::PillCommand;
+use raycast_dictation_clone::pill_window as pw;
+
+use crate::dictation_view::{Dictation, Phase};
+use crate::download_runner::{remove_dir_all_retrying, spawn_model_download};
+use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
+use crate::onboarding_view::{OnboardingView, SetupOrigin};
+
+pub(crate) const WINDOW_TITLE: &str = "raycast-dictation-window";
+#[derive(Clone)]
+pub(crate) enum Screen {
+    Onboarding {
+        view: Entity<OnboardingView>,
+        origin: SetupOrigin,
+    },
+    Dictation,
+}
+
+pub(crate) struct AppRoot {
+    pub(crate) screen: Screen,
+    pub(crate) dictation: Option<Entity<Dictation>>,
+    pub(crate) commands: Option<mpsc::Sender<Command>>,
+    pub(crate) events: mpsc::Sender<Event>,
+    pub(crate) results: mpsc::Sender<PasteResult>,
+    pub(crate) downloads: mpsc::Sender<DownloadMessage>,
+    pub(crate) ui: mpsc::Sender<UiMessage>,
+    pub(crate) pill_cmd: mpsc::Sender<PillCommand>,
+    pub(crate) pending_start: bool,
+    pub(crate) download_generation: u64,
+    pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
+    pub(crate) worker_live: bool,
+    pub(crate) hwnd: Option<isize>,
+}
+
+impl AppRoot {
+    pub(crate) fn hwnd_resolved(&mut self) -> Option<pw::HWND> {
+        if self.hwnd.is_none() {
+            match pw::find_by_title(&window_title_utf16()) {
+                Some(hwnd) if pw::process_owns_window(hwnd) => {
+                    self.hwnd = Some(hwnd as isize);
+                }
+                Some(_) => {
+                    log!(
+                        "app",
+                        "ERROR: window with our title belongs to another process; not touching it"
+                    );
+                }
+                None => {
+                    log!("app", "ERROR: main window not found by title");
+                }
+            }
+        }
+        self.hwnd.map(|value| value as pw::HWND)
+    }
+
+    pub(crate) fn apply_pill_chrome(&mut self) {
+        let Some(hwnd) = self.hwnd_resolved() else {
+            return;
+        };
+        let (style, ex) = pw::styles(hwnd);
+        let style = pw::pill_style(style);
+        let ex = (ex & !pw::EX_CLEAR_MASK) | pw::EX_PILL;
+        pw::set_styles(hwnd, style, ex);
+        pw::set_text(hwnd, &window_title_utf16());
+        let (frame_w, frame_h) =
+            pw::frame_size_for_client(pw::PILL_WIDTH, pw::PILL_HEIGHT, style, ex);
+        let (wx, wy, ww, wh) = pw::primary_work_area();
+        let x = wx + (ww - frame_w) / 2;
+        let y = wy + wh - frame_h - 12;
+        pw::place(hwnd, x, y, frame_w, frame_h, true);
+    }
+
+    pub(crate) fn apply_panel_chrome(&mut self) {
+        let Some(hwnd) = self.hwnd_resolved() else {
+            return;
+        };
+        let (style, ex) = pw::styles(hwnd);
+        let style = pw::panel_style(style);
+        let ex = ex & !pw::EX_CLEAR_MASK;
+        pw::set_styles(hwnd, style, ex);
+        pw::set_text(hwnd, &panel_title_utf16());
+        let (frame_w, frame_h) =
+            pw::frame_size_for_client(pw::PANEL_WIDTH, pw::PANEL_HEIGHT, style, ex);
+        let (ax, ay, aw, ah) = pw::primary_work_area();
+        let x = ax + (aw - frame_w) / 2;
+        let y = ay + (ah - frame_h) / 2;
+        pw::place(hwnd, x, y, frame_w, frame_h, true);
+    }
+
+    pub(crate) fn close_panel_to_pill(&mut self, cx: &mut Context<Self>) {
+        log!("app", "panel closed; returning to idle pill");
+        match self.screen.clone() {
+            Screen::Onboarding { origin, .. } => {
+                if matches!(origin, SetupOrigin::Settings)
+                    && let Some(dictation) = self.dictation.clone()
+                {
+                    dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
+                }
+                if self.dictation.is_some() {
+                    self.screen = Screen::Dictation;
+                    self.hide_pill_window();
+                } else {
+                    log!("app", "onboarding not completed; hiding until restart");
+                    self.hide_pill_window();
+                }
+            }
+            Screen::Dictation => self.hide_pill_window(),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn hide_pill_window(&mut self) {
+        if let Some(hwnd) = self.hwnd_resolved() {
+            pw::set_click_through(hwnd, true);
+            log!("app", "pill idle: click-through");
+        }
+    }
+
+    pub(crate) fn show_panel_window(&mut self) {
+        match self.hwnd_resolved() {
+            Some(_) => {
+                self.apply_panel_chrome();
+                if let Some(hwnd) = self.hwnd_resolved() {
+                    pw::show_no_activate(hwnd);
+                    log!("app", "panel shown");
+                }
+            }
+            None => log!("app", "ERROR: panel window not found by title"),
+        }
+    }
+}
+
+impl AppRoot {
+    pub(crate) fn handle_asr_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if let Some(dictation) = self.dictation.clone() {
+            dictation.update(cx, |dictation, cx| dictation.handle_asr_event(event, cx));
+        }
+    }
+
+    pub(crate) fn handle_hotkey(&mut self, message: HotkeyMessage, cx: &mut Context<Self>) {
+        match self.screen.clone() {
+            Screen::Dictation => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| dictation.handle_hotkey(message, cx));
+                }
+            }
+            Screen::Onboarding { view, origin } => match message {
+                HotkeyMessage::ToggleRecording => match origin {
+                    SetupOrigin::Settings | SetupOrigin::Respawn => {
+                        log!("app", "F9 ignored while settings open");
+                    }
+                    SetupOrigin::FirstRun | SetupOrigin::Recovery => {
+                        if view.read(cx).model_ready() || self.worker_live {
+                            self.pending_start = true;
+                            log!("app", "F9 during setup: queued start after models load");
+                            view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                        } else {
+                            log!(
+                                "app",
+                                "F9 blocked: model not fully cached and no worker loaded"
+                            );
+                            view.update(cx, |onboarding, cx| onboarding.set_blocked_notice(cx));
+                        }
+                    }
+                },
+                HotkeyMessage::DebugReload => log!("app", "F10 ignored during setup"),
+            },
+        }
+    }
+
+    pub(crate) fn handle_paste_result(&mut self, result: PasteResult, cx: &mut Context<Self>) {
+        if let Some(dictation) = self.dictation.clone() {
+            dictation.update(cx, |dictation, cx| {
+                dictation.handle_paste_result(result, cx)
+            });
+        }
+    }
+
+    pub(crate) fn pump_audio(
+        &mut self,
+        levels: &mut Vec<f32>,
+        chunks: &mut Vec<Vec<f32>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let (Screen::Dictation, Some(dictation)) = (self.screen.clone(), self.dictation.clone())
+        {
+            let drained_levels = std::mem::take(levels);
+            let drained_chunks = std::mem::take(chunks);
+            dictation.update(cx, |dictation, cx| {
+                if dictation.phase == Phase::Recording {
+                    dictation.push_levels(drained_levels);
+                    for chunk in drained_chunks {
+                        let _ = dictation.commands.send(Command::Chunk(chunk));
+                    }
+                }
+                cx.notify();
+            });
+        } else {
+            levels.clear();
+            chunks.clear();
+        }
+    }
+
+
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.screen, Screen::Dictation) {
+            return;
+        }
+        if let Some(dictation) = self.dictation.clone() {
+            dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
+        }
+        let default_id = ModelKind::Nemotron.spec().id;
+        let model_id = config::load().map_or(default_id, |config| {
+            spec_by_id(&config.model).map_or(default_id, |spec| spec.id)
+        });
+        log!("app", "opening settings: model={model_id}");
+        let device = detect_device();
+        let view = cx
+            .new(|_| OnboardingView::new(SetupOrigin::Settings, device, model_id, self.ui.clone()));
+        self.screen = Screen::Onboarding {
+            view,
+            origin: SetupOrigin::Settings,
+        };
+        self.show_panel_window();
+        cx.notify();
+    }
+
+    pub(crate) fn start_download(&mut self, captured_model: &'static str, purge: bool) {
+        let Some(spec) = spec_by_id(captured_model) else {
+            log!("app", "download ignored: unknown model '{captured_model}'");
+            return;
+        };
+        if purge && self.worker_live {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::Shutdown);
+                    log!("app", "releasing loaded model before re-download purge");
+                    self.worker_live = false;
+                }
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel before purge"
+                    );
+                    self.worker_live = false;
+                }
+            }
+        }
+        self.download_generation += 1;
+        let generation = self.download_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_flag = Some(cancel.clone());
+        log!(
+            "app",
+            "download started: {} (generation {generation}, purge={purge})",
+            spec.id
+        );
+        spawn_model_download(spec, purge, generation, cancel, self.downloads.clone());
+    }
+
+    pub(crate) fn handle_download_message(&mut self, message: DownloadMessage, cx: &mut Context<Self>) {
+        match message {
+            DownloadMessage::Progress {
+                generation,
+                progress,
+            } => {
+                if generation != self.download_generation {
+                    log!(
+                        "app",
+                        "stale download progress dropped (generation {generation})"
+                    );
+                    return;
+                }
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| {
+                        onboarding.download_progress(progress, cx)
+                    });
+                }
+            }
+            DownloadMessage::Finished { generation, result } => {
+                if generation != self.download_generation {
+                    log!(
+                        "app",
+                        "stale download finish dropped (generation {generation})"
+                    );
+                    return;
+                }
+                self.cancel_flag = None;
+                match result {
+                    Ok(model) => {
+                        let step_flow_view = match self.screen.clone() {
+                            Screen::Onboarding { view, .. } => Some(view),
+                            Screen::Dictation => None,
+                        };
+                        let in_step_flow = step_flow_view
+                            .as_ref()
+                            .is_some_and(|view| view.read(cx).step_active());
+                        if in_step_flow && let Some(view) = step_flow_view {
+                            view.update(cx, |onboarding, cx| onboarding.download_finished_step(cx));
+                        } else {
+                            self.finish_onboarding(model, cx);
+                        }
+                    }
+                    Err(error) => {
+                        if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                            view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
+                        }
+                    }
+                }
+            }
+            DownloadMessage::Cancelled { generation } => {
+                if generation != self.download_generation {
+                    log!("app", "stale cancel dropped (generation {generation})");
+                    return;
+                }
+                self.cancel_flag = None;
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| onboarding.download_cancelled(cx));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_ui_message(&mut self, message: UiMessage, cx: &mut Context<Self>) {
+        match message {
+            UiMessage::OpenSettings => self.open_settings(cx),
+            UiMessage::PanelClosed => self.close_panel_to_pill(cx),
+            UiMessage::StartDownload {
+                captured_model,
+                purge,
+            } => self.start_download(captured_model, purge),
+            UiMessage::CancelDownload => {
+                if let Some(flag) = &self.cancel_flag {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    log!("app", "cancel ignored: no download in flight");
+                }
+            }
+            UiMessage::FinishOnboarding { captured_model } => {
+                let kind = kind_by_id(captured_model).unwrap_or(ModelKind::Nemotron);
+                self.finish_onboarding(kind, cx);
+            }
+            UiMessage::DeleteRequest { captured_model } => self.delete_model(captured_model),
+            UiMessage::DeleteFinished(result) => {
+                if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                    view.update(cx, |onboarding, cx| onboarding.delete_finished(result, cx));
+                }
+            }
+            UiMessage::ResetSetup { captured_model } => self.reset_setup(captured_model, cx),
+            UiMessage::PillDiscard => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| dictation.discard_clicked(cx));
+                }
+            }
+            UiMessage::PillFinish => {
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| dictation.done_clicked(cx));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn delete_model(&mut self, captured_model: &'static str) {
+        let kind = kind_by_id(captured_model).unwrap_or(ModelKind::Nemotron);
+        let Some(dir) = repo_cache_dir_for(kind) else {
+            return;
+        };
+        if self.worker_live {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::Shutdown);
+                    log!("app", "releasing loaded model before delete");
+                    self.worker_live = false;
+                }
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel before delete"
+                    );
+                    self.worker_live = false;
+                }
+            }
+        }
+        let ui = self.ui.clone();
+        thread::spawn(move || {
+            let result = remove_dir_all_retrying(&dir);
+            let _ = ui.send(UiMessage::DeleteFinished(result));
+        });
+    }
+
+    pub(crate) fn reset_setup(&mut self, captured_model: &'static str, cx: &mut Context<Self>) {
+        match config::delete() {
+            Ok(true) => log!("app", "setup reset: config deleted"),
+            Ok(false) => log!("app", "setup reset: no config file present"),
+            Err(error) => log!("app", "setup reset FAILED: {error}"),
+        }
+        let default_id = ModelKind::Nemotron.spec().id;
+        let model_id = spec_by_id(captured_model).map_or(default_id, |spec| spec.id);
+        log!("app", "re-entering setup with model={model_id}");
+        let device = detect_device();
+        let view = cx
+            .new(|_| OnboardingView::new(SetupOrigin::Respawn, device, model_id, self.ui.clone()));
+        self.screen = Screen::Onboarding {
+            view,
+            origin: SetupOrigin::Respawn,
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
+        let config = AppConfig {
+            model: model.spec().id.to_owned(),
+        };
+        match config::save(&config) {
+            Ok(()) => log!("app", "config saved: model={}", config.model),
+            Err(error) => log!("app", "config save FAILED: {error}"),
+        }
+        if self.worker_live {
+            match self.commands.clone() {
+                Some(commands) => {
+                    let _ = commands.send(Command::SetModel(model));
+                    log!("app", "SetModel sent to live worker: {}", model.spec().id);
+                }
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: worker_live with no worker channel; cannot send SetModel"
+                    );
+                }
+            }
+            self.pending_start = false;
+            self.screen = Screen::Dictation;
+            self.hide_pill_window();
+            cx.notify();
+            return;
+        }
+        let selection = ModelSelection { model };
+        let commands = raycast_dictation_clone::asr::spawn_worker(self.events.clone(), selection);
+        self.worker_live = true;
+        log!("app", "worker spawned with selection {selection:?}");
+        let pending_start = std::mem::replace(&mut self.pending_start, false);
+        let dictation = cx.new(|_| {
+            Dictation::new(
+                commands.clone(),
+                self.results.clone(),
+                self.pill_cmd.clone(),
+                pending_start,
+            )
+        });
+        self.dictation = Some(dictation);
+        self.commands = Some(commands);
+        self.screen = Screen::Dictation;
+        self.hide_pill_window();
+        cx.notify();
+    }
+}
+
+impl Render for AppRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match self.screen.clone() {
+            Screen::Onboarding { view, .. } => div().size_full().child(view),
+            Screen::Dictation => match self.dictation.clone() {
+                Some(dictation) => div().size_full().child(dictation),
+                None => div().size_full(),
+            },
+        }
+    }
+}
+pub(crate) fn window_title_utf16() -> Vec<u16> {
+    WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+pub(crate) fn panel_title_utf16() -> Vec<u16> {
+    "Dictation Setup"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+pub(crate) fn selection_from_config(config: &AppConfig) -> ModelSelection {
+    let fallback = ModelKind::Nemotron;
+    let model = kind_by_id(&config.model).unwrap_or_else(|| {
+        log!(
+            "app",
+            "unknown model id '{}' in config; using default instead",
+            config.model
+        );
+        fallback
+    });
+    ModelSelection { model }
+}
+
+pub(crate) fn detect_device() -> (u32, usize) {
+    let system = sysinfo::System::new_all();
+    let ram_gb = (system.total_memory() / (1024 * 1024 * 1024)) as u32;
+    let cores = system.cpus().len();
+    (ram_gb, cores)
+}
+
+pub(crate) fn rms_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}

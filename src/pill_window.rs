@@ -5,11 +5,11 @@ use windows_sys::Win32::{
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
             AdjustWindowRectEx, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetWindowLongW,
-            GetWindowRect, GetWindowThreadProcessId, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
-            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW,
-            SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, WS_CAPTION,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-            WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            GetWindowRect, GetWindowThreadProcessId, PostMessageW, SPI_GETWORKAREA, SW_HIDE,
+            SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
+            SystemParametersInfoW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
         },
     },
 };
@@ -132,12 +132,57 @@ pub fn move_to(hwnd: HWND, x: i32, y: i32) {
 pub fn show_no_activate(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        use windows_sys::Win32::Graphics::Gdi::{
+            RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+        };
+        RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+        PostMessageW(hwnd, WM_GPUI_FORCE_UPDATE_WINDOW, 0, 0);
     }
 }
+
+const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = 0x0400 + 5;
 
 pub fn hide(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+pub fn set_click_through(hwnd: HWND, enabled: bool) {
+    unsafe {
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let updated = if enabled {
+            ex | WS_EX_TRANSPARENT
+        } else {
+            ex & !WS_EX_TRANSPARENT
+        };
+        if updated != ex {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, updated as i32);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        PostMessageW(hwnd, WM_GPUI_FORCE_UPDATE_WINDOW, 0, 0);
     }
 }
 

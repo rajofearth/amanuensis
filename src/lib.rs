@@ -4,5 +4,6 @@ pub mod config;
 pub mod logging;
 pub mod paste;
 pub mod pill_window;
+pub mod pill_win32;
 pub mod setup_steps;
 pub mod win_focus;
