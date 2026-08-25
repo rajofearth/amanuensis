@@ -16,37 +16,47 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    GWLP_USERDATA, GetWindowLongPtrW, HTCAPTION, KillTimer, MSG, PostQuitMessage, RegisterClassW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SPI_GETWORKAREA, SendMessageW, SetTimer, SetWindowLongPtrW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, WM_CREATE,
-    WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    GetMessageW, GWLP_USERDATA, GetWindowLongPtrW, HTCAPTION, IDC_HAND, KillTimer, LoadCursorW, MSG,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SPI_GETWORKAREA, SendMessageW,
+    SetCursor, SetTimer, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    UpdateLayeredWindow, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONUP,
+    WM_TIMER, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::log;
 
-const PILL_W: i32 = 340;
-const PILL_H: i32 = 64;
+// ---- Geometry (logical px, scaled by DPI at creation) ----
+// One compact surface: controls overlay the waveform on hover.
+const PILL_W: i32 = 120;
+const PILL_H: i32 = 36;
+const WAVE_H: i32 = 36;
+const CONTROLS_X: i32 = 0;
+const CONTROLS_Y: i32 = 0;
+const CONTROLS_W: i32 = 120;
+const CONTROLS_H: i32 = 36;
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 33;
-const BARS: usize = 26;
-const INNER_PAD: i32 = 14;
-const BAR_AREA_W: i32 = 120;
-const BAR_H: i32 = 18;
-const TEXT_W: i32 = 64;
-const BTN_SIZE: i32 = 24;
-const ROUND_RADIUS: i32 = 16;
 
-const COLOR_BG: COLORREF = 0x00161616;
-const COLOR_BORDER: COLORREF = 0x00333333;
-const COLOR_BAR: COLORREF = 0x0033CC66;
-const COLOR_BAR_FLASH: COLORREF = 0x00606060;
-const COLOR_TEXT: COLORREF = 0x00CCCCCC;
-const COLOR_DISCARD: COLORREF = 0x00CC3333;
-const COLOR_FINISH: COLORREF = 0x0033CC66;
-const COLOR_BTN_IDLE: COLORREF = 0x002A2A2A;
-const COLOR_BTN_HOVER: COLORREF = 0x003A3A3A;
+const BARS: usize = 26; // level count arriving from the Waveform ring
+const WAVE_BARS: usize = 31; // thin bars actually drawn (resampled from BARS)
+const BAR_W: i32 = 1;
+const BAR_MAX_H: i32 = 18;
+const MIN_BAR_H: i32 = 1;
+const INNER_PAD: i32 = 6;
+const BTN_SIZE: i32 = 22;
+const BTN_GAP: i32 = 4;
+const PILL_RADIUS: i32 = 0;
+
+// ---- Colors (COLORREF = 0x00BBGGRR) — monochrome, like the reference ----
+const COLOR_BG: COLORREF = 0x00101010; // #101010
+const COLOR_BORDER: COLORREF = 0x002E2E2E; // #2E2E2E
+const COLOR_WAVE: COLORREF = 0x00909090; // dim waveform behind hover controls
+const COLOR_WAVE_HOVER: COLORREF = 0x00484848; // quieter while controls are overlaid
+const COLOR_TEXT: COLORREF = 0x00F2F2F2; // #F2F2F2
+const COLOR_BTN_IDLE: COLORREF = 0x001A1A1A; // #1A1A1A
+const COLOR_BTN_HOVER: COLORREF = 0x00262626; // #262626
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PillMode {
@@ -124,6 +134,61 @@ struct PillWindow {
     click_tx: mpsc::Sender<PillButton>,
 }
 
+impl PillWindow {
+    fn controls_rect(&self) -> RECT {
+        RECT {
+            left: self.s(CONTROLS_X),
+            top: self.s(CONTROLS_Y),
+            right: self.s(CONTROLS_X + CONTROLS_W),
+            bottom: self.s(CONTROLS_Y + CONTROLS_H),
+        }
+    }
+
+    fn discard_rect(&self) -> RECT {
+        let bs = self.s(BTN_SIZE);
+        let controls = self.controls_rect();
+        RECT {
+            left: controls.left + self.s(INNER_PAD),
+            top: controls.top + (controls.bottom - controls.top - bs) / 2,
+            right: controls.left + self.s(INNER_PAD) + bs,
+            bottom: controls.top + (controls.bottom - controls.top - bs) / 2 + bs,
+        }
+    }
+
+    fn finish_rect(&self) -> RECT {
+        let bs = self.s(BTN_SIZE);
+        let controls = self.controls_rect();
+        let x = controls.right - self.s(INNER_PAD) - bs;
+        RECT {
+            left: x,
+            top: controls.top + (controls.bottom - controls.top - bs) / 2,
+            right: x + bs,
+            bottom: controls.top + (controls.bottom - controls.top - bs) / 2 + bs,
+        }
+    }
+
+    fn bar_area_x(&self) -> i32 {
+        self.s(INNER_PAD)
+    }
+
+    fn text_x(&self) -> i32 {
+        self.s(CONTROLS_X + INNER_PAD + BTN_SIZE + BTN_GAP)
+    }
+
+    fn text_width(&self) -> i32 {
+        self.s(CONTROLS_W - 2 * (INNER_PAD + BTN_SIZE + BTN_GAP))
+    }
+
+    /// Logical -> device px.
+    fn s(&self, v: i32) -> i32 {
+        (v as f64 * self.dpi_scale) as i32
+    }
+
+    fn buttons_visible(&self) -> bool {
+        self.mode == Some(PillMode::Recording) && self.mouse_in
+    }
+}
+
 fn work_area() -> (i32, i32, i32, i32) {
     unsafe {
         let mut rect: RECT = std::mem::zeroed();
@@ -151,40 +216,28 @@ fn dpi_scale(hwnd: HWND) -> f64 {
     }
 }
 
-fn hit_test(x: i32, y: i32, w: i32, h: i32, scale: f64, any_hover: bool) -> HoverTarget {
-    if !any_hover {
+fn hit_test(pill: &PillWindow, x: i32, y: i32) -> HoverTarget {
+    if !pill.buttons_visible() {
         return HoverTarget::None;
     }
-    let bs = (BTN_SIZE as f64 * scale) as i32;
-    let ip = (INNER_PAD as f64 * scale) as i32;
-    let center_y = h / 2;
-    let btn_top = center_y - bs / 2;
-
-    let discard_x = ip;
-    if x >= discard_x && x <= discard_x + bs && y >= btn_top && y <= btn_top + bs {
+    let inside = |r: &RECT| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    if inside(&pill.discard_rect()) {
         return HoverTarget::Discard;
     }
-
-    let finish_x = w - ip - bs;
-    if x >= finish_x && x <= finish_x + bs && y >= btn_top && y <= btn_top + bs {
+    if inside(&pill.finish_rect()) {
         return HoverTarget::Finish;
     }
-
     HoverTarget::Body
 }
 
-fn is_recording(pill: &PillWindow) -> bool {
-    matches!(pill.mode, Some(PillMode::Recording))
-}
-
-/// Animated bar levels for modes that self-animate (no live mic data).
+/// Animated bar levels for modes without live mic data.
 fn synthesized_levels(mode: PillMode, elapsed: f64) -> Vec<f32> {
     match mode {
-        PillMode::Flash => vec![0.06; BARS],
+        PillMode::Flash => vec![0.0; BARS],
         _ => (0..BARS)
             .map(|index| {
                 let wave = (elapsed * 3.0 + index as f64 * 0.7).sin().abs();
-                (0.2 + 0.5 * wave).clamp(0.08, 1.0) as f32
+                (0.15 + 0.55 * wave).clamp(0.05, 1.0) as f32
             })
             .collect(),
     }
@@ -263,27 +316,27 @@ fn update_elapsed(pill: &mut PillWindow) {
     }
 }
 
-/// Per-pixel alpha pass: opaque inside the rounded capsule, transparent outside.
-/// GDI writes leave the alpha channel garbage/zero, which AC_SRC_ALPHA would
-/// render as a fully transparent window — this is what makes the pill visible.
-fn apply_alpha(pixels: *mut u8, w: i32, h: i32, scale: f64) {
+/// Per-pixel alpha pass: opaque inside the rounded rectangle, transparent
+/// outside. GDI writes leave the alpha channel zero, which AC_SRC_ALPHA would
+/// render as a fully transparent window — this pass is what makes it visible.
+fn apply_alpha(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    wave_rect: &RECT,
+    controls_rect: &RECT,
+    corner_radius: i32,
+) {
     if pixels.is_null() {
         return;
     }
     let stride = w as usize * 4;
-    let radius = (ROUND_RADIUS as f64 * scale) as i32;
+    let radius = corner_radius.max(0) as f64;
     for y in 0..h {
         let row = unsafe { pixels.add(y as usize * stride) };
-        let dy = y.min(h - 1 - y);
         for x in 0..w {
-            let dx = x.min(w - 1 - x);
-            let inside = if dx >= radius || dy >= radius {
-                true
-            } else {
-                let ddx = (radius - dx) as f64;
-                let ddy = (radius - dy) as f64;
-                ddx * ddx + ddy * ddy <= (radius * radius) as f64
-            };
+            let inside = point_in_round_rect(x, y, wave_rect, radius)
+                || point_in_round_rect(x, y, controls_rect, radius);
             unsafe {
                 *row.add(x as usize * 4 + 3) = if inside { 0xFF } else { 0x00 };
             }
@@ -291,20 +344,46 @@ fn apply_alpha(pixels: *mut u8, w: i32, h: i32, scale: f64) {
     }
 }
 
-fn draw_button_glyph(hdc: HDC, x: i32, top: i32, size: i32, glyph: &[u16], color: COLORREF) {
+fn point_in_round_rect(x: i32, y: i32, rect: &RECT, radius: f64) -> bool {
+    if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
+        return false;
+    }
+    let dx = (x - rect.left).min(rect.right - 1 - x) as f64;
+    let dy = (y - rect.top).min(rect.bottom - 1 - y) as f64;
+    if dx >= radius || dy >= radius {
+        true
+    } else {
+        dx * dx + dy * dy <= radius * radius
+    }
+}
+
+fn fill_round(hdc: HDC, r: &RECT, radius: i32, color: COLORREF) {
     unsafe {
-        SetTextColor(hdc, color);
-        let mut rect = RECT {
-            left: x,
-            top,
-            right: x + size,
-            bottom: top + size,
-        };
+        let brush = CreateSolidBrush(color);
+        let rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
+        FillRgn(hdc, rgn, brush);
+        DeleteObject(brush as _);
+        DeleteObject(rgn as _);
+    }
+}
+
+fn draw_button(pill: &PillWindow, hdc: HDC, r: &RECT, glyph: &[u16], glyph_color: COLORREF, hovered: bool) {
+    let bg = if hovered { COLOR_BTN_HOVER } else { COLOR_BTN_IDLE };
+    let radius = pill.s(14);
+    fill_round(hdc, r, radius, bg);
+    unsafe {
+        // 1px border, like the original window's action buttons.
+        let brush = CreateSolidBrush(COLOR_BORDER);
+        let rgn: HRGN = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
+        FrameRgn(hdc, rgn, brush, 1, 1);
+        DeleteObject(brush as _);
+        DeleteObject(rgn as _);
+        SetTextColor(hdc, glyph_color);
         DrawTextW(
             hdc,
             glyph.as_ptr(),
             (glyph.len() - 1) as i32,
-            &mut rect,
+            r as *const RECT as *mut RECT,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
     }
@@ -317,27 +396,22 @@ fn render_pill(pill: &PillWindow) {
     unsafe {
         let w = pill.width;
         let h = pill.height;
-        let scale = pill.dpi_scale;
         let hdc = pill.hdc_mem;
 
-        let bg_brush = CreateSolidBrush(COLOR_BG);
-        let bg_rect = RECT {
+        let wave_rect = RECT {
             left: 0,
             top: 0,
             right: w,
-            bottom: h,
+            bottom: pill.s(WAVE_H),
         };
-        windows_sys::Win32::Graphics::Gdi::FillRect(hdc, &bg_rect, bg_brush);
-        DeleteObject(bg_brush as _);
+        let controls_rect = pill.controls_rect();
+        let corner = pill.s(PILL_RADIUS * 2); // GDI ellipse size = 2x visual radius
 
-        let ip = (INNER_PAD as f64 * scale) as i32;
-        let bs = (BTN_SIZE as f64 * scale) as i32;
-        let center_y = h / 2;
-
-        // Border follows the rounded outline.
+        // Clear the backing store before redrawing the compact panel.
+        std::ptr::write_bytes(pill.pixels, 0, (w * h * 4) as usize);
+        fill_round(hdc, &wave_rect, corner, COLOR_BG);
         let border_brush = CreateSolidBrush(COLOR_BORDER);
-        let outline: HRGN =
-            CreateRoundRectRgn(0, 0, w + 1, h + 1, ROUND_RADIUS * 2, ROUND_RADIUS * 2);
+        let outline: HRGN = CreateRoundRectRgn(0, 0, w + 1, h + 1, corner, corner);
         FrameRgn(hdc, outline, border_brush, 1, 1);
         DeleteObject(border_brush as _);
         DeleteObject(outline as _);
@@ -345,10 +419,9 @@ fn render_pill(pill: &PillWindow) {
         SetBkMode(hdc, 1);
 
         let segoe: Vec<u16> = "Segoe UI".encode_utf16().chain(std::iter::once(0)).collect();
-        let font_size = (-12.0 * scale * 20.0 / 96.0) as i32;
         let font = CreateFontIndirectW(&LOGFONTW {
-            lfHeight: font_size,
-            lfWeight: 400,
+            lfHeight: (-(14.0 * pill.dpi_scale)) as i32,
+            lfWeight: 600,
             lfFaceName: {
                 let mut name = [0u16; 32];
                 let copy_len = segoe.len().min(31);
@@ -359,34 +432,7 @@ fn render_pill(pill: &PillWindow) {
         });
         let old_font = SelectObject(hdc, font as _);
 
-        // Buttons appear once the cursor is over the pill (recording) or hover.
-        let expanded = pill.hover != HoverTarget::None || is_recording(pill);
-        if expanded && pill.hover != HoverTarget::None {
-            let discard_x = ip;
-            let finish_x = w - ip - bs;
-            let btn_top = center_y - bs / 2;
-
-            let btn_color = match pill.hover {
-                HoverTarget::Discard | HoverTarget::Finish => COLOR_BTN_HOVER,
-                _ => COLOR_BTN_IDLE,
-            };
-
-            for bx in [discard_x, finish_x] {
-                let btn_brush = CreateSolidBrush(btn_color);
-                let btn_rgn =
-                    CreateRoundRectRgn(bx, btn_top, bx + bs, btn_top + bs, 6 * scale as i32 + 1, 6 * scale as i32 + 1);
-                FillRgn(hdc, btn_rgn, btn_brush);
-                DeleteObject(btn_brush as _);
-                DeleteObject(btn_rgn as _);
-            }
-
-            let cross: Vec<u16> = "\u{2715}".encode_utf16().chain(std::iter::once(0)).collect();
-            draw_button_glyph(hdc, discard_x, btn_top, bs, &cross, COLOR_DISCARD);
-            let check: Vec<u16> = "\u{2713}".encode_utf16().chain(std::iter::once(0)).collect();
-            draw_button_glyph(hdc, finish_x, btn_top, bs, &check, COLOR_FINISH);
-        }
-
-        // Bars: live mic levels while recording, self-animated otherwise.
+        // Bars: live mic levels while recording, self-animated while transcribing.
         let synth;
         let levels: &[f32] = match pill.mode {
             Some(PillMode::Recording) | None => &pill.levels,
@@ -400,61 +446,111 @@ fn render_pill(pill: &PillWindow) {
             }
         };
 
-        let shift_left = expanded && pill.hover != HoverTarget::None;
-        let bar_area_x = ip + if shift_left { bs + (4.0 * scale) as i32 } else { 0 };
-        let bar_w = (((BAR_AREA_W as f64 * scale) as i32) - (BARS as i32 - 1) * 2) / BARS as i32;
-        let bar_gap = 2;
-        let bar_max_h = (BAR_H as f64 * scale) as i32;
-        let bar_top = center_y - bar_max_h / 2;
-
-        let bar_color: COLORREF = match pill.mode {
-            Some(PillMode::Flash) => COLOR_BAR_FLASH,
-            _ => COLOR_BAR,
-        };
-        for (index, level) in levels.iter().take(BARS).enumerate() {
-            let level = level.clamp(0.0, 1.0);
-            let bar_h = ((bar_max_h as f32 * level) as i32).max(2);
-            let bar_x = bar_area_x + index as i32 * (bar_w + bar_gap);
-            let bar_y = bar_top + bar_max_h - bar_h;
-            let bar_brush = CreateSolidBrush(bar_color);
-            let bar_rgn = CreateRoundRectRgn(bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, 2, 2);
-            FillRgn(hdc, bar_rgn, bar_brush);
-            DeleteObject(bar_brush as _);
-            DeleteObject(bar_rgn as _);
+        // Waveform: thin bars resampled from the mic levels, symmetric
+        // envelope — tallest in the middle, tapering to dots at the edges.
+        let bar_max_h = pill.s(BAR_MAX_H);
+        let bar_top = h / 2;
+        let bar_x0 = pill.bar_area_x();
+        let area_w = w - pill.s(INNER_PAD) - bar_x0;
+        let bar_w = pill.s(BAR_W);
+        let count = WAVE_BARS as i32;
+        let n_in = levels.len();
+        if n_in > 0 && area_w > bar_w {
+            let gap = ((area_w - count * bar_w) / (count - 1)).max(1);
+            let total_w = count * bar_w + (count - 1) * gap;
+            let start_x = bar_x0 + (area_w - total_w) / 2;
+            let center = (WAVE_BARS as f32 - 1.0) / 2.0;
+            for i in 0..count {
+                // Linear resample of the input levels down/up to WAVE_BARS.
+                let t = i as f32 * (n_in as f32 - 1.0) / (count as f32 - 1.0);
+                let i0 = (t.floor() as usize).min(n_in - 1);
+                let i1 = (i0 + 1).min(n_in - 1);
+                let frac = t - i0 as f32;
+                let level = (levels[i0] * (1.0 - frac) + levels[i1] * frac).clamp(0.0, 1.0);
+                // Parabolic envelope peaked at the center.
+                let env = (1.0 - ((i as f32 - center) / (center + 0.5)).abs().powi(2)).max(0.0);
+                let env = 0.82 * env;
+                let raw_height = bar_max_h as f32 * env * level;
+                if raw_height < pill.s(MIN_BAR_H) as f32 {
+                    continue;
+                }
+                let bar_h = raw_height as i32;
+                let bar_x = start_x + i * (bar_w + gap);
+                let r = RECT {
+                    left: bar_x,
+                    top: bar_top - bar_h / 2,
+                    right: bar_x + bar_w,
+                    bottom: bar_top - bar_h / 2 + bar_h,
+                };
+                let wave_color = if pill.buttons_visible() {
+                    COLOR_WAVE_HOVER
+                } else {
+                    COLOR_WAVE
+                };
+                fill_round(hdc, &r, bar_w, wave_color);
+            }
         }
 
-        // Status text pinned to the right edge.
+        // Hover controls sit over the dim waveform.
+        if pill.buttons_visible() {
+            let cross: Vec<u16> = "\u{2715}".encode_utf16().chain(std::iter::once(0)).collect();
+            let check: Vec<u16> = "\u{2713}".encode_utf16().chain(std::iter::once(0)).collect();
+            draw_button(
+                pill,
+                hdc,
+                &pill.discard_rect(),
+                &cross,
+                COLOR_TEXT,
+                pill.hover == HoverTarget::Discard,
+            );
+            draw_button(
+                pill,
+                hdc,
+                &pill.finish_rect(),
+                &check,
+                COLOR_TEXT,
+                pill.hover == HoverTarget::Finish,
+            );
+        }
+
+        // Right slot: timer / dots / done.
         SetTextColor(hdc, COLOR_TEXT);
-        let text_area_w = (TEXT_W as f64 * scale) as i32;
-        let text_x = w - ip - text_area_w;
-        let duration_str = match pill.mode {
-            Some(PillMode::Recording) => {
-                let total_secs = pill.elapsed as u64;
-                format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
+        let right_text: String = match pill.mode {
+            Some(PillMode::Recording) if pill.buttons_visible() => {
+                let total = pill.elapsed as u64;
+                format!("{}:{:02}", total / 60, total % 60)
             }
-            Some(PillMode::Transcribing) => "transcribing\u{2026}".to_owned(),
-            Some(PillMode::Flash) => "done \u{2713}".to_owned(),
             None => String::new(),
+            _ => String::new(),
         };
-        let utf16: Vec<u16> = duration_str.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: 0,
-            right: text_x + text_area_w,
-            bottom: h,
-        };
-        DrawTextW(
-            hdc,
-            utf16.as_ptr(),
-            utf16.len() as i32 - 1,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
+        if !right_text.is_empty() {
+            let utf16: Vec<u16> = right_text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut text_rect = RECT {
+                left: pill.text_x(),
+                top: controls_rect.top,
+                right: pill.text_x() + pill.text_width(),
+                bottom: controls_rect.bottom,
+            };
+            DrawTextW(
+                hdc,
+                utf16.as_ptr(),
+                utf16.len() as i32 - 1,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
 
         SelectObject(hdc, old_font);
         DeleteObject(font as _);
 
-        apply_alpha(pill.pixels, w, h, scale);
+        apply_alpha(
+            pill.pixels,
+            w,
+            h,
+            &wave_rect,
+            &controls_rect,
+            pill.s(PILL_RADIUS),
+        );
 
         let src = POINT { x: 0, y: 0 };
         let size = SIZE { cx: w, cy: h };
@@ -484,6 +580,15 @@ fn invalidate(hwnd: HWND) {
     unsafe {
         let rect: RECT = std::mem::zeroed();
         InvalidateRect(hwnd, &rect, 0);
+    }
+}
+
+fn client_cursor_pos(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+        (pt.x, pt.y)
     }
 }
 
@@ -517,6 +622,21 @@ unsafe extern "system" fn pill_wnd_proc(
                 }
                 0
             }
+            WM_SETCURSOR => {
+                if (lparam & 0xFFFF) as u16 == 1 /* HTCLIENT */ {
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PillWindow;
+                    if !ptr.is_null() {
+                        let pill = &*ptr;
+                        let (x, y) = client_cursor_pos(hwnd);
+                        if matches!(hit_test(pill, x, y), HoverTarget::Discard | HoverTarget::Finish)
+                        {
+                            SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                            return 1;
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_MOUSEMOVE => {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PillWindow;
                 if ptr.is_null() {
@@ -533,8 +653,7 @@ unsafe extern "system" fn pill_wnd_proc(
                 }
                 let x = (lparam & 0xFFFF) as i16 as i32;
                 let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
-                let has_buttons = is_recording(pill);
-                let new_hover = hit_test(x, y, pill.width, pill.height, pill.dpi_scale, has_buttons);
+                let new_hover = hit_test(pill, x, y);
                 let changed = new_hover != pill.hover;
                 pill.hover = new_hover;
                 if changed {
@@ -560,15 +679,7 @@ unsafe extern "system" fn pill_wnd_proc(
                 let pill = &*ptr;
                 let x = (lparam & 0xFFFF) as i16 as i32;
                 let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
-                let target = hit_test(
-                    x,
-                    y,
-                    pill.width,
-                    pill.height,
-                    pill.dpi_scale,
-                    is_recording(pill),
-                );
-                match target {
+                match hit_test(pill, x, y) {
                     HoverTarget::Discard => {
                         let _ = (*ptr).click_tx.send(PillButton::Discard);
                     }
@@ -638,7 +749,7 @@ fn pill_thread(cmd_rx: mpsc::Receiver<PillCommand>, click_tx: mpsc::Sender<PillB
             .collect();
 
         let wnd_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
             lpfnWndProc: Some(pill_wnd_proc),
             hInstance: GetModuleHandleW(std::ptr::null()),
             lpszClassName: class_name.as_ptr(),

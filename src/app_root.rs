@@ -15,6 +15,9 @@ use raycast_dictation_clone::pill_window as pw;
 use crate::dictation_view::{Dictation, Phase};
 use crate::download_runner::{remove_dir_all_retrying, spawn_model_download};
 use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
+
+const LOW_SIGNAL_PEAK: f32 = 0.05;
+const LOW_SIGNAL_GAIN: f32 = 8.0;
 use crate::onboarding_view::{OnboardingView, SetupOrigin};
 
 pub(crate) const WINDOW_TITLE: &str = "raycast-dictation-window";
@@ -201,7 +204,9 @@ impl AppRoot {
                 if dictation.phase == Phase::Recording {
                     dictation.push_levels(drained_levels);
                     for chunk in drained_chunks {
-                        let _ = dictation.commands.send(Command::Chunk(chunk));
+                        let _ = dictation
+                            .commands
+                            .send(Command::Chunk(prepare_asr_chunk(chunk)));
                     }
                 }
                 cx.notify();
@@ -516,4 +521,34 @@ pub(crate) fn rms_level(samples: &[f32]) -> f32 {
         return 0.0;
     }
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn prepare_asr_chunk(mut samples: Vec<f32>) -> Vec<f32> {
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    if peak >= LOW_SIGNAL_PEAK {
+        return samples;
+    }
+    for sample in &mut samples {
+        *sample = (*sample * LOW_SIGNAL_GAIN).clamp(-1.0, 1.0);
+    }
+    samples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_asr_chunk;
+
+    #[test]
+    fn quiet_asr_chunks_are_boosted_without_clipping() {
+        let boosted = prepare_asr_chunk(vec![0.01, -0.02]);
+        assert_eq!(boosted, vec![0.08, -0.16]);
+    }
+
+    #[test]
+    fn normal_asr_chunks_are_unchanged() {
+        let samples = vec![0.05, -0.1];
+        assert_eq!(prepare_asr_chunk(samples.clone()), samples);
+    }
 }
