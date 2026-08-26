@@ -3,6 +3,7 @@ use std::{sync::mpsc, thread, time::Instant};
 use crate::messages::{HotkeyMessage, PasteResult};
 use amanuensis::asr::{Command, Event, Mode};
 use amanuensis::audio::{self, Sound};
+use amanuensis::esc_hook::EscHook;
 use amanuensis::log;
 use amanuensis::paste::{MIN_AUDIO_SECS, clean_transcript, paste_text};
 use amanuensis::pill_win32::{PillCommand, PillMode};
@@ -60,6 +61,7 @@ pub(crate) struct Dictation {
     pub(crate) commands: mpsc::Sender<Command>,
     results: mpsc::Sender<PasteResult>,
     pill_cmd: mpsc::Sender<PillCommand>,
+    esc: EscHook,
     pending_start: bool,
     transcribing_since: Option<Instant>,
     focus: Option<FocusTarget>,
@@ -73,6 +75,7 @@ impl Dictation {
         commands: mpsc::Sender<Command>,
         results: mpsc::Sender<PasteResult>,
         pill_cmd: mpsc::Sender<PillCommand>,
+        esc: EscHook,
         pending_start: bool,
     ) -> Self {
         Self {
@@ -85,6 +88,7 @@ impl Dictation {
             commands,
             results,
             pill_cmd,
+            esc,
             pending_start,
             transcribing_since: None,
             focus: None,
@@ -104,6 +108,9 @@ impl Dictation {
         self.transcribing_since = None;
         self.flash_since = None;
         self.recording_started = Some(Instant::now());
+        // Escape now cancels from anywhere; released on every exit path in
+        // stop_recording, the sole funnel out of Phase::Recording.
+        self.esc.set_active(true);
         audio::play(Sound::Start);
         let _ = self.commands.send(Command::Start);
         let _ = self.pill_cmd.send(PillCommand::Show(PillMode::Recording));
@@ -112,12 +119,14 @@ impl Dictation {
             .send(PillCommand::RecordingStarted(Instant::now()));
     }
 
-    fn stop_recording(&mut self, play_sound: bool) {
+    /// Sole exit path from Phase::Recording (F9 toggle, pill ✓ finish, and
+    /// discard all land here), so releasing the Escape hook here covers them
+    /// all. Stray discards after this point are no-ops: discard_clicked
+    /// early-returns outside Recording.
+    fn stop_recording(&mut self) {
+        self.esc.set_active(false);
         self.phase = Phase::Transcribing;
         self.transcribing_since = Some(Instant::now());
-        if play_sound {
-            audio::play(Sound::Stop);
-        }
         self.recording_started = None;
         let _ = self
             .pill_cmd
@@ -133,7 +142,7 @@ impl Dictation {
         match self.phase {
             Phase::Loading => self.pending_start = true,
             Phase::Idle => self.begin_recording(),
-            Phase::Recording => self.stop_recording(true),
+            Phase::Recording => self.stop_recording(),
             Phase::Transcribing => self.pending_start = true,
             Phase::Flash => {
                 log!("app", "F9 during done-flash: starting next recording");
@@ -150,7 +159,7 @@ impl Dictation {
         log!("app", "recording discarded by user");
         self.discard_requested = true;
         audio::play(Sound::Cancel);
-        self.stop_recording(false);
+        self.stop_recording();
         cx.notify();
     }
 
@@ -159,7 +168,7 @@ impl Dictation {
             return;
         }
         log!("app", "recording finished by user");
-        self.stop_recording(true);
+        self.stop_recording();
         cx.notify();
     }
 

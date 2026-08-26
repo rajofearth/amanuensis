@@ -179,7 +179,6 @@ mod tests {
 #[derive(Clone, Copy)]
 pub enum Sound {
     Start,
-    Stop,
     Cancel,
     Success,
     Failure,
@@ -188,8 +187,7 @@ pub enum Sound {
 pub fn play(sound: Sound) {
     thread::spawn(move || {
         let bytes = match sound {
-            Sound::Start => include_bytes!("../assets/audio/alert-01.mp3").as_slice(),
-            Sound::Stop => include_bytes!("../assets/audio/staplebops-01.mp3").as_slice(),
+            Sound::Start => include_bytes!("../assets/audio/yup-01.mp3").as_slice(),
             Sound::Cancel | Sound::Failure => {
                 include_bytes!("../assets/audio/nope-03.mp3").as_slice()
             }

@@ -1,6 +1,7 @@
 pub mod asr;
 pub mod audio;
 pub mod config;
+pub mod esc_hook;
 pub mod logging;
 pub mod paste;
 pub mod pill_win32;

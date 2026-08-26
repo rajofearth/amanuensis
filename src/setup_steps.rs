@@ -1,12 +1,17 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupStep {
     Welcome,
+    HowItWorks,
+    Shortcuts,
+    MicCheck,
     Downloading,
     Ready,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepEvent {
+    NavNext,
+    NavBack,
     StartDownload,
     DownloadFinished,
     DownloadCancelled,
@@ -15,10 +20,16 @@ pub enum StepEvent {
 
 pub fn next_step(step: SetupStep, event: StepEvent) -> Option<SetupStep> {
     match (step, event) {
-        (SetupStep::Welcome, StepEvent::StartDownload) => Some(SetupStep::Downloading),
+        (SetupStep::Welcome, StepEvent::NavNext) => Some(SetupStep::HowItWorks),
+        (SetupStep::HowItWorks, StepEvent::NavNext) => Some(SetupStep::Shortcuts),
+        (SetupStep::HowItWorks, StepEvent::NavBack) => Some(SetupStep::Welcome),
+        (SetupStep::Shortcuts, StepEvent::NavNext) => Some(SetupStep::MicCheck),
+        (SetupStep::Shortcuts, StepEvent::NavBack) => Some(SetupStep::HowItWorks),
+        (SetupStep::MicCheck, StepEvent::NavBack) => Some(SetupStep::Shortcuts),
+        (SetupStep::MicCheck, StepEvent::StartDownload) => Some(SetupStep::Downloading),
         (SetupStep::Downloading, StepEvent::DownloadFinished) => Some(SetupStep::Ready),
-        (SetupStep::Downloading, StepEvent::DownloadCancelled) => Some(SetupStep::Welcome),
-        (SetupStep::Downloading, StepEvent::DownloadFailed) => Some(SetupStep::Welcome),
+        (SetupStep::Downloading, StepEvent::DownloadCancelled) => Some(SetupStep::MicCheck),
+        (SetupStep::Downloading, StepEvent::DownloadFailed) => Some(SetupStep::MicCheck),
         _ => None,
     }
 }
@@ -28,9 +39,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn happy_path_walks_all_steps() {
+    fn tour_navigation_walks_forward_and_back() {
         assert_eq!(
-            next_step(SetupStep::Welcome, StepEvent::StartDownload),
+            next_step(SetupStep::Welcome, StepEvent::NavNext),
+            Some(SetupStep::HowItWorks)
+        );
+        assert_eq!(
+            next_step(SetupStep::HowItWorks, StepEvent::NavNext),
+            Some(SetupStep::Shortcuts)
+        );
+        assert_eq!(
+            next_step(SetupStep::Shortcuts, StepEvent::NavNext),
+            Some(SetupStep::MicCheck)
+        );
+        assert_eq!(
+            next_step(SetupStep::MicCheck, StepEvent::NavBack),
+            Some(SetupStep::Shortcuts)
+        );
+        assert_eq!(
+            next_step(SetupStep::Shortcuts, StepEvent::NavBack),
+            Some(SetupStep::HowItWorks)
+        );
+        assert_eq!(
+            next_step(SetupStep::HowItWorks, StepEvent::NavBack),
+            Some(SetupStep::Welcome)
+        );
+    }
+
+    #[test]
+    fn mic_check_start_walks_download_to_ready() {
+        assert_eq!(
+            next_step(SetupStep::MicCheck, StepEvent::StartDownload),
             Some(SetupStep::Downloading)
         );
         assert_eq!(
@@ -40,14 +79,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_failure_return_to_welcome() {
+    fn cancel_and_failure_return_to_mic_check() {
         assert_eq!(
             next_step(SetupStep::Downloading, StepEvent::DownloadCancelled),
-            Some(SetupStep::Welcome)
+            Some(SetupStep::MicCheck)
         );
         assert_eq!(
             next_step(SetupStep::Downloading, StepEvent::DownloadFailed),
-            Some(SetupStep::Welcome)
+            Some(SetupStep::MicCheck)
         );
     }
 
@@ -57,9 +96,15 @@ mod tests {
             next_step(SetupStep::Welcome, StepEvent::DownloadFinished),
             None
         );
+        assert_eq!(next_step(SetupStep::Welcome, StepEvent::StartDownload), None);
+        assert_eq!(next_step(SetupStep::MicCheck, StepEvent::NavNext), None);
         assert_eq!(next_step(SetupStep::Ready, StepEvent::StartDownload), None);
         assert_eq!(
             next_step(SetupStep::Ready, StepEvent::DownloadCancelled),
+            None
+        );
+        assert_eq!(
+            next_step(SetupStep::Downloading, StepEvent::NavBack),
             None
         );
     }

@@ -47,4 +47,5 @@ pub(crate) enum UiMessage {
     DeleteFinished(Result<(), String>),
     PillDiscard,
     PillFinish,
+    QueueDictationStart,
 }

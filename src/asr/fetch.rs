@@ -22,11 +22,60 @@ pub struct DownloadProgress {
     pub file: String,
     pub done: u64,
     pub total: u64,
+    pub bytes_per_sec: Option<f64>,
+}
+
+const SPEED_EMA_ALPHA: f64 = 0.25;
+
+#[derive(Clone, Copy)]
+struct SpeedSample {
+    at: Instant,
+    done: u64,
+}
+
+pub struct SpeedTracker {
+    last: Option<SpeedSample>,
+    ema_rate: Option<f64>,
+    min_interval: std::time::Duration,
+}
+
+impl Default for SpeedTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpeedTracker {
+    pub fn new() -> Self {
+        Self {
+            last: None,
+            ema_rate: None,
+            min_interval: std::time::Duration::from_millis(100),
+        }
+    }
+
+    pub fn push(&mut self, done: u64, at: Instant) -> Option<f64> {
+        let Some(sample) = self.last else {
+            self.last = Some(SpeedSample { at, done });
+            return self.ema_rate;
+        };
+        let elapsed = at.duration_since(sample.at);
+        if elapsed >= self.min_interval {
+            let rate = done.saturating_sub(sample.done) as f64 / elapsed.as_secs_f64();
+            self.ema_rate = Some(match self.ema_rate {
+                Some(previous) => previous + SPEED_EMA_ALPHA * (rate - previous),
+                None => rate,
+            });
+            self.last = Some(SpeedSample { at, done });
+        }
+        self.ema_rate
+    }
 }
 
 struct Aggregate {
     total: u64,
     completed: u64,
+    speed: SpeedTracker,
 }
 
 impl Aggregate {
@@ -34,6 +83,7 @@ impl Aggregate {
         Self {
             total,
             completed: 0,
+            speed: SpeedTracker::new(),
         }
     }
 
@@ -41,11 +91,14 @@ impl Aggregate {
         self.completed += bytes;
     }
 
-    fn current(&self, file: &str, streamed: u64) -> DownloadProgress {
+    fn current(&mut self, file: &str, streamed: u64) -> DownloadProgress {
+        let done = self.completed + streamed;
+        let bytes_per_sec = self.speed.push(done, Instant::now());
         DownloadProgress {
             file: file.to_owned(),
-            done: self.completed + streamed,
+            done,
             total: self.total,
+            bytes_per_sec,
         }
     }
 }
@@ -117,6 +170,15 @@ pub(crate) fn mb_summary(done: u64, total: u64) -> String {
     )
 }
 
+pub fn speed_summary(bytes_per_sec: f64) -> String {
+    let kb = (bytes_per_sec / 1e3).round();
+    if kb < 1000.0 {
+        format!("{} KB/s", kb as u64)
+    } else {
+        format!("{:.1} MB/s", bytes_per_sec / 1e6)
+    }
+}
+
 pub fn progress_text(display_name: &str, progress: &DownloadProgress) -> String {
     format!(
         "Downloading {} — {} ({})",
@@ -131,19 +193,23 @@ pub fn progress_status(
     progress: &DownloadProgress,
     eta: Option<&str>,
 ) -> String {
+    let speed_part = progress
+        .bytes_per_sec
+        .map(|bytes_per_sec| format!(" · {}", speed_summary(bytes_per_sec)))
+        .unwrap_or_default();
     let eta_part = eta.map(|eta| format!(" · {eta}")).unwrap_or_default();
     format!(
-        "Downloading {} — {}{} ({})",
+        "Downloading {} — {}{speed_part}{eta_part} ({})",
         display_name,
         mb_summary(progress.done, progress.total),
-        eta_part,
         progress.file
     )
 }
 
-pub fn progress_summary(done: u64, total: u64, eta: Option<&str>) -> String {
+pub fn progress_summary(done: u64, total: u64, speed: Option<&str>, eta: Option<&str>) -> String {
+    let speed_part = speed.map(|speed| format!(" · {speed}")).unwrap_or_default();
     let eta_part = eta.map(|eta| format!(" · {eta}")).unwrap_or_default();
-    format!("{}{}", mb_summary(done, total), eta_part)
+    format!("{}{}{}", mb_summary(done, total), speed_part, eta_part)
 }
 
 pub fn path_is_dir(path: &Path) -> bool {
@@ -430,6 +496,52 @@ mod tests {
         assert_eq!(mb_summary(238_000_000, 700_000_000), "34% · 238/700 MB");
         assert_eq!(mb_summary(700_500_000, 700_000_000), "100% · 701/700 MB");
         assert_eq!(mb_summary(0, 700_000_000), "0% · 0/700 MB");
+    }
+
+    #[test]
+    fn speed_summary_formats_kb_below_one_mb_and_mb_above() {
+        assert_eq!(speed_summary(0.0), "0 KB/s");
+        assert_eq!(speed_summary(512_000.0), "512 KB/s");
+        assert_eq!(speed_summary(999_400.0), "999 KB/s");
+        assert_eq!(speed_summary(999_500.0), "1.0 MB/s");
+        assert_eq!(speed_summary(2_400_000.0), "2.4 MB/s");
+        assert_eq!(speed_summary(26_500_000.0), "26.5 MB/s");
+    }
+
+    #[test]
+    fn speed_tracker_emas_rate_clamps_rapid_samples_and_hides_first() {
+        let t0 = Instant::now();
+        let mut tracker = SpeedTracker::new();
+        assert_eq!(tracker.push(0, t0), None);
+        assert_eq!(
+            tracker.push(50_000_000, t0 + std::time::Duration::from_millis(20)),
+            None
+        );
+        let first = tracker.push(1_000_000, t0 + std::time::Duration::from_secs(1));
+        assert_eq!(first, Some(1_000_000.0));
+        assert_eq!(
+            tracker.push(1_400_000, t0 + std::time::Duration::from_millis(1_050)),
+            Some(1_000_000.0)
+        );
+        let second = tracker.push(3_000_000, t0 + std::time::Duration::from_secs(2));
+        assert_eq!(second, Some(1_250_000.0));
+    }
+
+    #[test]
+    fn aggregate_payload_starts_with_unknown_speed() {
+        let mut aggregate = Aggregate::new(700_000_000);
+        assert_eq!(
+            aggregate
+                .current("encoder.int8.onnx", 10_000)
+                .bytes_per_sec,
+            None
+        );
+        assert_eq!(
+            aggregate
+                .current("encoder.int8.onnx", 20_000)
+                .bytes_per_sec,
+            None
+        );
     }
 
     #[test]

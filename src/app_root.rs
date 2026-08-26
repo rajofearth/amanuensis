@@ -7,6 +7,7 @@ use amanuensis::asr::{
     Command, Event, ModelKind, ModelSelection, kind_by_id, repo_cache_dir_for, spec_by_id,
 };
 use amanuensis::config::{self, AppConfig};
+use amanuensis::esc_hook::EscHook;
 use amanuensis::log;
 use amanuensis::pill_win32::PillCommand;
 use amanuensis::pill_window as pw;
@@ -41,6 +42,7 @@ pub(crate) struct AppRoot {
     pub(crate) ui: mpsc::Sender<UiMessage>,
     pub(crate) pill_cmd: mpsc::Sender<PillCommand>,
     pub(crate) tray_commands: mpsc::Sender<TrayCommand>,
+    pub(crate) esc: EscHook,
     pub(crate) pending_start: bool,
     pub(crate) download_generation: u64,
     pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
@@ -73,6 +75,7 @@ impl AppRoot {
         let Some(hwnd) = self.hwnd_resolved() else {
             return;
         };
+        pw::remove_panel_wndproc(hwnd);
         let (style, ex) = pw::styles(hwnd);
         let style = pw::pill_style(style);
         let ex = (ex & !pw::EX_CLEAR_MASK) | pw::EX_PILL;
@@ -90,6 +93,7 @@ impl AppRoot {
         let Some(hwnd) = self.hwnd_resolved() else {
             return;
         };
+        pw::install_panel_wndproc(hwnd);
         let (style, ex) = pw::styles(hwnd);
         let style = pw::panel_style(style);
         let ex = (ex & !pw::EX_CLEAR_MASK)
@@ -97,8 +101,13 @@ impl AppRoot {
         pw::set_styles(hwnd, style, ex);
         pw::demote_from_topmost(hwnd);
         pw::set_text(hwnd, &panel_title_utf16());
-        let (frame_w, frame_h) =
-            pw::frame_size_for_client(pw::PANEL_WIDTH, pw::PANEL_HEIGHT, style, ex);
+        let (frame_w, frame_h) = pw::panel_frame_size_for_client(
+            pw::PANEL_WIDTH,
+            pw::PANEL_HEIGHT,
+            style,
+            ex,
+            pw::dpi(hwnd),
+        );
         let (ax, ay, aw, ah) = pw::primary_work_area();
         let x = ax + (aw - frame_w) / 2;
         let y = ay + (ah - frame_h) / 2;
@@ -129,6 +138,7 @@ impl AppRoot {
 
     pub(crate) fn hide_pill_window(&mut self) {
         if let Some(hwnd) = self.hwnd_resolved() {
+            pw::remove_panel_wndproc(hwnd);
             pw::set_click_through(hwnd, true);
             log!("app", "pill idle: click-through");
         }
@@ -221,24 +231,37 @@ impl AppRoot {
         chunks: &mut Vec<Vec<f32>>,
         cx: &mut Context<Self>,
     ) {
-        if let (Screen::Dictation, Some(dictation)) = (self.screen.clone(), self.dictation.clone())
-        {
-            let drained_levels = std::mem::take(levels);
-            let drained_chunks = std::mem::take(chunks);
-            dictation.update(cx, |dictation, cx| {
-                if dictation.phase == Phase::Recording {
-                    dictation.push_levels(drained_levels);
-                    for chunk in drained_chunks {
-                        let _ = dictation
-                            .commands
-                            .send(Command::Chunk(prepare_asr_chunk(chunk)));
-                    }
+        match self.screen.clone() {
+            Screen::Dictation => {
+                if let Some(dictation) = self.dictation.clone() {
+                    let drained_levels = std::mem::take(levels);
+                    let drained_chunks = std::mem::take(chunks);
+                    dictation.update(cx, |dictation, cx| {
+                        if dictation.phase == Phase::Recording {
+                            dictation.push_levels(drained_levels);
+                            for chunk in drained_chunks {
+                                let _ = dictation
+                                    .commands
+                                    .send(Command::Chunk(prepare_asr_chunk(chunk)));
+                            }
+                        }
+                        cx.notify();
+                    });
+                } else {
+                    levels.clear();
+                    chunks.clear();
                 }
-                cx.notify();
-            });
-        } else {
-            levels.clear();
-            chunks.clear();
+            }
+            Screen::Onboarding { view, .. } => {
+                let mic_check_active = view.read(cx).mic_check_active();
+                if mic_check_active && !levels.is_empty() {
+                    let drained_levels = std::mem::take(levels);
+                    view.update(cx, |onboarding, cx| {
+                        onboarding.push_mic_levels(&drained_levels, cx)
+                    });
+                }
+                chunks.clear();
+            }
         }
     }
 
@@ -422,6 +445,25 @@ impl AppRoot {
                     dictation.update(cx, |dictation, cx| dictation.done_clicked(cx));
                 }
             }
+            UiMessage::QueueDictationStart => {
+                let Screen::Onboarding { view, origin } = self.screen.clone() else {
+                    return;
+                };
+                if !matches!(origin, SetupOrigin::FirstRun | SetupOrigin::Recovery) {
+                    return;
+                }
+                if view.read(cx).model_ready() || self.worker_live {
+                    self.pending_start = true;
+                    log!("app", "try-it clicked during setup: queued start after models load");
+                    view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
+                } else {
+                    log!(
+                        "app",
+                        "try-it blocked: model not fully cached and no worker loaded"
+                    );
+                    view.update(cx, |onboarding, cx| onboarding.set_blocked_notice(cx));
+                }
+            }
         }
     }
 
@@ -517,6 +559,7 @@ impl AppRoot {
                 commands.clone(),
                 self.results.clone(),
                 self.pill_cmd.clone(),
+                self.esc.clone(),
                 pending_start,
             )
         });

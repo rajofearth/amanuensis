@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app_root;
 mod dictation_view;
 mod download_runner;
@@ -10,6 +12,7 @@ use std::{sync::mpsc, thread, time::Duration};
 use amanuensis::asr::{self, Event, is_model_cached};
 use amanuensis::audio;
 use amanuensis::config;
+use amanuensis::esc_hook;
 use amanuensis::log;
 use amanuensis::logging;
 use amanuensis::pill_win32::PillButton;
@@ -99,6 +102,7 @@ fn main() {
                 let (download_sender, download_receiver) = mpsc::channel::<DownloadMessage>();
                 let (ui_sender, ui_receiver) = mpsc::channel::<UiMessage>();
                 let pill = PillOverlay::spawn();
+                let (esc, esc_events) = esc_hook::spawn();
                 let loop_ui = ui_sender.clone();
 
                 let loaded_config = config::load();
@@ -120,6 +124,7 @@ fn main() {
                                     commands.clone(),
                                     paste_sender.clone(),
                                     pill.command_tx(),
+                                    esc.clone(),
                                     false,
                                 )
                             });
@@ -186,6 +191,7 @@ fn main() {
                     ui: ui_sender,
                     pill_cmd: pill.command_tx(),
                     tray_commands: tray.sender(),
+                    esc: esc.clone(),
                     pending_start: false,
                     download_generation: 0,
                     cancel_flag: None,
@@ -246,6 +252,11 @@ fn main() {
                                         PillButton::OpenSettings => UiMessage::OpenSettings,
                                     };
                                     let _ = loop_ui.send(message);
+                                }
+                                // Escape pressed anywhere while recording:
+                                // reuse the exact pill ✕ discard path.
+                                while esc_events.try_recv_escape() {
+                                    let _ = loop_ui.send(UiMessage::PillDiscard);
                                 }
                                 cx.update(|_, cx| {
                                     app.update(cx, |app, cx| {

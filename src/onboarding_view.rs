@@ -1,7 +1,9 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
-use amanuensis::asr::fetch::{EtaTracker, path_is_dir, progress_status, progress_summary};
+use amanuensis::asr::fetch::{
+    EtaTracker, path_is_dir, progress_status, progress_summary, speed_summary,
+};
 use amanuensis::asr::{
     DownloadProgress, ModelSpec, cache_dir_for, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
@@ -40,6 +42,8 @@ pub(crate) struct OnboardingView {
     step: Option<SetupStep>,
     start_queued: bool,
     tray_enabled: bool,
+    mic_level: f32,
+    mic_peak: f32,
     ui: mpsc::Sender<UiMessage>,
 }
 
@@ -67,6 +71,8 @@ impl OnboardingView {
             step: (origin == SetupOrigin::FirstRun).then_some(SetupStep::Welcome),
             start_queued: false,
             tray_enabled,
+            mic_level: 0.0,
+            mic_peak: 0.0,
             ui,
         }
     }
@@ -100,6 +106,34 @@ impl OnboardingView {
 
     pub(crate) fn queue_start(&mut self, cx: &mut Context<Self>) {
         self.start_queued = true;
+        cx.notify();
+    }
+
+    fn nav(&mut self, event: StepEvent, cx: &mut Context<Self>) {
+        if let Some(step) = self.step {
+            self.step = next_step(step, event);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn mic_check_active(&self) -> bool {
+        self.step == Some(SetupStep::MicCheck)
+    }
+
+    pub(crate) fn push_mic_levels(&mut self, levels: &[f32], cx: &mut Context<Self>) {
+        let instant = levels.iter().copied().fold(0.0_f32, f32::max);
+        if self.mic_peak > f32::EPSILON {
+            self.mic_peak *= 0.995;
+        }
+        if instant > self.mic_peak {
+            self.mic_peak = instant;
+        }
+        let target = if self.mic_peak > f32::EPSILON {
+            (instant / self.mic_peak).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.mic_level = self.mic_level * 0.7 + target * 0.3;
         cx.notify();
     }
 
@@ -317,16 +351,13 @@ impl OnboardingView {
         };
         match step {
             SetupStep::Welcome => base()
-                .child(div().text_size(px(26.)).child("Amanuensis"))
+                .child(div().text_size(px(26.)).child("Welcome to Amanuensis"))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
                         .text_size(px(14.))
-                        .child("Hold")
-                        .child(keycap("F9"))
-                        .child(", speak, and your words appear in any app."),
+                        .child(
+                            "Press F9 anywhere, speak, and your words become text in whatever app you're using.",
+                        ),
                 )
                 .child(
                     div()
@@ -349,20 +380,128 @@ impl OnboardingView {
                         .text_color(rgb(0xcc3333))
                         .child(format!("Something went wrong: {error}"))
                 }))
-                .child(primary_button(
-                    "get-started",
-                    if self.error.is_some() {
-                        "Try again"
-                    } else {
-                        "Get started"
-                    },
-                    cx.listener(|this, _, _, cx| this.start_clicked(cx)),
+                .child(tour_footer(
+                    None,
+                    primary_button(
+                        "tour-welcome-next",
+                        "Next",
+                        cx.listener(|this, _, _, cx| this.nav(StepEvent::NavNext, cx)),
+                    ),
                 )),
+            SetupStep::HowItWorks => base()
+                .child(div().text_size(px(26.)).child("How it works"))
+                .child(numbered_row(1, "F9 starts your microphone"))
+                .child(numbered_row(
+                    2,
+                    "A voice model running on your PC transcribes as you speak — audio never leaves your machine",
+                ))
+                .child(numbered_row(
+                    3,
+                    "Filler words are cleaned up, then the text is pasted wherever your cursor is",
+                ))
+                .child(tour_footer(
+                    Some(action_button("tour-how-back", "Back", true).on_click(cx.listener(
+                        |this, _, _, cx| this.nav(StepEvent::NavBack, cx),
+                    ))),
+                    primary_button(
+                        "tour-how-next",
+                        "Next",
+                        cx.listener(|this, _, _, cx| this.nav(StepEvent::NavNext, cx)),
+                    ),
+                )),
+            SetupStep::Shortcuts => base()
+                .child(div().text_size(px(26.)).child("Your shortcuts"))
+                .child(shortcut_key_row("F9", "Start / stop dictation"))
+                .child(shortcut_key_row("Esc", "Discard an active recording"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(0x909090))
+                                .child("Pill hover"),
+                        )
+                        .child(div().text_size(px(14.)).child("✕ discard · ✓ finish")),
+                )
+                .child(div().text_size(px(13.)).child("Right-click the pill — open settings"))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .child("Tray icon — left-click opens settings"),
+                )
+                .child(tour_footer(
+                    Some(action_button("tour-shortcuts-back", "Back", true).on_click(
+                        cx.listener(|this, _, _, cx| this.nav(StepEvent::NavBack, cx)),
+                    )),
+                    primary_button(
+                        "tour-shortcuts-mic",
+                        "Test my microphone",
+                        cx.listener(|this, _, _, cx| this.nav(StepEvent::NavNext, cx)),
+                    ),
+                )),
+            SetupStep::MicCheck => {
+                let fraction = self.mic_level.clamp(0.0, 1.0);
+                base()
+                    .child(div().text_size(px(26.)).child("Mic check"))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .child("Say something — the bar should move."),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(12.))
+                            .bg(rgb(0x17191d))
+                            .child(
+                                div()
+                                    .h(px(12.))
+                                    .bg(rgb(0xd8d8d8))
+                                    .w(relative(fraction)),
+                            ),
+                    )
+                    .children(self.status.clone().map(|status| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xd8d8d8))
+                            .child(status)
+                    }))
+                    .children(self.error.clone().map(|error| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0xcc3333))
+                            .child(format!("Something went wrong: {error}"))
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(text_button(
+                                "tour-mic-skip",
+                                "Skip",
+                                cx.listener(|this, _, _, cx| this.start_clicked(cx)),
+                            ))
+                            .child(primary_button(
+                                "tour-mic-continue",
+                                "Looks good — continue",
+                                cx.listener(|this, _, _, cx| this.start_clicked(cx)),
+                            )),
+                    )
+            }
             SetupStep::Downloading => {
                 let eta = self
                     .progress
                     .as_ref()
                     .and_then(|progress| self.eta.estimate(progress.done, progress.total));
+                let speed = self
+                    .progress
+                    .as_ref()
+                    .and_then(|progress| progress.bytes_per_sec)
+                    .map(speed_summary);
                 base()
                     .child(div().text_size(px(20.)).child("Setting up your voice model…"))
                     .children(self.progress.as_ref().map(progress_bar))
@@ -373,6 +512,7 @@ impl OnboardingView {
                             .child(progress_summary(
                                 progress.done,
                                 progress.total,
+                                speed.as_deref(),
                                 eta.as_deref(),
                             ))
                     }))
@@ -403,32 +543,44 @@ impl OnboardingView {
                     )
             }
             SetupStep::Ready => base()
-                .child(div().text_size(px(24.)).child("You're all set."))
+                .child(div().text_size(px(26.)).child("You're all set — try it."))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .child("Hold F9 and speak — your words will land in the last app you used."),
+                )
+                .children(self.notice.clone().map(|notice| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xcc9933))
+                        .child(notice)
+                }))
+                .children(self.start_queued.then(|| {
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xcc9933))
+                        .child("F9 pressed — recording will begin once models load")
+                }))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .text_size(px(14.))
-                        .child("Hold")
-                        .child(keycap("F9"))
-                        .child("and speak — text appears wherever your cursor is."),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(0x909090))
-                        .child("Fine-tune anything later in settings."),
-                )
-                .child(primary_button(
-                    "begin",
-                    "Start dictating",
-                    cx.listener(|this, _, _, _| {
-                        let _ = this.ui.send(UiMessage::FinishOnboarding {
-                            captured_model: this.model_id,
-                        });
-                    }),
-                )),
+                        .child(primary_button(
+                            "begin",
+                            "Start using Amanuensis",
+                            cx.listener(|this, _, _, _| {
+                                let _ = this.ui.send(UiMessage::FinishOnboarding {
+                                    captured_model: this.model_id,
+                                });
+                            }),
+                        ))
+                        .child(action_button("try-now", "Try it now (F9)", true).on_click(
+                            cx.listener(|this, _, _, _| {
+                                let _ = this.ui.send(UiMessage::QueueDictationStart);
+                            }),
+                        )),
+                ),
         }
     }
 }
@@ -679,6 +831,49 @@ impl Render for OnboardingView {
                     }))
             }))
     }
+}
+
+fn tour_footer(back: Option<Stateful<Div>>, primary: Stateful<Div>) -> Div {
+    div().flex().items_center().gap(px(8.)).children(back).child(primary)
+}
+
+fn numbered_row(index: usize, text: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(0x909090))
+                .child(format!("{index}.")),
+        )
+        .child(div().flex_1().text_size(px(14.)).child(text))
+}
+
+fn shortcut_key_row(key: &'static str, description: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .child(keycap(key))
+        .child(div().text_size(px(14.)).child(description))
+}
+
+fn text_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(4.))
+        .py(px(8.))
+        .text_size(px(13.))
+        .text_color(rgb(0x909090))
+        .child(label)
+        .on_click(move |event, window, app| on_click(event, window, app))
 }
 
 pub(crate) fn keycap(label: &'static str) -> Div {
