@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: draft-release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -30,12 +34,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install Rust target
         shell: pwsh
         run: rustup target add ${{ matrix.target }}
 
       # sherpa-onnx-sys auto-downloads static libs for win-x64, but has no
       # windows/aarch64 entry, so ARM64 libs must be provisioned explicitly.
+      - name: Cache sherpa-onnx native libs
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\sherpa-onnx-arm64
+          key: sherpa-onnx-1.13.5-win-arm64-static
+
       - name: Fetch sherpa-onnx native libs
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
@@ -44,10 +60,12 @@ jobs:
           $asset = "sherpa-onnx-v$($version)-win-arm64-static-MT-Release-lib.tar.bz2"
           $root = "$env:RUNNER_TEMP\sherpa-onnx-arm64"
           New-Item -ItemType Directory -Path $root -Force | Out-Null
-          Invoke-WebRequest `
-            -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$($version)/$asset" `
-            -OutFile "$root\$asset"
-          tar -xjf "$root\$asset" -C "$root"
+          if (-not (Test-Path "$root\$asset")) {
+            Invoke-WebRequest `
+              -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$($version)/$asset" `
+              -OutFile "$root\$asset"
+            tar -xjf "$root\$asset" -C "$root"
+          }
           $libDir = (Get-ChildItem -Path $root -Recurse -Filter sherpa-onnx-c-api.lib |
             Select-Object -First 1).DirectoryName
           if (-not $libDir) { throw "sherpa-onnx-c-api.lib not found after extracting $asset" }
