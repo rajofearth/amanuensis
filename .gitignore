@@ -1,5 +1,6 @@
 /target
 /.native-libs
+/.cargo/config.toml
 
 *.log
 amanuensis.log

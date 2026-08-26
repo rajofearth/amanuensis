@@ -1,0 +1,13 @@
+# Machine-local cargo configuration. Copy to .cargo/config.toml and adjust
+# paths for your machine; .cargo/config.toml is gitignored because it contains
+# absolute local paths. CI (draft-release.yml) provisions its own native libs.
+[build]
+target = "aarch64-pc-windows-msvc"
+
+[env]
+# sherpa-onnx-sys has no auto-download entry for windows/aarch64, so ARM64
+# static libs must be vendored manually (see docs/PLAN.md phase 10).
+SHERPA_ONNX_LIB_DIR = "C:\\path\\to\\.native-libs\\aarch64-windows\\lib"
+AWS_LC_SYS_PREBUILT_NASM = "1"
+CC_aarch64_pc_windows_msvc = "C:\\Program Files\\LLVM\\bin\\clang-cl.exe"
+CXX_aarch64_pc_windows_msvc = "C:\\Program Files\\LLVM\\bin\\clang-cl.exe"
