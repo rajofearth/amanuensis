@@ -10,11 +10,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, IDI_APPLICATION, KillTimer,
-    LoadIconW, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, IMAGE_ICON, KillTimer,
+    LoadImageW, LR_DEFAULTSIZE, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
+    WM_NCCREATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::messages::UiMessage;
@@ -138,7 +138,14 @@ unsafe fn make_icon(hwnd: HWND) -> NOTIFYICONDATAW {
     icon.uID = TRAY_ID;
     icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     icon.uCallbackMessage = TRAY_CALLBACK;
-    icon.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+    icon.hIcon = LoadImageW(
+        GetModuleHandleW(std::ptr::null()),
+        1 as *const u16,
+        IMAGE_ICON,
+        16,
+        16,
+        LR_DEFAULTSIZE,
+    ) as _;
     let tip = wide("Amanuensis");
     let tip_len = tip.len().min(icon.szTip.len());
     icon.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);

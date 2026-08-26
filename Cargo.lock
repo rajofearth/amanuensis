@@ -186,10 +186,11 @@ dependencies = [
 
 [[package]]
 name = "amanuensis"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "arboard",
  "cpal 0.15.3",
+ "embed-resource",
  "enigo",
  "global-hotkey",
  "gpui",

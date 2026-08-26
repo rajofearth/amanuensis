@@ -1,7 +1,8 @@
 [package]
 name = "amanuensis"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
+build = "build.rs"
 default-run = "amanuensis"
 
 [dependencies]
@@ -34,3 +35,6 @@ windows-sys = { version = "0.60", features = [
 ] }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "424a68244aa9b8ac9d4766e51b0824d2b2174bd7", features = ["font-kit"] }
+
+[build-dependencies]
+embed-resource = "3.0.11"

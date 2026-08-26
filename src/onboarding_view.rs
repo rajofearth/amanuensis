@@ -15,6 +15,7 @@ use gpui::{
     App, Context, Div, IntoElement, Render, Stateful, Window, div, prelude::*, px, relative, rgb,
 };
 
+use crate::brand_assets;
 use crate::messages::UiMessage;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum SetupOrigin {
@@ -364,6 +365,7 @@ impl OnboardingView {
         };
         match step {
             SetupStep::Welcome => base()
+                .child(brand_assets::horizontal(190.))
                 .child(div().text_size(px(26.)).child("Welcome to Amanuensis"))
                 .child(
                     div()

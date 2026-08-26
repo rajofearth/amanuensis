@@ -21,6 +21,7 @@ use amanuensis::installer::{
 };
 use amanuensis::log;
 use amanuensis::pill_window as pw;
+use crate::brand_assets;
 use gpui::{
     App, Bounds, Context, Div, Entity, IntoElement, Render, Stateful, TitlebarOptions, Window,
     WindowBounds, WindowKind, WindowOptions, div, prelude::*, px, relative, rgb, size,
@@ -369,6 +370,7 @@ impl InstallerApp {
             .bg(rgb(0x0d0e10))
             .text_color(rgb(0xe5e7eb))
             .size_full()
+            .child(brand_assets::horizontal(190.))
             .child(div().text_size(px(26.)).child("Amanuensis"))
             .child(div().text_size(px(14.)).child(TAGLINE))
             .children(updating.then(|| {

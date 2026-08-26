@@ -1,5 +1,7 @@
 # Amanuensis
 
+![Amanuensis logo](assets/logos/logo-workmark-horizontal.png)
+
 A small Windows desktop dictation app. Press `F9` to start and stop recording; Amanuensis transcribes locally and pastes the result into the active application.
 
 ## Features
