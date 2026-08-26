@@ -8,6 +8,7 @@ use amanuensis::asr::{
     DownloadProgress, ModelSpec, cache_dir_for, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
 };
+use amanuensis::config::{self, AppConfig};
 use amanuensis::log;
 use amanuensis::setup_steps::{SetupStep, StepEvent, next_step};
 use gpui::{
@@ -178,6 +179,15 @@ impl OnboardingView {
 
     pub(crate) fn download_finished_step(&mut self, cx: &mut Context<Self>) {
         log!("app", "setup download finished");
+        let config = AppConfig {
+            model: self.model_id.to_owned(),
+            tray_enabled: config::load().map_or(true, |existing| existing.tray_enabled),
+        };
+        if let Err(error) = config::save(&config) {
+            log!("app", "config save after model download FAILED: {error}");
+        } else {
+            log!("app", "config saved after model download: model={}", config.model);
+        }
         self.busy = false;
         self.downloading = false;
         self.cancel_requested = false;
@@ -225,7 +235,10 @@ impl OnboardingView {
         self.notice = None;
         self.progress = None;
         self.eta.clear();
-        self.status = Some(format!("checking {} …", spec.display_name));
+        self.status = Some(format!(
+            "Checking {} and preparing the download...",
+            spec.display_name
+        ));
         log!("app", "download requested: {}", spec.id);
         if let Some(step) = self.step {
             self.step = next_step(step, StepEvent::StartDownload);
@@ -504,6 +517,16 @@ impl OnboardingView {
                     .map(speed_summary);
                 base()
                     .child(div().text_size(px(20.)).child("Setting up your voice model…"))
+                    .children((self.progress.is_none()).then(|| {
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(0xd8d8d8))
+                            .child(
+                                self.status
+                                    .clone()
+                                    .unwrap_or_else(|| "Preparing the download...".to_owned()),
+                            )
+                    }))
                     .children(self.progress.as_ref().map(progress_bar))
                     .children(self.progress.as_ref().map(|progress| {
                         div()

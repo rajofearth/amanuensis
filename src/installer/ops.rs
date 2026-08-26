@@ -7,29 +7,28 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE, HWND, LPARAM,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
     REG_VALUE_TYPE,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+    TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenMutexW, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    CREATE_NO_WINDOW, MUTEX_MODIFY_STATE, PROCESS_NAME_WIN32,
+    WaitForSingleObject, CREATE_NO_WINDOW, MUTEX_MODIFY_STATE, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-};
-
 use super::{
-    log, marker_path, write_marker, APP_WINDOW_TITLE, EXE_NAME, RUN_SUBKEY, RUN_VALUE_NAME,
-    SHORTCUT_FILE_NAME, SINGLE_INSTANCE_MUTEX_NAME, UNINSTALL_SUBKEY,
+    log, marker_path, write_marker, EXE_NAME, RUN_SUBKEY, RUN_VALUE_NAME, SHORTCUT_FILE_NAME,
+    SINGLE_INSTANCE_MUTEX_NAME, UNINSTALL_SUBKEY,
 };
 
 const TAG: &str = "installer";
@@ -39,7 +38,8 @@ const COPY_RETRIES: u32 = 8;
 const COPY_BACKOFF: Duration = Duration::from_millis(250);
 /// How long to wait for the app mutex to disappear after terminating.
 const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
+const WAIT_OBJECT_0_RESULT: u32 = 0;
 
 /// Spawned helpers must never flash a console window.
 /// CREATE_NO_WINDOW alone: DETACHED_PROCESS cannot be combined with it
@@ -394,21 +394,49 @@ fn wide(value: &str) -> Vec<u16> {
 
 // ---- Close running instance ----
 
-/// Terminate any running Amanuensis app instance so its exe can be replaced.
-/// Detects it via the single-instance mutex (name pinned in main.rs), finds
-/// its window by title, verifies the owning process is NOT this installer,
-/// then terminates. No mutex → no-op.
-fn close_running_instance() {
+/// Terminate any running Amanuensis app instance and wait for its process to
+/// finish before replacing the executable. The mutex is only a presence check:
+/// it is not proof that Windows has released the process image file.
+fn close_running_instance(expected_exe: &Path) -> Result<(), String> {
     if !mutex_is_held() {
         log!(TAG, "no running instance (mutex free)");
-        return;
+        return Ok(());
     }
     log!(TAG, "single-instance mutex held; closing running Amanuensis");
-    for hwnd in find_app_windows() {
-        terminate_window_process(hwnd);
+    let mut processes = Vec::new();
+    for pid in find_app_process_ids()? {
+        if let Some(process) = open_app_process(pid, expected_exe) {
+            processes.push((pid, process));
+        }
     }
-    wait_for_mutex_release();
+    if processes.is_empty() {
+        return Err("Amanuensis is running, but its process could not be found".to_owned());
+    }
+    for (pid, process) in &processes {
+        unsafe {
+            if TerminateProcess(*process, 0) == 0 {
+                log!(TAG, "terminate pid {pid} failed");
+            } else {
+                log!(TAG, "terminate pid {pid} requested");
+            }
+        }
+    }
+    let mut timed_out = false;
+    for (pid, process) in processes {
+        let result = unsafe { WaitForSingleObject(process, CLOSE_WAIT_TIMEOUT.as_millis() as u32) };
+        unsafe { CloseHandle(process) };
+        if result != WAIT_OBJECT_0_RESULT {
+            log!(TAG, "pid {pid} did not finish before update timeout");
+            timed_out = true;
+        }
+    }
+    if timed_out || mutex_is_held() {
+        return Err(
+            "Amanuensis did not finish closing. Close it and try the update again.".to_owned(),
+        );
+    }
     log!(TAG, "close-running-instance done");
+    Ok(())
 }
 
 fn mutex_is_held() -> bool {
@@ -424,75 +452,76 @@ fn mutex_is_held() -> bool {
     }
 }
 
-fn wait_for_mutex_release() {
-    let deadline = Instant::now() + CLOSE_WAIT_TIMEOUT;
-    while Instant::now() < deadline && mutex_is_held() {
-        thread::sleep(CLOSE_POLL_INTERVAL);
+fn find_app_process_ids() -> Result<Vec<u32>, String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err("could not enumerate running processes".to_owned());
     }
-}
-
-fn find_app_windows() -> Vec<HWND> {
-    struct EnumCtx {
-        title: Vec<u16>,
-        found: *mut Vec<HWND>,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        unsafe {
-            let ctx = &mut *(lparam as *mut EnumCtx);
-            let length = GetWindowTextLengthW(hwnd);
-            if length <= 0 {
-                return 1;
-            }
-            let mut buffer = vec![0_u16; (length + 1) as usize];
-            GetWindowTextW(hwnd, buffer.as_mut_ptr(), length + 1);
-            while buffer.last() == Some(&0) {
-                buffer.pop();
-            }
-            if buffer != ctx.title {
-                return 1;
-            }
-            (*ctx.found).push(hwnd);
-            1
-        }
-    }
-
-    let mut found: Vec<HWND> = Vec::new();
-    let mut ctx = EnumCtx {
-        title: wide(APP_WINDOW_TITLE),
-        found: &mut found,
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
     };
-    unsafe { EnumWindows(Some(enum_proc), &mut ctx as *mut EnumCtx as LPARAM) };
-    found
+    let mut found = Vec::new();
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry) == 0 {
+            CloseHandle(snapshot);
+            return Err("could not read the running process list".to_owned());
+        }
+        loop {
+            if entry.th32ProcessID != GetCurrentProcessId() {
+                found.push(entry.th32ProcessID);
+            }
+            if Process32NextW(snapshot, &mut entry) == 0 {
+                break;
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    Ok(found)
 }
 
-fn terminate_window_process(hwnd: HWND) {
+fn open_app_process(pid: u32, expected_exe: &Path) -> Option<HANDLE> {
     unsafe {
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == 0 || pid == GetCurrentProcessId() {
-            return;
-        }
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid);
+        let process = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
         if process.is_null() {
-            log!(TAG, "could not open pid {pid} to terminate");
-            return;
+            return None;
         }
-        if is_this_installer(process) {
-            log!(TAG, "refusing to terminate own installer process");
+        if is_this_installer(process) || !is_expected_app_process(process, expected_exe) {
             CloseHandle(process);
-            return;
+            return None;
         }
-        let terminated = TerminateProcess(process, 0);
-        CloseHandle(process);
-        log!(TAG, "terminate pid {pid}: {}", terminated != 0);
+        Some(process)
     }
+}
+
+fn is_expected_app_process(process: HANDLE, expected_exe: &Path) -> bool {
+    let Some(image) = process_image_path(process) else {
+        return false;
+    };
+    Path::new(&image)
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(EXE_NAME))
+        && image.eq_ignore_ascii_case(&expected_exe.display().to_string())
 }
 
 /// True when the process image behind `process` resolves to THIS exe — the
 /// safety rail that keeps the installer from killing itself when both share
 /// the same window title.
 fn is_this_installer(process: HANDLE) -> bool {
+    let Some(image) = process_image_path(process) else {
+        return false;
+    };
+    match std::env::current_exe() {
+        Ok(me) => image.eq_ignore_ascii_case(&me.display().to_string()),
+        Err(_) => false,
+    }
+}
+
+fn process_image_path(process: HANDLE) -> Option<String> {
     let mut path = [0_u16; 1024];
     let mut size = path.len() as u32;
     unsafe {
@@ -503,14 +532,10 @@ fn is_this_installer(process: HANDLE) -> bool {
             &mut size,
         ) == 0
         {
-            return false;
+            return None;
         }
     }
-    let image = String::from_utf16_lossy(&path[..size as usize]);
-    match std::env::current_exe() {
-        Ok(me) => image.eq_ignore_ascii_case(&me.display().to_string()),
-        Err(_) => false,
-    }
+    Some(String::from_utf16_lossy(&path[..size as usize]))
 }
 
 // ---- Self copy ----
@@ -574,7 +599,7 @@ fn pipeline(opts: &super::InstallOptions, on_step: &mut dyn FnMut(super::Step, &
     let target = opts.dir.join(EXE_NAME);
 
     announce(on_step, super::Step::CloseRunning, true);
-    close_running_instance();
+    close_running_instance(&target)?;
 
     announce(on_step, super::Step::CopyFiles, true);
     copy_self_to_dir(&opts.dir)?;
@@ -643,7 +668,7 @@ pub fn run_uninstall(
     );
 
     on_step(super::Step::CloseRunning, "Closing Amanuensis…");
-    close_running_instance();
+    close_running_instance(&dir.join(EXE_NAME))?;
 
     on_step(super::Step::StartMenu, "Removing Start menu shortcut…");
     set_start_menu_shortcut(&dir.join(EXE_NAME), false)?;

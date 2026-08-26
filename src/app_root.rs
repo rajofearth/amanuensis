@@ -127,8 +127,8 @@ impl AppRoot {
                     self.screen = Screen::Dictation;
                     self.hide_pill_window();
                 } else {
-                    log!("app", "onboarding not completed; hiding until restart");
-                    self.hide_pill_window();
+                    log!("app", "onboarding panel closed; quitting app");
+                    cx.quit();
                 }
             }
             Screen::Dictation => self.hide_pill_window(),
@@ -138,7 +138,7 @@ impl AppRoot {
 
     pub(crate) fn hide_pill_window(&mut self) {
         if let Some(hwnd) = self.hwnd_resolved() {
-            pw::remove_panel_wndproc(hwnd);
+            self.apply_pill_chrome();
             pw::set_click_through(hwnd, true);
             log!("app", "pill idle: click-through");
         }

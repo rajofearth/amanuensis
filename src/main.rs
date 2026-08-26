@@ -115,7 +115,29 @@ fn main() {
                 let (esc, esc_events) = esc_hook::spawn();
                 let loop_ui = ui_sender.clone();
 
-                let loaded_config = config::load();
+                let loaded_config = config::load().or_else(|| {
+                    // Older builds could finish downloading before saving setup
+                    // state. A complete default model is enough to safely
+                    // recover that install without replaying onboarding.
+                    let model = asr::ModelKind::Nemotron;
+                    if !is_model_cached(model.spec().id) {
+                        return None;
+                    }
+                    let recovered = config::AppConfig {
+                        model: model.spec().id.to_owned(),
+                        tray_enabled: true,
+                    };
+                    match config::save(&recovered) {
+                        Ok(()) => {
+                            log!("app", "recovered config from cached model: {}", recovered.model);
+                            Some(recovered)
+                        }
+                        Err(error) => {
+                            log!("app", "cached-model config recovery FAILED: {error}");
+                            None
+                        }
+                    }
+                });
                 let tray_enabled = loaded_config
                     .as_ref()
                     .map_or(true, |config| config.tray_enabled);
@@ -306,25 +328,20 @@ fn main() {
 }
 
 fn acquire_single_instance_lock() -> bool {
-    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
-    use windows_sys::Win32::System::Threading::{CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
     let name: Vec<u16> = "Local\\amanuensis-single-instance"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let existing = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
-    if !existing.is_null() {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(existing) };
-        return false;
-    }
-    let missing = unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_FILE_NOT_FOUND;
-    if !missing {
-        log!("app", "single-instance mutex probe failed unexpectedly");
-        return false;
-    }
     let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if handle.is_null() {
         log!("app", "single-instance mutex creation failed");
+        return false;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        log!("app", "another Amanuensis instance is already running");
         return false;
     }
     true
