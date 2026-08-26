@@ -502,10 +502,21 @@ fn is_expected_app_process(process: HANDLE, expected_exe: &Path) -> bool {
     let Some(image) = process_image_path(process) else {
         return false;
     };
-    Path::new(&image)
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(EXE_NAME))
-        && image.eq_ignore_ascii_case(&expected_exe.display().to_string())
+    let Some(name) = Path::new(&image).file_name() else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(EXE_NAME) {
+        return false;
+    }
+    let expected = expected_exe.display().to_string();
+    if !image.eq_ignore_ascii_case(&expected) {
+        log!(
+            TAG,
+            "app candidate path differs from expected path; accepting verified {} candidate",
+            image
+        );
+    }
+    true
 }
 
 /// True when the process image behind `process` resolves to THIS exe — the
