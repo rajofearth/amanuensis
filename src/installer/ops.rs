@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenMutexW, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    CREATE_NO_WINDOW, DETACHED_PROCESS, MUTEX_MODIFY_STATE, PROCESS_NAME_WIN32,
+    CREATE_NO_WINDOW, MUTEX_MODIFY_STATE, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -42,7 +42,9 @@ const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Spawned helpers must never flash a console window.
-const HIDDEN_PROCESS: u32 = CREATE_NO_WINDOW | DETACHED_PROCESS;
+/// CREATE_NO_WINDOW alone: DETACHED_PROCESS cannot be combined with it
+/// (CreateProcess rejects the pair with ERROR_INVALID_PARAMETER).
+const HIDDEN_PROCESS: u32 = CREATE_NO_WINDOW;
 
 // ---- Folder picker ----
 
@@ -666,12 +668,22 @@ fn delete_install_data(keep_data: bool, dir: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(marker_path(dir));
     if !keep_data {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            let data_dir = PathBuf::from(appdata).join(super::CONFIG_DIR_NAME);
-            match std::fs::remove_dir_all(&data_dir) {
-                Ok(()) => log!(TAG, "removed data dir {}", data_dir.display()),
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("removing {}: {error}", data_dir.display()));
+            let appdata = PathBuf::from(appdata);
+            // Current data dir plus the pre-rename legacy dir that config
+            // loading still falls back to — a complete uninstall removes both,
+            // otherwise the next launch resurrects old state instead of
+            // showing first-run onboarding.
+            for dir_name in [
+                super::CONFIG_DIR_NAME,
+                super::LEGACY_CONFIG_DIR_NAME,
+            ] {
+                let data_dir = appdata.join(dir_name);
+                match std::fs::remove_dir_all(&data_dir) {
+                    Ok(()) => log!(TAG, "removed data dir {}", data_dir.display()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("removing {}: {error}", data_dir.display()));
+                    }
                 }
             }
         }
@@ -691,9 +703,12 @@ fn self_delete_command(dir: &Path) -> String {
 /// two pings first; we exit right after returning (classic trick, spec-approved).
 fn spawn_self_delete(dir: &Path) -> Result<(), String> {
     let comspec = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    // raw_arg is load-bearing: a normal .arg would escape the embedded quotes
+    // as \" which cmd.exe does not understand, mangling the rd path so the
+    // install dir silently survives uninstall.
     Command::new(comspec)
-        .arg("/c")
-        .arg(self_delete_command(dir))
+        .raw_arg("/c")
+        .raw_arg(self_delete_command(dir))
         .creation_flags(HIDDEN_PROCESS)
         .spawn()
         .map(|child| std::mem::forget(child))

@@ -39,6 +39,10 @@ pub const SHORTCUT_FILE_NAME: &str = "Amanuensis.lnk";
 /// Must match the dir in config.rs config_dir() — removed on full uninstall.
 pub const CONFIG_DIR_NAME: &str = "amanuensis";
 
+/// Pre-rename app-data dir the config layer still reads as a fallback
+/// (src/config.rs `legacy_config_dir`). Complete-uninstall must remove it too.
+pub const LEGACY_CONFIG_DIR_NAME: &str = "raycast-dictation";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchMode {
     /// Exe lives inside the install dir → normal dictation app.
