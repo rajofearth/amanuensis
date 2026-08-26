@@ -38,7 +38,11 @@ const TAG: &str = "installer";
 /// Distinct from the app's "amanuensis-window" title on purpose: ops.rs
 /// enumerates that title when terminating a running instance, and the
 /// installer window must never match it.
-const WINDOW_TITLE: &str = "amanuensis-installer";
+/// Win32 window text for the installer window. Must equal the TitlebarOptions
+/// title AND stay constant for the window's whole life: hwnd_resolved()
+/// locates the window with FindWindowW, which matches this text. (Never
+/// "amanuensis-window" — ops' close-running-instance logic enumerates that.)
+const WINDOW_TITLE: &str = "Amanuensis Setup";
 const WINDOW_WIDTH: f32 = 520.;
 const WINDOW_HEIGHT: f32 = 400.;
 /// Top strip of the frameless progress window routed to HTCAPTION for drag.
@@ -108,7 +112,9 @@ pub fn run(mode: LaunchMode) {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Amanuensis Setup".to_owned().into()),
+                        // Must equal WINDOW_TITLE — hwnd_resolved() finds this
+                        // window via FindWindowW on that text.
+                        title: Some(WINDOW_TITLE.to_owned().into()),
                         ..Default::default()
                     }),
                     focus: true,
