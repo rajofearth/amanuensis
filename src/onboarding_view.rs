@@ -860,7 +860,7 @@ fn shortcut_key_row(key: &'static str, description: &'static str) -> Div {
         .child(div().text_size(px(14.)).child(description))
 }
 
-fn text_button(
+pub(crate) fn text_button(
     id: &'static str,
     label: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,

@@ -3,12 +3,14 @@
 mod app_root;
 mod dictation_view;
 mod download_runner;
+mod installer_ui;
 mod messages;
 mod onboarding_view;
 mod tray;
 
 use std::{sync::mpsc, thread, time::Duration};
 
+use amanuensis::installer::{self, LaunchMode};
 use amanuensis::asr::{self, Event, is_model_cached};
 use amanuensis::audio;
 use amanuensis::config;
@@ -40,6 +42,14 @@ const WINDOW_TITLE: &str = "amanuensis-window";
 
 fn main() {
     logging::init();
+    match installer::detect_mode() {
+        LaunchMode::App => {}
+        mode => {
+            log!("installer", "installer launch mode detected ({mode:?})");
+            installer_ui::run(mode);
+            return;
+        }
+    }
     if !acquire_single_instance_lock() {
         log!("app", "another instance is running; exiting");
         return;
