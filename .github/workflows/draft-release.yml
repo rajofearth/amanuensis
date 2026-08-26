@@ -28,8 +28,10 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             artifact: amanuensis-windows-x64
+            suffix: x64
           - target: aarch64-pc-windows-msvc
             artifact: amanuensis-windows-arm64
+            suffix: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,20 +79,13 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "${{ matrix.artifact }}"
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\amanuensis.exe" "$dir\amanuensis.exe"
-          Copy-Item README.md, THIRD_PARTY_NOTICES.md "$dir\"
-          Compress-Archive -Path "$dir\*" -DestinationPath "$dir.zip"
-          Copy-Item "target\${{ matrix.target }}\release\amanuensis.exe" "${{ matrix.artifact }}.exe"
+          Copy-Item "target\${{ matrix.target }}\release\amanuensis.exe" "amanuensis-${{ github.ref_name }}-${{ matrix.suffix }}.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.exe
+          path: amanuensis-${{ github.ref_name }}-${{ matrix.suffix }}.exe
 
   draft-release:
     name: Create Draft Release
@@ -111,6 +106,4 @@ jobs:
           name: Amanuensis ${{ inputs.tag || github.ref_name }}
           draft: true
           generate_release_notes: true
-          files: |
-            release-assets/*.zip
-            release-assets/*.exe
+          files: release-assets/*.exe
