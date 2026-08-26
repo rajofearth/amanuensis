@@ -468,7 +468,15 @@ fn find_app_process_ids() -> Result<Vec<u32>, String> {
             return Err("could not read the running process list".to_owned());
         }
         loop {
-            if entry.th32ProcessID != GetCurrentProcessId() {
+            let name_end = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+            if entry.th32ProcessID != GetCurrentProcessId()
+                && name.eq_ignore_ascii_case(EXE_NAME)
+            {
                 found.push(entry.th32ProcessID);
             }
             if Process32NextW(snapshot, &mut entry) == 0 {
@@ -487,10 +495,15 @@ fn open_app_process(pid: u32, expected_exe: &Path) -> Option<HANDLE> {
             0,
             pid,
         );
+        let process = if process.is_null() {
+            OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)
+        } else {
+            process
+        };
         if process.is_null() {
             return None;
         }
-        if is_this_installer(process) || !is_expected_app_process(process, expected_exe) {
+        if !is_expected_app_process(process, expected_exe) {
             CloseHandle(process);
             return None;
         }
@@ -499,37 +512,17 @@ fn open_app_process(pid: u32, expected_exe: &Path) -> Option<HANDLE> {
 }
 
 fn is_expected_app_process(process: HANDLE, expected_exe: &Path) -> bool {
-    let Some(image) = process_image_path(process) else {
-        return false;
-    };
-    let Some(name) = Path::new(&image).file_name() else {
-        return false;
-    };
-    if !name.eq_ignore_ascii_case(EXE_NAME) {
-        return false;
-    }
-    let expected = expected_exe.display().to_string();
-    if !image.eq_ignore_ascii_case(&expected) {
-        log!(
-            TAG,
-            "app candidate path differs from expected path; accepting verified {} candidate",
-            image
-        );
+    if let Some(image) = process_image_path(process) {
+        let expected = expected_exe.display().to_string();
+        if !image.eq_ignore_ascii_case(&expected) {
+            log!(
+                TAG,
+                "app candidate path differs from expected path; accepting process-name match: {}",
+                image
+            );
+        }
     }
     true
-}
-
-/// True when the process image behind `process` resolves to THIS exe — the
-/// safety rail that keeps the installer from killing itself when both share
-/// the same window title.
-fn is_this_installer(process: HANDLE) -> bool {
-    let Some(image) = process_image_path(process) else {
-        return false;
-    };
-    match std::env::current_exe() {
-        Ok(me) => image.eq_ignore_ascii_case(&me.display().to_string()),
-        Err(_) => false,
-    }
 }
 
 fn process_image_path(process: HANDLE) -> Option<String> {
