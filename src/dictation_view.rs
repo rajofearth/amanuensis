@@ -68,6 +68,7 @@ pub(crate) struct Dictation {
     recording_started: Option<Instant>,
     discard_requested: bool,
     flash_since: Option<Instant>,
+    pub(crate) start_sent: bool,
 }
 
 impl Dictation {
@@ -95,6 +96,7 @@ impl Dictation {
             recording_started: None,
             discard_requested: false,
             flash_since: None,
+            start_sent: false,
         }
     }
 
@@ -111,8 +113,11 @@ impl Dictation {
         // Escape now cancels from anywhere; released on every exit path in
         // stop_recording, the sole funnel out of Phase::Recording.
         self.esc.set_active(true);
+        self.start_sent = false;
         audio::play(Sound::Start);
-        let _ = self.commands.send(Command::Start);
+        // Command::Start is withheld until the first captured chunk is
+        // forwarded (see AppRoot::pump_audio) so the ASR session never
+        // begins before any real audio exists.
         let _ = self.pill_cmd.send(PillCommand::Show(PillMode::Recording));
         let _ = self
             .pill_cmd

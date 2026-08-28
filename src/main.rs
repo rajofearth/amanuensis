@@ -106,7 +106,7 @@ fn main() {
             },
             |window, cx| {
                 let (audio_sender, audio_receiver) = mpsc::channel::<Vec<f32>>();
-                audio::spawn(audio_sender);
+                let recorder = audio::spawn(audio_sender);
 
                 let (event_sender, event_receiver) = mpsc::channel::<Event>();
                 let (paste_sender, paste_receiver) = mpsc::channel::<PasteResult>();
@@ -225,6 +225,7 @@ fn main() {
                     pill_cmd: pill.command_tx(),
                     tray_commands: tray.sender(),
                     esc: esc.clone(),
+                    recorder,
                     pending_start: false,
                     download_generation: 0,
                     cancel_flag: None,

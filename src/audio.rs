@@ -1,4 +1,9 @@
-use std::{error::Error, io::Cursor, sync::mpsc::Sender, thread, time::Duration};
+use std::{
+    error::Error,
+    io::Cursor,
+    sync::mpsc::{self, Sender},
+    thread,
+};
 
 use crate::log;
 use cpal::{
@@ -9,15 +14,71 @@ use cpal::{
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const CHUNK_SAMPLES: usize = 480;
 
-pub fn spawn(sender: Sender<Vec<f32>>) {
-    thread::spawn(move || {
-        if let Err(error) = run_capture(sender) {
-            log!("audio", "ERROR: capture failed: {error}");
-        }
-    });
+/// Gates whether microphone capture is active. Capture should only run while
+/// the user is recording (or checking the mic in setup), never for the whole
+/// lifetime of the app, so the OS "mic in use" indicator and the device are
+/// only claimed during those windows.
+#[derive(Clone)]
+pub struct Recorder(mpsc::Sender<bool>);
+
+impl Recorder {
+    pub fn set_enabled(&self, enabled: bool) {
+        let _ = self.0.send(enabled);
+    }
 }
 
-fn run_capture(sender: Sender<Vec<f32>>) -> Result<(), Box<dyn Error>> {
+/// Spawns the microphone-capture thread. The returned [`Recorder`] gates
+/// whether the device stream is actually open: while disabled the thread keeps
+/// the device closed and produces no chunks.
+pub fn spawn(sender: Sender<Vec<f32>>) -> Recorder {
+    let (command_tx, command_rx) = mpsc::channel::<bool>();
+    thread::spawn(move || {
+        let mut stream: Option<cpal::Stream> = None;
+        let mut was_enabled = false;
+        while let Ok(enabled) = command_rx.recv() {
+            match gate_action(was_enabled, enabled) {
+                GateAction::Open => {
+                    if stream.is_none() {
+                        if let Err(error) = open_capture(sender.clone()) {
+                            log!("audio", "capture open failed: {error}");
+                        }
+                    }
+                }
+                GateAction::Close => {
+                    if let Some(active) = stream.take() {
+                        drop(active);
+                        log!("audio", "capture stopped");
+                    }
+                }
+                GateAction::None => {}
+            }
+            was_enabled = enabled;
+        }
+    });
+    Recorder(command_tx)
+}
+
+enum GateAction {
+    /// Device is idle and capture was just turned on: open the stream.
+    Open,
+    /// Capture was just turned off: close the stream.
+    Close,
+    /// State unchanged; do nothing.
+    None,
+}
+
+/// Decides what to do on one enable-flag update. Opens only on a rising edge
+/// (so a device that fails to open isn't retried every frame), closes only on
+/// a falling edge.
+fn gate_action(was_enabled: bool, enabled: bool) -> GateAction {
+    match (was_enabled, enabled) {
+        (false, true) => GateAction::Open,
+        (true, false) => GateAction::Close,
+        _ => GateAction::None,
+    }
+}
+
+fn open_capture(sender: Sender<Vec<f32>>) -> Result<cpal::Stream, Box<dyn Error>> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -28,9 +89,8 @@ fn run_capture(sender: Sender<Vec<f32>>) -> Result<(), Box<dyn Error>> {
         (config.sample_rate.0 != TARGET_SAMPLE_RATE).then_some(config.sample_rate.0);
     let stream = open_stream(&device, &config, resample_from, sender)?;
     stream.play()?;
-    loop {
-        thread::sleep(Duration::from_secs(3600));
-    }
+    log!("audio", "capture started");
+    Ok(stream)
 }
 
 fn open_stream(
@@ -159,7 +219,7 @@ impl Chunker {
 
 #[cfg(test)]
 mod tests {
-    use super::Resampler;
+    use super::{GateAction, Resampler, gate_action};
 
     #[test]
     fn resampler_produces_target_rate() {
@@ -173,6 +233,16 @@ mod tests {
             resampler.push(sample, &mut |sample| output.push(sample));
         }
         assert!((output.len() as i64 - 16_000).abs() < 100);
+    }
+
+    #[test]
+    fn gate_opens_only_on_rising_edge_and_closes_on_falling_edge() {
+        use GateAction::{Close, None, Open};
+
+        assert!(matches!(gate_action(false, true), Open));
+        assert!(matches!(gate_action(false, false), None));
+        assert!(matches!(gate_action(true, true), None));
+        assert!(matches!(gate_action(true, false), Close));
     }
 }
 

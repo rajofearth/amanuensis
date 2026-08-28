@@ -6,6 +6,7 @@ use std::{
 use amanuensis::asr::{
     Command, Event, ModelKind, ModelSelection, kind_by_id, repo_cache_dir_for, spec_by_id,
 };
+use amanuensis::audio;
 use amanuensis::config::{self, AppConfig};
 use amanuensis::esc_hook::EscHook;
 use amanuensis::log;
@@ -43,6 +44,7 @@ pub(crate) struct AppRoot {
     pub(crate) pill_cmd: mpsc::Sender<PillCommand>,
     pub(crate) tray_commands: mpsc::Sender<TrayCommand>,
     pub(crate) esc: EscHook,
+    pub(crate) recorder: audio::Recorder,
     pub(crate) pending_start: bool,
     pub(crate) download_generation: u64,
     pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
@@ -231,29 +233,50 @@ impl AppRoot {
         chunks: &mut Vec<Vec<f32>>,
         cx: &mut Context<Self>,
     ) {
+        // Claim the mic only while the user is actually using it: during a
+        // recording or the setup mic check. When neither is active the device
+        // stays closed so the OS never shows it as in use.
+        let (phase, mic_check_active) = match &self.screen {
+            Screen::Dictation => (
+                self.dictation.as_ref().map(|d| d.read(cx).phase),
+                false,
+            ),
+            Screen::Onboarding { view, .. } => (None, view.read(cx).mic_check_active()),
+        };
+        self.recorder
+            .set_enabled(capture_wanted(phase, mic_check_active));
         match self.screen.clone() {
             Screen::Dictation => {
                 if let Some(dictation) = self.dictation.clone() {
-                    let drained_levels = std::mem::take(levels);
-                    let drained_chunks = std::mem::take(chunks);
-                    dictation.update(cx, |dictation, cx| {
-                        if dictation.phase == Phase::Recording {
+                    if phase == Some(Phase::Recording) {
+                        let drained_levels = std::mem::take(levels);
+                        let drained_chunks = std::mem::take(chunks);
+                        dictation.update(cx, |dictation, cx| {
                             dictation.push_levels(drained_levels);
+                            // Open the ASR session right before forwarding the
+                            // first captured chunk, never before real audio
+                            // exists (the worker drops chunks until Start).
+                            if !drained_chunks.is_empty() && !dictation.start_sent {
+                                let _ = dictation.commands.send(Command::Start);
+                                dictation.start_sent = true;
+                            }
                             for chunk in drained_chunks {
                                 let _ = dictation
                                     .commands
                                     .send(Command::Chunk(prepare_asr_chunk(chunk)));
                             }
-                        }
-                        cx.notify();
-                    });
+                            cx.notify();
+                        });
+                    } else {
+                        levels.clear();
+                        chunks.clear();
+                    }
                 } else {
                     levels.clear();
                     chunks.clear();
                 }
             }
             Screen::Onboarding { view, .. } => {
-                let mic_check_active = view.read(cx).mic_check_active();
                 if mic_check_active && !levels.is_empty() {
                     let drained_levels = std::mem::take(levels);
                     view.update(cx, |onboarding, cx| {
@@ -628,6 +651,16 @@ pub(crate) fn rms_level(samples: &[f32]) -> f32 {
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+/// Whether the microphone should be captured this frame. `phase` is the
+/// dictation phase, or `None` while in onboarding (no dictation yet).
+fn capture_wanted(phase: Option<Phase>, mic_check_active: bool) -> bool {
+    match phase {
+        Some(Phase::Recording) => true,
+        Some(_) => false,
+        None => mic_check_active,
+    }
+}
+
 fn prepare_asr_chunk(mut samples: Vec<f32>) -> Vec<f32> {
     let peak = samples
         .iter()
@@ -643,7 +676,7 @@ fn prepare_asr_chunk(mut samples: Vec<f32>) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_asr_chunk;
+    use super::{Phase, capture_wanted, prepare_asr_chunk};
 
     #[test]
     fn quiet_asr_chunks_are_boosted_without_clipping() {
@@ -655,5 +688,15 @@ mod tests {
     fn normal_asr_chunks_are_unchanged() {
         let samples = vec![0.05, -0.1];
         assert_eq!(prepare_asr_chunk(samples.clone()), samples);
+    }
+
+    #[test]
+    fn mic_captured_only_while_recording_or_checking() {
+        assert!(capture_wanted(Some(Phase::Recording), false));
+        for phase in [Phase::Loading, Phase::Idle, Phase::Transcribing, Phase::Flash] {
+            assert!(!capture_wanted(Some(phase), false), "{phase:?} must not capture");
+        }
+        assert!(capture_wanted(None, true));
+        assert!(!capture_wanted(None, false));
     }
 }
