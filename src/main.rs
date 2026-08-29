@@ -11,11 +11,11 @@ mod tray;
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use amanuensis::installer::{self, LaunchMode};
 use amanuensis::asr::{self, Event, is_model_cached};
 use amanuensis::audio;
 use amanuensis::config;
 use amanuensis::esc_hook;
+use amanuensis::installer::{self, LaunchMode};
 use amanuensis::log;
 use amanuensis::logging;
 use amanuensis::pill_win32::PillButton;

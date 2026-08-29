@@ -531,15 +531,11 @@ mod tests {
     fn aggregate_payload_starts_with_unknown_speed() {
         let mut aggregate = Aggregate::new(700_000_000);
         assert_eq!(
-            aggregate
-                .current("encoder.int8.onnx", 10_000)
-                .bytes_per_sec,
+            aggregate.current("encoder.int8.onnx", 10_000).bytes_per_sec,
             None
         );
         assert_eq!(
-            aggregate
-                .current("encoder.int8.onnx", 20_000)
-                .bytes_per_sec,
+            aggregate.current("encoder.int8.onnx", 20_000).bytes_per_sec,
             None
         );
     }

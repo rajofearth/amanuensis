@@ -14,10 +14,9 @@
 
 use std::{
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
     },
     thread,
 };
@@ -27,8 +26,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::log;
@@ -152,7 +150,12 @@ fn install_hook() {
     }
     // hMod is null and the thread id is 0: the low-level hook lives in-process.
     let hook = unsafe {
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(escape_hook_proc), std::ptr::null_mut(), 0)
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(escape_hook_proc),
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if hook.is_null() {
         log!("esc", "ERROR: SetWindowsHookExW failed");
@@ -203,11 +206,7 @@ enum EscapeAction {
     TriggerDiscard,
 }
 
-unsafe extern "system" fn escape_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn escape_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Fast path: runs for EVERY keystroke system-wide while recording, so no
     // locks, allocation, or logging here.
     if code < 0 || !HOOK_ACTIVE.load(Ordering::Acquire) {

@@ -5,8 +5,8 @@
 pub mod ops;
 
 pub use ops::{
-    autostart_enabled, pick_folder, run_install, run_uninstall, run_update,
-    set_autostart, set_start_menu_shortcut, start_menu_shortcut_exists,
+    autostart_enabled, pick_folder, run_install, run_uninstall, run_update, set_autostart,
+    set_start_menu_shortcut, start_menu_shortcut_exists,
 };
 
 use std::path::{Path, PathBuf};
@@ -197,7 +197,8 @@ fn query_installed() -> Option<InstalledInfo> {
     if marker_version.is_none() && !has_key {
         return None;
     }
-    let version = marker_version.or_else(|| ops::reg_read_string(UNINSTALL_SUBKEY, "DisplayVersion"));
+    let version =
+        marker_version.or_else(|| ops::reg_read_string(UNINSTALL_SUBKEY, "DisplayVersion"));
     Some(InstalledInfo {
         dir,
         version: version.unwrap_or_default(),
@@ -254,20 +255,21 @@ mod tests {
             classify_mode(true, true, installed.clone()),
             LaunchMode::Uninstall
         );
-        assert_eq!(
-            classify_mode(true, false, installed),
-            LaunchMode::Uninstall
-        );
+        assert_eq!(classify_mode(true, false, installed), LaunchMode::Uninstall);
     }
 
     #[test]
     fn running_inside_install_dir_is_app_mode() {
         assert_eq!(classify_mode(false, true, None), LaunchMode::App);
         assert_eq!(
-            classify_mode(false, true, Some(InstalledInfo {
-                dir: PathBuf::from("C:\\other"),
-                version: "9.9".to_owned(),
-            })),
+            classify_mode(
+                false,
+                true,
+                Some(InstalledInfo {
+                    dir: PathBuf::from("C:\\other"),
+                    version: "9.9".to_owned(),
+                })
+            ),
             LaunchMode::App
         );
     }
@@ -323,14 +325,8 @@ mod tests {
     fn step_labels_cover_both_toggle_states() {
         assert_eq!(Step::CloseRunning.label(true), "Closing Amanuensis…");
         assert_eq!(Step::CopyFiles.label(true), "Copying files…");
-        assert_eq!(
-            Step::StartMenu.label(true),
-            "Adding Start menu shortcut…"
-        );
-        assert_eq!(
-            Step::StartMenu.label(false),
-            "Skipping Start menu shortcut"
-        );
+        assert_eq!(Step::StartMenu.label(true), "Adding Start menu shortcut…");
+        assert_eq!(Step::StartMenu.label(false), "Skipping Start menu shortcut");
         assert_eq!(Step::AutoStart.label(true), "Setting up auto-start…");
         assert_eq!(Step::AutoStart.label(false), "Skipping auto-start");
         assert_eq!(Step::Register.label(true), "Finishing…");

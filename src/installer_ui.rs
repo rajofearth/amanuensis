@@ -16,12 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::brand_assets;
 use amanuensis::installer::{
-    self, ALL_STEPS, APP_VERSION, InstalledInfo, InstallOptions, LaunchMode, Step,
+    self, ALL_STEPS, APP_VERSION, InstallOptions, InstalledInfo, LaunchMode, Step,
 };
 use amanuensis::log;
 use amanuensis::pill_window as pw;
-use crate::brand_assets;
 use gpui::{
     App, Bounds, Context, Div, Entity, IntoElement, Render, Stateful, TitlebarOptions, Window,
     WindowBounds, WindowKind, WindowOptions, div, prelude::*, px, relative, rgb, size,
@@ -78,7 +78,9 @@ enum Stage {
 /// Events flowing from worker threads into the UI pump loop.
 enum WorkerEvent {
     /// Fired by the ops layer BEFORE each step starts running.
-    StepStarted { message: String },
+    StepStarted {
+        message: String,
+    },
     FolderPicked(Option<PathBuf>),
     Finished(Result<(), String>),
 }
@@ -169,7 +171,10 @@ impl InstallerApp {
                 false,
             ),
             LaunchMode::App => {
-                log!(TAG, "BUG: App mode reached installer UI; defaulting to Install");
+                log!(
+                    TAG,
+                    "BUG: App mode reached installer UI; defaulting to Install"
+                );
                 (
                     Pipeline::Install,
                     installer::default_install_dir(),
@@ -406,12 +411,20 @@ impl InstallerApp {
             ))
             .child(div().flex_1())
             .child(footer(
-                text_button("cancel", "Cancel", cx.listener(|_, _, _, cx| {
-                    log!(TAG, "cancelled from intro");
-                    cx.quit();
-                })),
+                text_button(
+                    "cancel",
+                    "Cancel",
+                    cx.listener(|_, _, _, cx| {
+                        log!(TAG, "cancelled from intro");
+                        cx.quit();
+                    }),
+                ),
                 primary_button(
-                    if updating { "update-btn" } else { "install-btn" },
+                    if updating {
+                        "update-btn"
+                    } else {
+                        "install-btn"
+                    },
                     if updating { "Update" } else { "Install" },
                     cx.listener(|this, _, _, cx| this.start_pipeline(cx)),
                 ),
@@ -502,7 +515,11 @@ impl InstallerApp {
                             .text_color(rgb(0xf2f2f2))
                             .child(if self.keep_data { "✓" } else { "" }),
                     )
-                    .child(div().text_size(px(13.)).child("Keep my models and settings"))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .child("Keep my models and settings"),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.keep_data = !this.keep_data;
                         cx.notify();
@@ -510,10 +527,14 @@ impl InstallerApp {
             )
             .child(div().flex_1())
             .child(footer(
-                text_button("cancel", "Cancel", cx.listener(|_, _, _, cx| {
-                    log!(TAG, "cancelled from uninstall confirm");
-                    cx.quit();
-                })),
+                text_button(
+                    "cancel",
+                    "Cancel",
+                    cx.listener(|_, _, _, cx| {
+                        log!(TAG, "cancelled from uninstall confirm");
+                        cx.quit();
+                    }),
+                ),
                 primary_button(
                     "remove",
                     "Remove",
@@ -564,10 +585,14 @@ impl InstallerApp {
                         action_button("retry", "Retry", true)
                             .on_click(cx.listener(|this, _, _, cx| this.retry_clicked(cx))),
                     )
-                    .child(text_button("close", "Close", cx.listener(|_, _, _, cx| {
-                        log!(TAG, "closed after failure");
-                        cx.quit();
-                    })))
+                    .child(text_button(
+                        "close",
+                        "Close",
+                        cx.listener(|_, _, _, cx| {
+                            log!(TAG, "closed after failure");
+                            cx.quit();
+                        }),
+                    ))
             }))
             .child(div().flex_1())
     }
@@ -578,7 +603,12 @@ fn status_done_row(label: &String) -> Div {
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(div().text_size(px(13.)).text_color(rgb(0x6fbf73)).child("✓"))
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(0x6fbf73))
+                .child("✓"),
+        )
         .child(
             div()
                 .text_size(px(13.))
@@ -618,9 +648,10 @@ fn toggle_row(
                         .child(description),
                 ),
         )
-        .child(toggle_chip(id, enabled).on_click(move |event, window, app| {
-            on_click(event, window, app)
-        }))
+        .child(
+            toggle_chip(id, enabled)
+                .on_click(move |event, window, app| on_click(event, window, app)),
+        )
 }
 
 fn toggle_chip(id: &'static str, enabled: bool) -> Stateful<Div> {
@@ -717,7 +748,11 @@ fn install_progress_wndproc(hwnd: HWND) {
             return;
         }
         PROGRESS_PREV_WNDPROC.store(current, Ordering::SeqCst);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, progress_subclass_proc as *const () as isize);
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            progress_subclass_proc as *const () as isize,
+        );
     }
 }
 
@@ -762,10 +797,7 @@ fn hit_in_drag_strip(hwnd: HWND, lparam: isize) -> bool {
     if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
         return false;
     }
-    x >= rect.left
-        && x < rect.right
-        && y >= rect.top
-        && y - rect.top <= DRAG_STRIP_PX
+    x >= rect.left && x < rect.right && y >= rect.top && y - rect.top <= DRAG_STRIP_PX
 }
 
 fn signed_loword(lparam: isize) -> i32 {
@@ -780,25 +812,27 @@ fn signed_hiword(lparam: isize) -> i32 {
 
 fn pump_worker_events(window: &mut Window, cx: &mut App, app: Entity<InstallerApp>) {
     window
-        .spawn(cx, async move |cx| loop {
-            cx.update(|_, cx| {
-                app.update(cx, |installer, cx| {
-                    while let Ok(event) = installer.events.try_recv() {
-                        installer.handle_event(event, cx);
-                    }
-                });
-            })
-            .ok();
-            let should_quit = cx
-                .update(|_, cx| app.update(cx, |installer, _| installer.poll_quit()))
-                .ok()
-                .unwrap_or(false);
-            if should_quit {
-                log!(TAG, "success linger elapsed; quitting");
-                cx.update(|_, cx| cx.quit()).ok();
-                break;
+        .spawn(cx, async move |cx| {
+            loop {
+                cx.update(|_, cx| {
+                    app.update(cx, |installer, cx| {
+                        while let Ok(event) = installer.events.try_recv() {
+                            installer.handle_event(event, cx);
+                        }
+                    });
+                })
+                .ok();
+                let should_quit = cx
+                    .update(|_, cx| app.update(cx, |installer, _| installer.poll_quit()))
+                    .ok()
+                    .unwrap_or(false);
+                if should_quit {
+                    log!(TAG, "success linger elapsed; quitting");
+                    cx.update(|_, cx| cx.quit()).ok();
+                    break;
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
             }
-            cx.background_executor().timer(POLL_INTERVAL).await;
         })
         .detach();
 }
@@ -818,10 +852,7 @@ mod tests {
 
     #[test]
     fn version_arrow_shows_both_versions_when_different() {
-        assert_eq!(
-            version_arrow("1.0.0", "1.0.1"),
-            "v1.0.0 \u{2192} v1.0.1"
-        );
+        assert_eq!(version_arrow("1.0.0", "1.0.1"), "v1.0.0 \u{2192} v1.0.1");
     }
 
     #[test]

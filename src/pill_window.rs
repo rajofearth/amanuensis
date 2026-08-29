@@ -8,13 +8,13 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AdjustWindowRectEx, CallWindowProcW, DefWindowProcW, FindWindowW, GWL_EXSTYLE,
             GWL_STYLE, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, GetWindowLongW,
-            GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, PostMessageW,
-            SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
-            SystemParametersInfoW, WM_NCCALCSIZE, WM_NCHITTEST, WNDPROC, WS_CAPTION,
-            WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-            WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+            GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, PostMessageW, SPI_GETWORKAREA,
+            SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowLongW,
+            SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, WM_NCCALCSIZE,
+            WM_NCHITTEST, WNDPROC, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+            WS_THICKFRAME,
         },
     },
 };
@@ -134,7 +134,11 @@ pub fn install_panel_wndproc(hwnd: HWND) {
             return;
         }
         PANEL_PREV_WNDPROC.store(current, Ordering::SeqCst);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, panel_subclass_proc as *const () as isize);
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            panel_subclass_proc as *const () as isize,
+        );
     }
 }
 

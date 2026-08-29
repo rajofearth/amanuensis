@@ -237,10 +237,7 @@ impl AppRoot {
         // recording or the setup mic check. When neither is active the device
         // stays closed so the OS never shows it as in use.
         let (phase, mic_check_active) = match &self.screen {
-            Screen::Dictation => (
-                self.dictation.as_ref().map(|d| d.read(cx).phase),
-                false,
-            ),
+            Screen::Dictation => (self.dictation.as_ref().map(|d| d.read(cx).phase), false),
             Screen::Onboarding { view, .. } => (None, view.read(cx).mic_check_active()),
         };
         self.recorder
@@ -477,7 +474,10 @@ impl AppRoot {
                 }
                 if view.read(cx).model_ready() || self.worker_live {
                     self.pending_start = true;
-                    log!("app", "try-it clicked during setup: queued start after models load");
+                    log!(
+                        "app",
+                        "try-it clicked during setup: queued start after models load"
+                    );
                     view.update(cx, |onboarding, cx| onboarding.queue_start(cx));
                 } else {
                     log!(
@@ -693,8 +693,16 @@ mod tests {
     #[test]
     fn mic_captured_only_while_recording_or_checking() {
         assert!(capture_wanted(Some(Phase::Recording), false));
-        for phase in [Phase::Loading, Phase::Idle, Phase::Transcribing, Phase::Flash] {
-            assert!(!capture_wanted(Some(phase), false), "{phase:?} must not capture");
+        for phase in [
+            Phase::Loading,
+            Phase::Idle,
+            Phase::Transcribing,
+            Phase::Flash,
+        ] {
+            assert!(
+                !capture_wanted(Some(phase), false),
+                "{phase:?} must not capture"
+            );
         }
         assert!(capture_wanted(None, true));
         assert!(!capture_wanted(None, false));

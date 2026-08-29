@@ -9,26 +9,24 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use super::{
+    EXE_NAME, RUN_SUBKEY, RUN_VALUE_NAME, SHORTCUT_FILE_NAME, SINGLE_INSTANCE_MUTEX_NAME,
+    UNINSTALL_SUBKEY, log, marker_path, write_marker,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
-    REG_VALUE_TYPE,
-};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
+    RegCloseKey, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenMutexW, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, MUTEX_MODIFY_STATE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-};
-use super::{
-    log, marker_path, write_marker, EXE_NAME, RUN_SUBKEY, RUN_VALUE_NAME, SHORTCUT_FILE_NAME,
-    SINGLE_INSTANCE_MUTEX_NAME, UNINSTALL_SUBKEY,
+    CREATE_NO_WINDOW, GetCurrentProcessId, MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 
 const TAG: &str = "installer";
@@ -183,8 +181,13 @@ pub(crate) fn registry_key_exists(subkey: &str) -> bool {
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
         let name = wide(subkey);
-        let opened =
-            RegOpenKeyExW(HKEY_CURRENT_USER, name.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey);
+        let opened = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            name.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        );
         if opened == ERROR_SUCCESS {
             RegCloseKey(hkey);
             true
@@ -198,8 +201,13 @@ pub(crate) fn reg_read_string(subkey: &str, value_name: &str) -> Option<String> 
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
         let key_name = wide(subkey);
-        if RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey)
-            != ERROR_SUCCESS
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            key_name.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        ) != ERROR_SUCCESS
         {
             return None;
         }
@@ -284,13 +292,24 @@ fn reg_set(
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
         let key_name = wide(subkey);
-        let status = RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_SET_VALUE, &mut hkey);
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            key_name.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        );
         if status == ERROR_FILE_NOT_FOUND {
             // Parent keys like ...\Uninstall may not exist yet on fresh
             // machines; RegSetValueExW does NOT create intermediate keys.
             create_key_chain(subkey)?;
-            let status =
-                RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_SET_VALUE, &mut hkey);
+            let status = RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                key_name.as_ptr(),
+                0,
+                KEY_SET_VALUE,
+                &mut hkey,
+            );
             if status != ERROR_SUCCESS {
                 return Err(format!("opening {subkey}: win32 error {status}"));
             }
@@ -303,14 +322,16 @@ fn reg_set(
         if status == ERROR_SUCCESS {
             Ok(())
         } else {
-            Err(format!("setting {subkey}\\{value_name}: win32 error {status}"))
+            Err(format!(
+                "setting {subkey}\\{value_name}: win32 error {status}"
+            ))
         }
     }
 }
 
 /// Create every component of `subkey` under HKCU (RegCreateKeyExW per level).
 fn create_key_chain(subkey: &str) -> Result<(), String> {
-    use windows_sys::Win32::System::Registry::{RegCreateKeyExW, KEY_WRITE};
+    use windows_sys::Win32::System::Registry::{KEY_WRITE, RegCreateKeyExW};
     unsafe {
         let mut prefix = String::new();
         for component in subkey.split('\\') {
@@ -344,7 +365,13 @@ fn reg_delete_value(subkey: &str, value_name: &str) -> Result<(), String> {
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
         let key_name = wide(subkey);
-        let status = RegOpenKeyExW(HKEY_CURRENT_USER, key_name.as_ptr(), 0, KEY_SET_VALUE, &mut hkey);
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            key_name.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        );
         if status == ERROR_FILE_NOT_FOUND {
             return Ok(());
         }
@@ -357,7 +384,9 @@ fn reg_delete_value(subkey: &str, value_name: &str) -> Result<(), String> {
         match status {
             ERROR_SUCCESS => Ok(()),
             ERROR_FILE_NOT_FOUND => Ok(()),
-            other => Err(format!("deleting {subkey}\\{value_name}: win32 error {other}")),
+            other => Err(format!(
+                "deleting {subkey}\\{value_name}: win32 error {other}"
+            )),
         }
     }
 }
@@ -376,7 +405,11 @@ fn uninstall_registry_values(exe: &Path, dir: &Path) -> Result<(), String> {
     reg_set_string(UNINSTALL_SUBKEY, "DisplayName", "Amanuensis")?;
     reg_set_string(UNINSTALL_SUBKEY, "DisplayVersion", super::APP_VERSION)?;
     reg_set_string(UNINSTALL_SUBKEY, "DisplayIcon", &exe.display().to_string())?;
-    reg_set_string(UNINSTALL_SUBKEY, "InstallLocation", &dir.display().to_string())?;
+    reg_set_string(
+        UNINSTALL_SUBKEY,
+        "InstallLocation",
+        &dir.display().to_string(),
+    )?;
     reg_set_string(UNINSTALL_SUBKEY, "UninstallString", &uninstall_string(exe))?;
     reg_set_dword(UNINSTALL_SUBKEY, "NoModify", 1)?;
     reg_set_dword(UNINSTALL_SUBKEY, "NoRepair", 1)
@@ -402,7 +435,10 @@ fn close_running_instance(expected_exe: &Path) -> Result<(), String> {
         log!(TAG, "no running instance (mutex free)");
         return Ok(());
     }
-    log!(TAG, "single-instance mutex held; closing running Amanuensis");
+    log!(
+        TAG,
+        "single-instance mutex held; closing running Amanuensis"
+    );
     let mut processes = Vec::new();
     for pid in find_app_process_ids()? {
         if let Some(process) = open_app_process(pid, expected_exe) {
@@ -474,9 +510,7 @@ fn find_app_process_ids() -> Result<Vec<u32>, String> {
                 .position(|character| *character == 0)
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
-            if entry.th32ProcessID != GetCurrentProcessId()
-                && name.eq_ignore_ascii_case(EXE_NAME)
-            {
+            if entry.th32ProcessID != GetCurrentProcessId() && name.eq_ignore_ascii_case(EXE_NAME) {
                 found.push(entry.th32ProcessID);
             }
             if Process32NextW(snapshot, &mut entry) == 0 {
@@ -529,12 +563,8 @@ fn process_image_path(process: HANDLE) -> Option<String> {
     let mut path = [0_u16; 1024];
     let mut size = path.len() as u32;
     unsafe {
-        if QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            path.as_mut_ptr(),
-            &mut size,
-        ) == 0
+        if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut size)
+            == 0
         {
             return None;
         }
@@ -546,7 +576,8 @@ fn process_image_path(process: HANDLE) -> Option<String> {
 
 fn copy_self_to_dir(dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("creating {}: {error}", dir.display()))?;
-    let source = std::env::current_exe().map_err(|error| format!("locating current exe: {error}"))?;
+    let source =
+        std::env::current_exe().map_err(|error| format!("locating current exe: {error}"))?;
     let target = dir.join(EXE_NAME);
     let mut last_error: Option<std::io::Error> = None;
     for attempt in 0..COPY_RETRIES {
@@ -558,10 +589,8 @@ fn copy_self_to_dir(dir: &Path) -> Result<PathBuf, String> {
                 return Ok(target);
             }
             Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::PermissionDenied
-                ) || matches!(error.raw_os_error(), Some(32 | 33)) =>
+                if matches!(error.kind(), ErrorKind::PermissionDenied)
+                    || matches!(error.raw_os_error(), Some(32 | 33)) =>
             {
                 last_error = Some(error);
                 thread::sleep(COPY_BACKOFF);
@@ -599,7 +628,10 @@ fn announce(on_step: &mut dyn FnMut(super::Step, &str), step: super::Step, enabl
 
 /// Shared install/update sequence:
 /// close running → self-copy → shortcut? → run key? → registry + marker → launch.
-fn pipeline(opts: &super::InstallOptions, on_step: &mut dyn FnMut(super::Step, &str)) -> Result<(), String> {
+fn pipeline(
+    opts: &super::InstallOptions,
+    on_step: &mut dyn FnMut(super::Step, &str),
+) -> Result<(), String> {
     let target = opts.dir.join(EXE_NAME);
 
     announce(on_step, super::Step::CloseRunning, true);
@@ -702,10 +734,7 @@ fn delete_install_data(keep_data: bool, dir: &Path) -> Result<(), String> {
             // loading still falls back to — a complete uninstall removes both,
             // otherwise the next launch resurrects old state instead of
             // showing first-run onboarding.
-            for dir_name in [
-                super::CONFIG_DIR_NAME,
-                super::LEGACY_CONFIG_DIR_NAME,
-            ] {
+            for dir_name in [super::CONFIG_DIR_NAME, super::LEGACY_CONFIG_DIR_NAME] {
                 let data_dir = appdata.join(dir_name);
                 match std::fs::remove_dir_all(&data_dir) {
                     Ok(()) => log!(TAG, "removed data dir {}", data_dir.display()),
@@ -721,10 +750,7 @@ fn delete_install_data(keep_data: bool, dir: &Path) -> Result<(), String> {
 }
 
 fn self_delete_command(dir: &Path) -> String {
-    format!(
-        "ping -n 2 127.0.0.1 > NUL & rd /s /q \"{}\"",
-        dir.display()
-    )
+    format!("ping -n 2 127.0.0.1 > NUL & rd /s /q \"{}\"", dir.display())
 }
 
 /// The uninstaller IS the installed exe, so it cannot delete its own dir

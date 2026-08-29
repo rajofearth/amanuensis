@@ -96,16 +96,16 @@ mod tests {
             next_step(SetupStep::Welcome, StepEvent::DownloadFinished),
             None
         );
-        assert_eq!(next_step(SetupStep::Welcome, StepEvent::StartDownload), None);
+        assert_eq!(
+            next_step(SetupStep::Welcome, StepEvent::StartDownload),
+            None
+        );
         assert_eq!(next_step(SetupStep::MicCheck, StepEvent::NavNext), None);
         assert_eq!(next_step(SetupStep::Ready, StepEvent::StartDownload), None);
         assert_eq!(
             next_step(SetupStep::Ready, StepEvent::DownloadCancelled),
             None
         );
-        assert_eq!(
-            next_step(SetupStep::Downloading, StepEvent::NavBack),
-            None
-        );
+        assert_eq!(next_step(SetupStep::Downloading, StepEvent::NavBack), None);
     }
 }

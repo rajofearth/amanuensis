@@ -187,7 +187,11 @@ impl OnboardingView {
         if let Err(error) = config::save(&config) {
             log!("app", "config save after model download FAILED: {error}");
         } else {
-            log!("app", "config saved after model download: model={}", config.model);
+            log!(
+                "app",
+                "config saved after model download: model={}",
+                config.model
+            );
         }
         self.busy = false;
         self.downloading = false;
@@ -859,7 +863,12 @@ impl Render for OnboardingView {
 }
 
 fn tour_footer(back: Option<Stateful<Div>>, primary: Stateful<Div>) -> Div {
-    div().flex().items_center().gap(px(8.)).children(back).child(primary)
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .children(back)
+        .child(primary)
 }
 
 fn numbered_row(index: usize, text: &'static str) -> Div {
