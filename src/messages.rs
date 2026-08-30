@@ -1,4 +1,5 @@
 use amanuensis::asr::{DownloadProgress, ModelKind};
+use amanuensis::backend_detect::BenchProgress;
 
 pub(crate) enum HotkeyMessage {
     ToggleRecording,
@@ -48,4 +49,7 @@ pub(crate) enum UiMessage {
     PillDiscard,
     PillFinish,
     QueueDictationStart,
+    RecheckBackend,
+    BenchProgress(BenchProgress),
+    BackendBenchFinished(Option<String>),
 }

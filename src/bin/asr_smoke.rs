@@ -75,7 +75,7 @@ fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
 }
 
 fn make_backend(_kind: ModelKind, paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
-    NemotronBackend::load(paths).map(|backend| Box::new(backend) as _)
+    NemotronBackend::load(paths, None, 2).map(|backend| Box::new(backend) as _)
 }
 
 fn feed_chunk_samples(_kind: ModelKind) -> usize {

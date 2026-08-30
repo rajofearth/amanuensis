@@ -8,6 +8,7 @@ use amanuensis::asr::{
     DownloadProgress, ModelSpec, cache_dir_for, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
 };
+use amanuensis::backend_detect::{self, BenchProgress, HardwareProfile};
 use amanuensis::config::{self, AppConfig};
 use amanuensis::log;
 use amanuensis::setup_steps::{SetupStep, StepEvent, next_step};
@@ -46,6 +47,13 @@ pub(crate) struct OnboardingView {
     tray_enabled: bool,
     mic_level: f32,
     mic_peak: f32,
+    bench_run: bool,
+    profile: HardwareProfile,
+    bench_progress: Option<String>,
+    bench_winner: Option<String>,
+    bench_busy: bool,
+    bench_skipped: bool,
+    bench_started: bool,
     ui: mpsc::Sender<UiMessage>,
 }
 
@@ -75,6 +83,13 @@ impl OnboardingView {
             tray_enabled,
             mic_level: 0.0,
             mic_peak: 0.0,
+            bench_run: false,
+            profile: backend_detect::detect_hardware(),
+            bench_progress: None,
+            bench_winner: None,
+            bench_busy: false,
+            bench_skipped: false,
+            bench_started: false,
             ui,
         }
     }
@@ -82,6 +97,33 @@ impl OnboardingView {
     fn toggle_tray(&mut self, cx: &mut Context<Self>) {
         self.tray_enabled = !self.tray_enabled;
         let _ = self.ui.send(UiMessage::TraySetEnabled(self.tray_enabled));
+        cx.notify();
+    }
+
+    fn recheck_backend(&mut self, cx: &mut Context<Self>) {
+        if self.bench_run {
+            log!("app", "backend recheck ignored: bench already running");
+            return;
+        }
+        self.bench_run = true;
+        log!("app", "backend recheck requested");
+        let _ = self.ui.send(UiMessage::RecheckBackend);
+        cx.notify();
+    }
+
+    pub(crate) fn on_bench_finished(&mut self, winner: Option<String>, cx: &mut Context<Self>) {
+        self.bench_run = false;
+        match winner {
+            Some(provider) => {
+                log!("app", "backend bench finished: winner={provider}");
+                self.status = Some(format!("Backend benchmarked: fastest is {provider}."));
+            }
+            None => {
+                log!("app", "backend bench finished: no winner recorded");
+                self.status =
+                    Some("Backend benchmark skipped or found nothing to record.".to_owned());
+            }
+        }
         cx.notify();
     }
 
@@ -113,9 +155,98 @@ impl OnboardingView {
 
     fn nav(&mut self, event: StepEvent, cx: &mut Context<Self>) {
         if let Some(step) = self.step {
-            self.step = next_step(step, event);
+            let next = next_step(step, event);
+            if next == Some(SetupStep::Measuring) {
+                self.maybe_start_bench(cx);
+            }
+            self.step = next;
             cx.notify();
         }
+    }
+
+    fn maybe_start_bench(&mut self, cx: &mut Context<Self>) {
+        if self.bench_started || self.bench_skipped {
+            return;
+        }
+        self.bench_started = true;
+        self.bench_busy = true;
+        self.bench_progress = None;
+        log!("app", "onboarding bench started on background thread");
+        let ui = self.ui.clone();
+        std::thread::spawn(move || {
+            let winner = backend_detect::run_backend_bench_with(&mut |progress| {
+                let _ = ui.send(UiMessage::BenchProgress(progress));
+            });
+            let _ = ui.send(UiMessage::BenchProgress(BenchProgress::Finished { winner }));
+        });
+        cx.notify();
+    }
+
+    fn skip_bench(&mut self, cx: &mut Context<Self>) {
+        if self.bench_skipped {
+            log!("app", "bench skip ignored: already skipped");
+            return;
+        }
+        self.bench_skipped = true;
+        self.bench_busy = false;
+        let mut config = config::load().unwrap_or_default();
+        config.backend_cache.asr.provider = "cpu".to_owned();
+        config.backend_cache.asr.threads = 2;
+        match config::save(&config) {
+            Ok(()) => log!("app", "bench skipped; persisted cpu@2 fallback"),
+            Err(error) => log!("app", "bench skip config save FAILED: {error}"),
+        }
+        if let Some(step) = self.step {
+            self.step = next_step(step, StepEvent::NavNext);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_bench_progress(&mut self, progress: BenchProgress, cx: &mut Context<Self>) {
+        if self.bench_skipped {
+            if matches!(progress, BenchProgress::Finished { .. }) {
+                let mut config = config::load().unwrap_or_default();
+                config.backend_cache.asr.provider = "cpu".to_owned();
+                config.backend_cache.asr.threads = 2;
+                match config::save(&config) {
+                    Ok(()) => log!(
+                        "app",
+                        "bench finished after skip; cpu@2 fallback re-asserted"
+                    ),
+                    Err(error) => log!("app", "cpu@2 re-assert save FAILED: {error}"),
+                }
+            }
+            log!("app", "bench progress ignored after skip: {progress:?}");
+            return;
+        }
+        match progress {
+            BenchProgress::Measuring {
+                provider, threads, ..
+            } => {
+                self.bench_busy = true;
+                self.bench_progress = Some(format!("Measuring {provider} · {threads} threads"));
+            }
+            BenchProgress::Finished { winner } => {
+                self.bench_busy = false;
+                match winner {
+                    Some(provider) => {
+                        let threads = config::load().unwrap_or_default().backend_cache.asr.threads;
+                        let threads = if threads > 0 { threads } else { 2 };
+                        self.bench_winner = Some(format!("{provider} · {threads} threads"));
+                        log!(
+                            "app",
+                            "onboarding bench finished: winner={provider} threads={threads}"
+                        );
+                    }
+                    None => {
+                        self.bench_winner = None;
+                        self.bench_progress =
+                            Some("No measurable backend — CPU default will be used.".to_owned());
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn mic_check_active(&self) -> bool {
@@ -183,6 +314,7 @@ impl OnboardingView {
         let config = AppConfig {
             model: self.model_id.to_owned(),
             tray_enabled: config::load().map_or(true, |existing| existing.tray_enabled),
+            ..config::load().unwrap_or_default()
         };
         if let Err(error) = config::save(&config) {
             log!("app", "config save after model download FAILED: {error}");
@@ -571,6 +703,97 @@ impl OnboardingView {
                             .child("You can cancel — it resumes where it left off."),
                     )
             }
+            SetupStep::DetectHardware => {
+                let profile = &self.profile;
+                base()
+                    .child(div().text_size(px(26.)).child("Detecting hardware"))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .child(format!(
+                                "{} · {}",
+                                profile.vendor.label(),
+                                profile.gpu_label
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0x909090))
+                            .child("Amanuensis auto-measures the fastest engine for this device."),
+                    )
+                    .child(tour_footer(
+                        Some(action_button("tour-hardware-back", "Back", true).on_click(
+                            cx.listener(|this, _, _, cx| this.nav(StepEvent::NavBack, cx)),
+                        )),
+                        primary_button(
+                            "tour-hardware-next",
+                            "Next",
+                            cx.listener(|this, _, _, cx| this.nav(StepEvent::NavNext, cx)),
+                        ),
+                    ))
+            }
+            SetupStep::Measuring => {
+                let status = if self.bench_skipped {
+                    Some("Using default (CPU, 2 threads)".to_owned())
+                } else if self.bench_busy {
+                    self.bench_progress
+                        .clone()
+                        .or_else(|| Some("Measuring…".to_owned()))
+                } else if let Some(winner) = &self.bench_winner {
+                    Some(format!("Selected: {winner}"))
+                } else {
+                    Some(
+                        self.bench_progress
+                            .clone()
+                            .unwrap_or_else(|| "Using default (CPU, 2 threads)".to_owned()),
+                    )
+                };
+                let back = action_button("tour-measuring-back", "Back", true)
+                    .on_click(cx.listener(|this, _, _, cx| this.nav(StepEvent::NavBack, cx)));
+                base()
+                    .child(div().text_size(px(26.)).child("Measuring your machine"))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .child(
+                                "Timing a short sample on each engine so Amanuensis picks the fastest.",
+                            ),
+                    )
+                    .children(status.map(|status| {
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(0xd8d8d8))
+                            .child(status)
+                    }))
+                    .children(self.bench_busy.then(|| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x909090))
+                            .child("You can skip — it uses the CPU default.")
+                    }))
+                    .child(if self.bench_busy {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(back)
+                            .child(action_button("tour-measuring-busy", "Measuring…", false))
+                            .child(
+                                action_button("tour-measuring-skip", "Skip", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.skip_bench(cx))),
+                            )
+                    } else {
+                        tour_footer(
+                            Some(back),
+                            primary_button(
+                                "tour-measuring-next",
+                                "Next",
+                                cx.listener(|this, _, _, cx| this.nav(StepEvent::NavNext, cx)),
+                            ),
+                        )
+                    })
+            }
             SetupStep::Ready => base()
                 .child(div().text_size(px(26.)).child("You're all set — try it."))
                 .child(
@@ -695,6 +918,56 @@ impl Render for OnboardingView {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_tray(cx))),
                     ),
             )
+            .child({
+                let cached = config::load().unwrap_or_default().backend_cache.asr;
+                let profile = &self.profile;
+                let description = if self.bench_run {
+                    "Benchmarking backend…".to_owned()
+                } else if !cached.provider.is_empty() {
+                    format!(
+                        "{} · {} threads · {:.2}x realtime",
+                        cached.provider, cached.threads, cached.win_rtf
+                    )
+                } else {
+                    "Not selected yet".to_owned()
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Audio backend"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x808080))
+                                    .child(description),
+                            )
+                            .child(div().text_size(px(10.)).text_color(rgb(0x606060)).child(
+                                format!("{} · {}", profile.vendor.label(), profile.gpu_label),
+                            )),
+                    )
+                    .child(
+                        action_button(
+                            "recheck-backend",
+                            if self.bench_run {
+                                "Benchmarking…"
+                            } else {
+                                "Re-check"
+                            },
+                            !self.bench_run,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.recheck_backend(cx))),
+                    )
+            })
             .children(
                 ((self.origin == SetupOrigin::Recovery) && !self.downloading).then(|| {
                     div()

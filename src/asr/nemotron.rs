@@ -5,7 +5,7 @@ use sherpa_onnx::{
 };
 
 use super::model::ModelPaths;
-use super::{AsrBackend, threads};
+use super::{AsrBackend, provider, threads};
 
 const SAMPLE_RATE: i32 = 16000;
 const FEATURE_DIM: i32 = 128;
@@ -17,7 +17,11 @@ pub struct NemotronBackend {
 }
 
 impl NemotronBackend {
-    pub fn load(model: &ModelPaths) -> Option<Self> {
+    pub fn load(
+        model: &ModelPaths,
+        preferred_provider: Option<&str>,
+        preferred_threads: i32,
+    ) -> Option<Self> {
         let mut config = OnlineRecognizerConfig::default();
         config.feat_config.sample_rate = SAMPLE_RATE;
         config.feat_config.feature_dim = FEATURE_DIM;
@@ -27,7 +31,10 @@ impl NemotronBackend {
             joiner: Some(path_string(&model.joiner)),
         };
         config.model_config.tokens = Some(path_string(&model.tokens));
-        config.model_config.num_threads = threads();
+        config.model_config.num_threads = threads(preferred_threads);
+        if let Some(provider) = provider(preferred_provider) {
+            config.model_config.provider = Some(provider);
+        }
         config.decoding_method = Some("greedy_search".to_string());
         config.enable_endpoint = false;
         OnlineRecognizer::create(&config).map(|recognizer| Self {

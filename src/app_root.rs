@@ -4,9 +4,11 @@ use std::{
 };
 
 use amanuensis::asr::{
-    Command, Event, ModelKind, ModelSelection, kind_by_id, repo_cache_dir_for, spec_by_id,
+    Command, Event, ModelKind, ModelSelection, is_model_cached, kind_by_id, repo_cache_dir_for,
+    spec_by_id,
 };
 use amanuensis::audio;
+use amanuensis::backend_detect;
 use amanuensis::config::{self, AppConfig};
 use amanuensis::esc_hook::EscHook;
 use amanuensis::log;
@@ -454,6 +456,40 @@ impl AppRoot {
                     view.update(cx, |onboarding, cx| onboarding.delete_finished(result, cx));
                 }
             }
+            UiMessage::RecheckBackend => {
+                let ui = self.ui.clone();
+                thread::spawn(move || {
+                    let winner = backend_detect::run_backend_bench();
+                    let _ = ui.send(UiMessage::BackendBenchFinished(winner));
+                });
+            }
+            UiMessage::BenchProgress(progress) => match self.screen.clone() {
+                Screen::Onboarding { view, .. } => {
+                    view.update(cx, |onboarding, cx| {
+                        onboarding.on_bench_progress(progress, cx)
+                    });
+                }
+                Screen::Dictation => {
+                    log!(
+                        "app",
+                        "backend bench progress dropped while dictating: {progress:?}"
+                    );
+                }
+            },
+            UiMessage::BackendBenchFinished(winner) => match self.screen.clone() {
+                Screen::Onboarding { view, .. } => {
+                    view.update(cx, |onboarding, cx| {
+                        onboarding.on_bench_finished(winner, cx)
+                    });
+                }
+                Screen::Dictation => {
+                    log!(
+                        "app",
+                        "backend bench finished while dictating: winner={:?}",
+                        winner
+                    );
+                }
+            },
             UiMessage::ResetSetup { captured_model } => self.reset_setup(captured_model, cx),
             UiMessage::PillDiscard => {
                 if let Some(dictation) = self.dictation.clone() {
@@ -548,6 +584,7 @@ impl AppRoot {
         let config = AppConfig {
             model: model.spec().id.to_owned(),
             tray_enabled: config::load().map_or(true, |existing| existing.tray_enabled),
+            ..config::load().unwrap_or_default()
         };
         match config::save(&config) {
             Ok(()) => log!("app", "config saved: model={}", config.model),
@@ -572,10 +609,24 @@ impl AppRoot {
             cx.notify();
             return;
         }
-        let selection = ModelSelection { model };
+        let cache = config::load().map(|c| c.backend_cache).unwrap_or_default();
+        let profile = backend_detect::detect_hardware();
+        if is_model_cached("nemotron") && backend_detect::needs_bench(&cache.asr, &profile) {
+            log!("app", "post-onboarding backend bench scheduled");
+            std::thread::spawn(backend_detect::run_backend_bench);
+        }
+        let selection = ModelSelection {
+            model,
+            provider: (!cache.asr.provider.is_empty()).then(|| cache.asr.provider.clone()),
+            threads: if cache.asr.threads > 0 {
+                cache.asr.threads
+            } else {
+                2
+            },
+        };
+        log!("app", "worker spawned with selection {selection:?}");
         let commands = amanuensis::asr::spawn_worker(self.events.clone(), selection);
         self.worker_live = true;
-        log!("app", "worker spawned with selection {selection:?}");
         let pending_start = std::mem::replace(&mut self.pending_start, false);
         let dictation = cx.new(|_| {
             Dictation::new(
@@ -634,7 +685,18 @@ pub(crate) fn selection_from_config(config: &AppConfig) -> ModelSelection {
         );
         fallback
     });
-    ModelSelection { model }
+    let cached = &config.backend_cache.asr;
+    let provider = (!cached.provider.is_empty()).then(|| cached.provider.clone());
+    let threads = if cached.threads > 0 {
+        cached.threads
+    } else {
+        2
+    };
+    ModelSelection {
+        model,
+        provider,
+        threads,
+    }
 }
 
 pub(crate) fn detect_device() -> (u32, usize) {

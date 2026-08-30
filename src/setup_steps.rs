@@ -5,6 +5,8 @@ pub enum SetupStep {
     Shortcuts,
     MicCheck,
     Downloading,
+    DetectHardware,
+    Measuring,
     Ready,
 }
 
@@ -27,9 +29,13 @@ pub fn next_step(step: SetupStep, event: StepEvent) -> Option<SetupStep> {
         (SetupStep::Shortcuts, StepEvent::NavBack) => Some(SetupStep::HowItWorks),
         (SetupStep::MicCheck, StepEvent::NavBack) => Some(SetupStep::Shortcuts),
         (SetupStep::MicCheck, StepEvent::StartDownload) => Some(SetupStep::Downloading),
-        (SetupStep::Downloading, StepEvent::DownloadFinished) => Some(SetupStep::Ready),
+        (SetupStep::Downloading, StepEvent::DownloadFinished) => Some(SetupStep::DetectHardware),
         (SetupStep::Downloading, StepEvent::DownloadCancelled) => Some(SetupStep::MicCheck),
         (SetupStep::Downloading, StepEvent::DownloadFailed) => Some(SetupStep::MicCheck),
+        (SetupStep::DetectHardware, StepEvent::NavNext) => Some(SetupStep::Measuring),
+        (SetupStep::DetectHardware, StepEvent::NavBack) => Some(SetupStep::MicCheck),
+        (SetupStep::Measuring, StepEvent::NavNext) => Some(SetupStep::Ready),
+        (SetupStep::Measuring, StepEvent::NavBack) => Some(SetupStep::DetectHardware),
         _ => None,
     }
 }
@@ -67,14 +73,34 @@ mod tests {
     }
 
     #[test]
-    fn mic_check_start_walks_download_to_ready() {
+    fn mic_check_start_walks_download_to_ready_via_bench_steps() {
         assert_eq!(
             next_step(SetupStep::MicCheck, StepEvent::StartDownload),
             Some(SetupStep::Downloading)
         );
         assert_eq!(
             next_step(SetupStep::Downloading, StepEvent::DownloadFinished),
+            Some(SetupStep::DetectHardware)
+        );
+        assert_eq!(
+            next_step(SetupStep::DetectHardware, StepEvent::NavNext),
+            Some(SetupStep::Measuring)
+        );
+        assert_eq!(
+            next_step(SetupStep::Measuring, StepEvent::NavNext),
             Some(SetupStep::Ready)
+        );
+    }
+
+    #[test]
+    fn hardware_and_measuring_navigate_back() {
+        assert_eq!(
+            next_step(SetupStep::DetectHardware, StepEvent::NavBack),
+            Some(SetupStep::MicCheck)
+        );
+        assert_eq!(
+            next_step(SetupStep::Measuring, StepEvent::NavBack),
+            Some(SetupStep::DetectHardware)
         );
     }
 
@@ -104,6 +130,15 @@ mod tests {
         assert_eq!(next_step(SetupStep::Ready, StepEvent::StartDownload), None);
         assert_eq!(
             next_step(SetupStep::Ready, StepEvent::DownloadCancelled),
+            None
+        );
+        assert_eq!(next_step(SetupStep::Ready, StepEvent::NavNext), None);
+        assert_eq!(
+            next_step(SetupStep::Measuring, StepEvent::DownloadFinished),
+            None
+        );
+        assert_eq!(
+            next_step(SetupStep::DetectHardware, StepEvent::StartDownload),
             None
         );
         assert_eq!(next_step(SetupStep::Downloading, StepEvent::NavBack), None);

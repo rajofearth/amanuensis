@@ -4,11 +4,53 @@ use serde::{Deserialize, Serialize};
 
 use crate::log;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AsrCacheEntry {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub threads: i32,
+    #[serde(default)]
+    pub win_rtf: f32,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub cached_at: String,
+    #[serde(default)]
+    pub device_hash: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NormalizerCacheEntry {
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub device: String,
+    #[serde(default)]
+    pub win_ms: u64,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub cached_at: String,
+    #[serde(default)]
+    pub device_hash: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackendCache {
+    #[serde(default)]
+    pub asr: AsrCacheEntry,
+    #[serde(default)]
+    pub normalizer: NormalizerCacheEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub model: String,
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
+    #[serde(default)]
+    pub backend_cache: BackendCache,
 }
 
 fn default_tray_enabled() -> bool {
@@ -20,6 +62,7 @@ impl Default for AppConfig {
         Self {
             model: "nemotron".to_owned(),
             tray_enabled: true,
+            backend_cache: BackendCache::default(),
         }
     }
 }
@@ -110,10 +153,53 @@ mod tests {
         let written = AppConfig {
             model: "nemotron".to_owned(),
             tray_enabled: true,
+            backend_cache: BackendCache {
+                asr: AsrCacheEntry {
+                    provider: "cpu".to_owned(),
+                    threads: 4,
+                    win_rtf: 0.84,
+                    app_version: "1.0.3".to_owned(),
+                    cached_at: "2026-08-29".to_owned(),
+                    device_hash: "abcdef".to_owned(),
+                },
+                ..Default::default()
+            },
         };
         save_to(&path, &written).expect("save");
         let loaded = load_from(&path).expect("load after save");
         assert_eq!(loaded, written);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_backend_cache_defaults_to_empty() {
+        let path = temp_path("nocache");
+        std::fs::write(&path, r#"{"model":"nemotron","tray_enabled":true}"#).unwrap();
+        let loaded = load_from(&path).expect("load");
+        assert_eq!(loaded.backend_cache, BackendCache::default());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_or_unknown_cache_fields_do_not_break_serde() {
+        let path = temp_path("partialcache");
+        std::fs::write(
+            &path,
+            r#"{
+                "model":"nemotron",
+                "tray_enabled":true,
+                "backend_cache":{
+                    "asr":{"provider":"cuda","threads":2},
+                    "normalizer":{"backend":"cpu","future_field":"ignored"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_from(&path).expect("load with partial cache");
+        assert_eq!(loaded.backend_cache.asr.provider, "cuda");
+        assert_eq!(loaded.backend_cache.asr.threads, 2);
+        assert_eq!(loaded.backend_cache.asr.app_version, "");
+        assert_eq!(loaded.backend_cache.normalizer.backend, "cpu");
         let _ = std::fs::remove_file(path);
     }
 

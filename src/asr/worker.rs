@@ -22,15 +22,23 @@ pub enum Command {
     SetModel(ModelKind),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
     pub model: ModelKind,
+    /// sherpa provider string; `None` means the default (cpu). Env
+    /// `ASR_PROVIDER` overrides this at recognizer load time.
+    pub provider: Option<String>,
+    /// Thread count for the recognizer. Env `ASR_THREADS` overrides this at
+    /// recognizer load time.
+    pub threads: i32,
 }
 
 impl Default for ModelSelection {
     fn default() -> Self {
         Self {
             model: ModelKind::Nemotron,
+            provider: None,
+            threads: 2,
         }
     }
 }
@@ -62,7 +70,8 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
 
     let _ = events.send(Event::LoadingProgress("loading recognizer".to_owned()));
     let started = Instant::now();
-    let Some(mut backend) = load_backend(&paths) else {
+    let Some(mut backend) = load_backend(&paths, selection.provider.as_deref(), selection.threads)
+    else {
         log!("asr", "ERROR: OnlineRecognizer::create returned None");
         let _ = events.send(Event::LoadingProgress("load failed".to_owned()));
         return;
@@ -196,7 +205,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                     return;
                 };
                 let reload_started = Instant::now();
-                match load_backend(&paths) {
+                match load_backend(&paths, selection.provider.as_deref(), selection.threads) {
                     Some(reloaded) => {
                         backend = reloaded;
                         cached_paths = Some(paths);
@@ -239,6 +248,8 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                     &mut cached_paths,
                     session_samples,
                     &events,
+                    selection.provider.as_deref(),
+                    selection.threads,
                 ) {
                     SwapOutcome::Swapped | SwapOutcome::FetchFailed => {}
                     SwapOutcome::Fatal => return,
@@ -264,6 +275,8 @@ fn load_and_swap(
     cached: &mut Option<ModelPaths>,
     session_samples: usize,
     events: &Sender<Event>,
+    provider: Option<&str>,
+    threads: i32,
 ) -> SwapOutcome {
     if *active {
         *active = false;
@@ -284,7 +297,7 @@ fn load_and_swap(
         "loading {kind:?} recognizer"
     )));
     let load_started = Instant::now();
-    let Some(new_backend) = load_backend(&new_paths) else {
+    let Some(new_backend) = load_backend(&new_paths, provider, threads) else {
         log!(
             "asr",
             "ERROR: swap to {kind:?} failed, create returned None"
@@ -331,8 +344,12 @@ fn fetch_paths(kind: ModelKind, events: &Sender<Event>) -> Option<ModelPaths> {
     }
 }
 
-fn load_backend(paths: &ModelPaths) -> Option<Box<dyn AsrBackend>> {
-    NemotronBackend::load(paths).map(|backend| Box::new(backend) as _)
+fn load_backend(
+    paths: &ModelPaths,
+    provider: Option<&str>,
+    threads: i32,
+) -> Option<Box<dyn AsrBackend>> {
+    NemotronBackend::load(paths, provider, threads).map(|backend| Box::new(backend) as _)
 }
 
 fn resident_mib() -> f64 {

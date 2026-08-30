@@ -13,6 +13,7 @@ use std::{sync::mpsc, thread, time::Duration};
 
 use amanuensis::asr::{self, Event, is_model_cached};
 use amanuensis::audio;
+use amanuensis::backend_detect;
 use amanuensis::config;
 use amanuensis::esc_hook;
 use amanuensis::installer::{self, LaunchMode};
@@ -43,6 +44,10 @@ const WINDOW_TITLE: &str = "amanuensis-window";
 
 fn main() {
     logging::init();
+    if std::env::args().any(|argument| argument == backend_detect::PROBE_FLAG) {
+        let code = amanuensis::backend_detect::probe_child();
+        std::process::exit(code);
+    }
     match installer::detect_mode() {
         LaunchMode::App => {}
         mode => {
@@ -127,6 +132,7 @@ fn main() {
                     let recovered = config::AppConfig {
                         model: model.spec().id.to_owned(),
                         tray_enabled: true,
+                        ..Default::default()
                     };
                     match config::save(&recovered) {
                         Ok(()) => {
@@ -144,6 +150,22 @@ fn main() {
                     .map_or(true, |config| config.tray_enabled);
                 let tray = TrayController::spawn(ui_sender.clone(), tray_enabled);
                 let device = detect_device();
+
+                // Optional background ASR backend benchmark. Runs only once the
+                // model is cached and the cached pick is stale; the winner is
+                // persisted for the next launch. Never blocks the pending-start
+                // path: the UI/worker are spawned regardless, on this thread.
+                if is_model_cached("nemotron") {
+                    let cached_asr = loaded_config
+                        .as_ref()
+                        .map(|config| config.backend_cache.asr.clone())
+                        .unwrap_or_default();
+                    let profile = backend_detect::detect_hardware();
+                    if backend_detect::needs_bench(&cached_asr, &profile) {
+                        log!("app", "background backend bench scheduled");
+                        std::thread::spawn(backend_detect::run_backend_bench);
+                    }
+                }
 
                 let (dictation, commands, screen) = match loaded_config {
                     Some(config) => {

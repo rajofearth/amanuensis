@@ -1,5 +1,6 @@
 pub mod asr;
 pub mod audio;
+pub mod backend_detect;
 pub mod config;
 pub mod esc_hook;
 pub mod installer;

@@ -49,7 +49,7 @@ fn main() {
     print!("loading backend once ... ");
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
     let load_started = Instant::now();
-    let mut backend = NemotronBackend::load(&paths).expect("backend load returned None");
+    let mut backend = NemotronBackend::load(&paths, None, 2).expect("backend load returned None");
     println!(
         "{:.2}s resident {:.0} MiB",
         load_started.elapsed().as_secs_f64(),

@@ -25,9 +25,21 @@ pub trait AsrBackend {
     fn finalize(&mut self) -> String;
 }
 
-pub(crate) fn threads() -> i32 {
+/// Thread count for the ASR recognizer. `ASR_THREADS` is the highest-priority
+/// override; otherwise the caller-chosen `preferred` wins, defaulting to 2.
+pub(crate) fn threads(preferred: i32) -> i32 {
     std::env::var("ASR_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(2)
+        .unwrap_or(preferred)
+}
+
+/// Recognizer execution provider. `ASR_PROVIDER` is the highest-priority
+/// override; otherwise the caller-chosen `preferred` provider wins.
+pub(crate) fn provider(preferred: Option<&str>) -> Option<String> {
+    std::env::var("ASR_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .or_else(|| preferred.map(str::to_owned))
 }
