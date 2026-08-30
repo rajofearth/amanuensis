@@ -1,5 +1,5 @@
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use amanuensis::asr::fetch::{
     EtaTracker, path_is_dir, progress_status, progress_summary, speed_summary,
@@ -8,7 +8,7 @@ use amanuensis::asr::{
     DownloadProgress, ModelSpec, cache_dir_for, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
 };
-use amanuensis::backend_detect::{self, BenchProgress, HardwareProfile};
+use amanuensis::backend_detect::{self, BenchProgress, BenchResult, HardwareProfile};
 use amanuensis::config::{self, AppConfig};
 use amanuensis::log;
 use amanuensis::setup_steps::{SetupStep, StepEvent, next_step};
@@ -49,11 +49,13 @@ pub(crate) struct OnboardingView {
     mic_peak: f32,
     bench_run: bool,
     profile: HardwareProfile,
-    bench_progress: Option<String>,
+    bench_results: Vec<BenchResult>,
     bench_winner: Option<String>,
+    bench_winner_result: Option<BenchResult>,
     bench_busy: bool,
     bench_skipped: bool,
     bench_started: bool,
+    measuring_pulse: usize,
     ui: mpsc::Sender<UiMessage>,
 }
 
@@ -85,11 +87,13 @@ impl OnboardingView {
             mic_peak: 0.0,
             bench_run: false,
             profile: backend_detect::detect_hardware(),
-            bench_progress: None,
+            bench_results: Vec::new(),
             bench_winner: None,
+            bench_winner_result: None,
             bench_busy: false,
             bench_skipped: false,
             bench_started: false,
+            measuring_pulse: 0,
             ui,
         }
     }
@@ -170,7 +174,11 @@ impl OnboardingView {
         }
         self.bench_started = true;
         self.bench_busy = true;
-        self.bench_progress = None;
+        self.bench_winner = None;
+        self.bench_winner_result = None;
+        self.bench_results.clear();
+        self.measuring_pulse = 0;
+        self.pulse_measuring(cx);
         log!("app", "onboarding bench started on background thread");
         let ui = self.ui.clone();
         std::thread::spawn(move || {
@@ -202,6 +210,24 @@ impl OnboardingView {
         cx.notify();
     }
 
+    fn pulse_measuring(&mut self, cx: &mut Context<Self>) {
+        if !self.bench_busy {
+            return;
+        }
+        let interval = Duration::from_millis(350);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(interval).await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| {
+                    this.measuring_pulse += 1;
+                    this.pulse_measuring(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn on_bench_progress(&mut self, progress: BenchProgress, cx: &mut Context<Self>) {
         if self.bench_skipped {
             if matches!(progress, BenchProgress::Finished { .. }) {
@@ -224,15 +250,35 @@ impl OnboardingView {
                 provider, threads, ..
             } => {
                 self.bench_busy = true;
-                self.bench_progress = Some(format!("Measuring {provider} · {threads} threads"));
+                log!("app", "bench measuring {provider} · {threads} threads");
+            }
+            BenchProgress::Measured(result) => {
+                self.bench_results.push(result);
+                self.bench_results.sort_by(|a, b| {
+                    a.rtf
+                        .partial_cmp(&b.rtf)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                log!(
+                    "app",
+                    "bench result appended; live leaderboard has {} ranked results",
+                    self.bench_results.len()
+                );
             }
             BenchProgress::Finished { winner } => {
                 self.bench_busy = false;
                 match winner {
                     Some(provider) => {
-                        let threads = config::load().unwrap_or_default().backend_cache.asr.threads;
+                        let config = config::load().unwrap_or_default();
+                        let threads = config.backend_cache.asr.threads;
                         let threads = if threads > 0 { threads } else { 2 };
-                        self.bench_winner = Some(format!("{provider} · {threads} threads"));
+                        self.bench_winner = Some(bench_label(&provider, threads));
+                        self.bench_winner_result = Some(BenchResult {
+                            provider: provider.clone(),
+                            threads,
+                            is_gpu: provider == "cuda",
+                            rtf: config.backend_cache.asr.win_rtf,
+                        });
                         log!(
                             "app",
                             "onboarding bench finished: winner={provider} threads={threads}"
@@ -240,8 +286,8 @@ impl OnboardingView {
                     }
                     None => {
                         self.bench_winner = None;
-                        self.bench_progress =
-                            Some("No measurable backend — CPU default will be used.".to_owned());
+                        self.bench_winner_result = None;
+                        log!("app", "onboarding bench finished: no winner recorded");
                     }
                 }
             }
@@ -705,22 +751,42 @@ impl OnboardingView {
             }
             SetupStep::DetectHardware => {
                 let profile = &self.profile;
+                let graphics = bench_graphics_line(profile);
                 base()
-                    .child(div().text_size(px(26.)).child("Detecting hardware"))
+                    .child(div().text_size(px(26.)).child("A quick look at your setup"))
                     .child(
                         div()
                             .text_size(px(14.))
-                            .child(format!(
-                                "{} · {}",
-                                profile.vendor.label(),
-                                profile.gpu_label
-                            )),
+                            .child(detect_heading(profile)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .border_1()
+                            .border_color(rgb(0x2e2e2e))
+                            .px(px(14.))
+                            .py(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Graphics"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .child(graphics),
+                            ),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(0x909090))
-                            .child("Amanuensis auto-measures the fastest engine for this device."),
+                            .child(
+                                "Next I'll time a quick sample on each engine and pick the fastest one for your machine.",
+                            ),
                     )
                     .child(tour_footer(
                         Some(action_button("tour-hardware-back", "Back", true).on_click(
@@ -734,53 +800,212 @@ impl OnboardingView {
                     ))
             }
             SetupStep::Measuring => {
-                let status = if self.bench_skipped {
-                    Some("Using default (CPU, 2 threads)".to_owned())
-                } else if self.bench_busy {
-                    self.bench_progress
-                        .clone()
-                        .or_else(|| Some("Measuring…".to_owned()))
-                } else if let Some(winner) = &self.bench_winner {
-                    Some(format!("Selected: {winner}"))
-                } else {
-                    Some(
-                        self.bench_progress
-                            .clone()
-                            .unwrap_or_else(|| "Using default (CPU, 2 threads)".to_owned()),
-                    )
-                };
+                let results = &self.bench_results;
+                let expected = backend_detect::candidates_for(&self.profile).len();
+                let fastest = results
+                    .first()
+                    .map(|result| result.rtf)
+                    .filter(|rtf| rtf.is_finite() && *rtf > 0.0)
+                    .unwrap_or(1.0);
+                let waiting = self.bench_busy;
+                let dots = ".".repeat((self.measuring_pulse % 3) + 1);
                 let back = action_button("tour-measuring-back", "Back", true)
                     .on_click(cx.listener(|this, _, _, cx| this.nav(StepEvent::NavBack, cx)));
                 base()
-                    .child(div().text_size(px(26.)).child("Measuring your machine"))
+                    .child(div().text_size(px(26.)).child("Finding your fastest engine"))
                     .child(
                         div()
                             .text_size(px(14.))
                             .child(
-                                "Timing a short sample on each engine so Amanuensis picks the fastest.",
+                                "I'm timing a short sample on each engine. The list below fills in as each one finishes, fastest first.",
                             ),
                     )
-                    .children(status.map(|status| {
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .border_1()
+                            .border_color(rgb(0x2e2e2e))
+                            .px(px(14.))
+                            .py(px(12.))
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .child(div().size(px(22.)))
+                                    .child(
+                                        div()
+                                            .w(px(150.))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(0x606060))
+                                            .child("Engine"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(0x606060))
+                                            .child("Speed"),
+                                    ),
+                            )
+                            .children(
+                                results.iter().enumerate().map(|(index, result)| {
+                                    let rank = index + 1;
+                                    let fraction = bench_bar_fraction(result, fastest);
+                                    let winner_row = self
+                                        .bench_winner_result
+                                        .as_ref()
+                                        .is_some_and(|winner| {
+                                            winner.provider == result.provider
+                                                && winner.threads == result.threads
+                                        });
+                                    let fastest_row = result.rtf <= fastest;
+                                    let fill = if fastest_row {
+                                        rgb(0x4c9f6e)
+                                    } else {
+                                        rgb(0x6b7280)
+                                    };
+                                    let tag = if winner_row {
+                                        "Selected".to_owned()
+                                    } else if fastest_row {
+                                        "Fastest".to_owned()
+                                    } else if result.rtf.is_finite() && result.rtf > 0.0 {
+                                        format!("{:.1}x slower", result.rtf / fastest)
+                                    } else {
+                                        String::new()
+                                    };
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.))
+                                        .child(
+                                            div()
+                                                .size(px(22.))
+                                                .border_1()
+                                                .border_color(rgb(0x2e2e2e))
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .text_color(if winner_row {
+                                                    rgb(0x9fe0b8)
+                                                } else {
+                                                    rgb(0x909090)
+                                                })
+                                                .child(format!("{rank}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(150.))
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .text_color(if winner_row {
+                                                    rgb(0x9fe0b8)
+                                                } else {
+                                                    rgb(0xe5e7eb)
+                                                })
+                                                .child(bench_label(&result.provider, result.threads)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .h(px(6.))
+                                                .bg(rgb(0x17191d))
+                                                .child(
+                                                    div()
+                                                        .h(px(6.))
+                                                        .bg(fill)
+                                                        .w(relative(fraction)),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .w(px(72.))
+                                                .justify_end()
+                                                .text_size(px(11.))
+                                                .text_color(if winner_row {
+                                                    rgb(0x9fe0b8)
+                                                } else {
+                                                    rgb(0x909090)
+                                                })
+                                                .child(tag),
+                                        )
+                                }),
+                            )
+                            .children((results.is_empty()).then(|| {
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0x606060))
+                                    .child("Results will appear here as each engine is measured.")
+                            })),
+                    )
+                    .children(if waiting {
+                        Some(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(rgb(0xd8d8d8))
+                                        .child(format!("Measuring{dots}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(0x606060))
+                                        .child(if results.len() >= expected {
+                                            "Almost done, just wrapping up.".to_owned()
+                                        } else {
+                                            "This usually takes a few seconds.".to_owned()
+                                        }),
+                                ),
+                        )
+                    } else {
+                        None
+                    })
+                    .children((!waiting && self.bench_skipped).then(|| {
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(0xd8d8d8))
-                            .child(status)
+                            .child("Using the CPU default.")
                     }))
-                    .children(self.bench_busy.then(|| {
+                    .children(
+                        (!waiting && !self.bench_skipped)
+                            .then(|| {
+                                self.bench_winner.as_ref().map(|winner| {
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(rgb(0x9fe0b8))
+                                        .child(format!("Done. I'll use {winner}."))
+                                })
+                            })
+                            .flatten(),
+                    )
+                    .children((!waiting && !self.bench_skipped && self.bench_winner.is_none()).then(|| {
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(0xd8d8d8))
+                            .child("I'll start you on the CPU default.")
+                    }))
+                    .children(waiting.then(|| {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(0x909090))
-                            .child("You can skip — it uses the CPU default.")
+                            .child("You can stop early and use the CPU default.")
                     }))
-                    .child(if self.bench_busy {
+                    .child(if waiting {
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.))
                             .child(back)
-                            .child(action_button("tour-measuring-busy", "Measuring…", false))
                             .child(
-                                action_button("tour-measuring-skip", "Skip", true)
+                                action_button("tour-measuring-skip", "Use CPU default", true)
                                     .on_click(cx.listener(|this, _, _, cx| this.skip_bench(cx))),
                             )
                     } else {
@@ -1142,6 +1367,51 @@ fn tour_footer(back: Option<Stateful<Div>>, primary: Stateful<Div>) -> Div {
         .gap(px(8.))
         .children(back)
         .child(primary)
+}
+
+fn detect_heading(profile: &HardwareProfile) -> String {
+    if matches!(profile.vendor, backend_detect::Vendor::Nvidia) {
+        format!(
+            "I found an {} graphics card. I'll check whether it can make dictation faster.",
+            profile.vendor.label()
+        )
+    } else {
+        "I'll tune the engine to make the most of this CPU.".to_owned()
+    }
+}
+
+fn bench_graphics_line(profile: &HardwareProfile) -> String {
+    if matches!(profile.vendor, backend_detect::Vendor::Nvidia) {
+        if profile.gpu_label.trim().is_empty() {
+            profile.vendor.label().to_owned()
+        } else {
+            profile.gpu_label.clone()
+        }
+    } else {
+        "CPU only".to_owned()
+    }
+}
+
+fn bench_label(provider: &str, threads: i32) -> String {
+    match provider {
+        "cuda" => "NVIDIA (GPU)".to_owned(),
+        _ => {
+            let cores = if threads == 1 {
+                "1 core".to_owned()
+            } else {
+                format!("{threads} cores")
+            };
+            format!("CPU · {cores}")
+        }
+    }
+}
+
+fn bench_bar_fraction(result: &BenchResult, fastest_rtf: f32) -> f32 {
+    if result.rtf.is_finite() && result.rtf > 0.0 && fastest_rtf.is_finite() && fastest_rtf > 0.0 {
+        (fastest_rtf / result.rtf).min(1.0)
+    } else {
+        0.0
+    }
 }
 
 fn numbered_row(index: usize, text: &'static str) -> Div {

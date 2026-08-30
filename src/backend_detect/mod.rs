@@ -93,7 +93,7 @@ pub struct BenchResult {
 }
 
 /// Live progress surfaced to the UI while a benchmark runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BenchProgress {
     /// A candidate is about to be measured (cooldown + probe run).
     Measuring {
@@ -101,6 +101,8 @@ pub enum BenchProgress {
         threads: i32,
         is_gpu: bool,
     },
+    /// A candidate finished measuring; the UI can rank/wins live from these.
+    Measured(BenchResult),
     /// The full bench finished; the winner (or None if skipped/failed) is set.
     Finished { winner: Option<String> },
 }
@@ -534,7 +536,7 @@ pub fn run_backend_bench_with<F: FnMut(BenchProgress)>(on_progress: &mut F) -> O
     // Cooldown between candidates keeps back-to-back decodes from thermally
     // skewing results. (The ticket's full 30 s is impractical for a live
     // onboarding bench; this is a lighter-but-much-larger-than-nothing gap.)
-    let cooldown = std::time::Duration::from_millis(1500);
+    let cooldown = std::time::Duration::from_millis(700);
     let mut results = Vec::new();
     let mut aborted = false;
     for candidate in &candidates {
@@ -576,12 +578,14 @@ pub fn run_backend_bench_with<F: FnMut(BenchProgress)>(on_progress: &mut F) -> O
             aborted = true;
             break;
         }
-        results.push(BenchResult {
+        let measured = BenchResult {
             provider: candidate.provider.clone(),
             threads: candidate.threads,
             is_gpu: candidate.is_gpu,
             rtf,
-        });
+        };
+        results.push(measured.clone());
+        on_progress(BenchProgress::Measured(measured));
         log!(
             "backend",
             "candidate {} threads={} rtf={rtf:.3}",
