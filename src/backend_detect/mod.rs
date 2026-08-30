@@ -73,6 +73,7 @@ pub struct HardwareProfile {
     pub arch: String,
     pub os: String,
     pub device_hash: String,
+    pub logical_cores: i32,
 }
 
 /// One (provider, thread-count) combination worth bench-marking.
@@ -226,6 +227,9 @@ pub fn detect_hardware() -> HardwareProfile {
         arch,
         os,
         device_hash: hash_device(&canonical),
+        logical_cores: std::thread::available_parallelism()
+            .map(|v| v.get() as i32)
+            .unwrap_or(1),
     }
 }
 
@@ -233,12 +237,41 @@ pub fn detect_hardware() -> HardwareProfile {
 // Candidate matrix
 // ---------------------------------------------------------------------------
 
+/// Build the ascending, deduplicated list of CPU thread counts to sweep.
+/// Always includes 1–4 (3 is an ONNX Runtime sweet spot). For machines with
+/// more than 4 logical cores, scaled representatives are added.
+pub fn cpu_thread_sweep(logical_cores: i32) -> Vec<i32> {
+    use std::collections::BTreeSet;
+    let n = logical_cores.max(1);
+    let mut set = BTreeSet::new();
+    for t in [1, 2, 3, 4] {
+        set.insert(t);
+    }
+    if n > 4 {
+        let quarters = n / 4;
+        let halves = n / 2;
+        for t in [quarters, halves, n] {
+            if t > 4 {
+                set.insert(t);
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Early-bail helper: returns `true` when a CPU candidate should stop the sweep.
+/// After ≥3 CPU measurements, if RTF worsens for 2 consecutive candidates
+/// compared to the best seen, the sweep halts (plateau reached).
+pub fn should_bail_cpu(best_rtf: f32, rtf: f32, regressions: u32) -> bool {
+    rtf > best_rtf * 1.02 && regressions >= 2
+}
+
 /// Seed the candidate set for a host profile. CPU thread counts always feature
 /// (thread count is part of the CPU decision). A GPU candidate is added only
 /// for an NVIDIA x86-64 host; AMD and Snapdragon-class profiles stay on CPU.
 pub fn candidates_for(profile: &HardwareProfile) -> Vec<ProviderCandidate> {
     let mut candidates = Vec::new();
-    for threads in [1, 2, 4] {
+    for threads in cpu_thread_sweep(profile.logical_cores) {
         candidates.push(ProviderCandidate {
             provider: "cpu".to_owned(),
             threads,
@@ -539,7 +572,16 @@ pub fn run_backend_bench_with<F: FnMut(BenchProgress)>(on_progress: &mut F) -> O
     let cooldown = std::time::Duration::from_millis(700);
     let mut results = Vec::new();
     let mut aborted = false;
+    let mut best_cpu_rtf: Option<f32> = None;
+    let mut consecutive_regressions: u32 = 0;
+    let mut cpu_measured: u32 = 0;
+    let mut bail_cpu = false;
     for candidate in &candidates {
+        // Once the CPU sweep plateaus, remaining CPU candidates are skipped so
+        // big machines finish fast. GPU candidates are never bailed.
+        if !candidate.is_gpu && bail_cpu {
+            continue;
+        }
         on_progress(BenchProgress::Measuring {
             provider: candidate.provider.clone(),
             threads: candidate.threads,
@@ -592,6 +634,26 @@ pub fn run_backend_bench_with<F: FnMut(BenchProgress)>(on_progress: &mut F) -> O
             candidate.provider,
             candidate.threads
         );
+        if !candidate.is_gpu {
+            cpu_measured += 1;
+            if let Some(best) = best_cpu_rtf {
+                if rtf > best * 1.02 {
+                    consecutive_regressions += 1;
+                } else {
+                    consecutive_regressions = 0;
+                }
+                best_cpu_rtf = Some(best.min(rtf));
+                if cpu_measured >= 3 && should_bail_cpu(best, rtf, consecutive_regressions) {
+                    log!(
+                        "backend",
+                        "CPU sweep plateaued (2 consecutive regressions at rtf={rtf:.3}); stopping further CPU candidates"
+                    );
+                    bail_cpu = true;
+                }
+            } else {
+                best_cpu_rtf = Some(rtf);
+            }
+        }
     }
     if aborted {
         on_progress(BenchProgress::Finished { winner: None });
@@ -713,6 +775,25 @@ mod tests {
     }
 
     #[test]
+    fn cpu_thread_sweep_reflects_core_count() {
+        assert_eq!(cpu_thread_sweep(4), vec![1, 2, 3, 4]);
+        assert_eq!(cpu_thread_sweep(8), vec![1, 2, 3, 4, 8]);
+        assert_eq!(cpu_thread_sweep(16), vec![1, 2, 3, 4, 8, 16]);
+        assert_eq!(cpu_thread_sweep(64), vec![1, 2, 3, 4, 16, 32, 64]);
+        assert_eq!(cpu_thread_sweep(128), vec![1, 2, 3, 4, 32, 64, 128]);
+    }
+
+    #[test]
+    fn early_bail_requires_two_consecutive_regressions() {
+        assert!(!should_bail_cpu(1.0, 1.01, 1));
+        assert!(should_bail_cpu(1.0, 1.03, 2));
+        assert!(!should_bail_cpu(1.0, 1.01, 2));
+        assert!(should_bail_cpu(1.0, 1.5, 2));
+        // A non-regressed run resets the count, so never bails.
+        assert!(!should_bail_cpu(1.0, 0.9, 2));
+    }
+
+    #[test]
     fn candidates_include_cpu_threads_and_gpu() {
         let profile = HardwareProfile {
             vendor: Vendor::Nvidia,
@@ -720,6 +801,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "abc".to_owned(),
+            logical_cores: 8,
         };
         let candidates = candidates_for(&profile);
         let cpu_threads: Vec<i32> = candidates
@@ -727,7 +809,7 @@ mod tests {
             .filter(|c| c.provider == "cpu")
             .map(|c| c.threads)
             .collect();
-        assert_eq!(cpu_threads, vec![1, 2, 4]);
+        assert_eq!(cpu_threads, vec![1, 2, 3, 4, 8]);
         assert!(candidates.iter().any(|c| c.provider == "cuda" && c.is_gpu));
     }
 
@@ -739,6 +821,7 @@ mod tests {
             arch: "aarch64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "abc".to_owned(),
+            logical_cores: 8,
         };
         let candidates = candidates_for(&profile);
         assert!(!candidates.is_empty());
@@ -754,6 +837,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "abc".to_owned(),
+            logical_cores: 8,
         };
         let candidates = candidates_for(&profile);
         assert!(!candidates.iter().any(|c| c.is_gpu));
@@ -767,6 +851,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "h1".to_owned(),
+            logical_cores: 8,
         };
         let empty = AsrCacheEntry::default();
         assert!(needs_bench(&empty, &profile));
@@ -780,6 +865,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "h2".to_owned(),
+            logical_cores: 8,
         };
         let cached = AsrCacheEntry {
             provider: "cpu".to_owned(),
@@ -800,6 +886,7 @@ mod tests {
             arch: "x86_64".to_owned(),
             os: "windows".to_owned(),
             device_hash: "h1".to_owned(),
+            logical_cores: 8,
         };
         let cached = AsrCacheEntry {
             provider: "cpu".to_owned(),

@@ -55,6 +55,7 @@ pub(crate) struct OnboardingView {
     bench_busy: bool,
     bench_skipped: bool,
     bench_started: bool,
+    bench_running: Option<(String, i32)>,
     measuring_pulse: usize,
     ui: mpsc::Sender<UiMessage>,
 }
@@ -93,6 +94,7 @@ impl OnboardingView {
             bench_busy: false,
             bench_skipped: false,
             bench_started: false,
+            bench_running: None,
             measuring_pulse: 0,
             ui,
         }
@@ -177,6 +179,7 @@ impl OnboardingView {
         self.bench_winner = None;
         self.bench_winner_result = None;
         self.bench_results.clear();
+        self.bench_running = None;
         self.measuring_pulse = 0;
         self.pulse_measuring(cx);
         log!("app", "onboarding bench started on background thread");
@@ -197,6 +200,7 @@ impl OnboardingView {
         }
         self.bench_skipped = true;
         self.bench_busy = false;
+        self.bench_running = None;
         let mut config = config::load().unwrap_or_default();
         config.backend_cache.asr.provider = "cpu".to_owned();
         config.backend_cache.asr.threads = 2;
@@ -250,9 +254,11 @@ impl OnboardingView {
                 provider, threads, ..
             } => {
                 self.bench_busy = true;
+                self.bench_running = Some((provider.clone(), threads));
                 log!("app", "bench measuring {provider} · {threads} threads");
             }
             BenchProgress::Measured(result) => {
+                self.bench_running = None;
                 self.bench_results.push(result);
                 self.bench_results.sort_by(|a, b| {
                     a.rtf
@@ -267,6 +273,7 @@ impl OnboardingView {
             }
             BenchProgress::Finished { winner } => {
                 self.bench_busy = false;
+                self.bench_running = None;
                 match winner {
                     Some(provider) => {
                         let config = config::load().unwrap_or_default();
@@ -800,8 +807,9 @@ impl OnboardingView {
                     ))
             }
             SetupStep::Measuring => {
+                let candidates = backend_detect::candidates_for(&self.profile);
                 let results = &self.bench_results;
-                let expected = backend_detect::candidates_for(&self.profile).len();
+                let expected = candidates.len();
                 let fastest = results
                     .first()
                     .map(|result| result.rtf)
@@ -817,7 +825,7 @@ impl OnboardingView {
                         div()
                             .text_size(px(14.))
                             .child(
-                                "I'm timing a short sample on each engine. The list below fills in as each one finishes, fastest first.",
+                                "I'm timing a short sample on each engine. Every planned test is listed below; rows fill in as each engine finishes.",
                             ),
                     )
                     .child(
@@ -850,74 +858,128 @@ impl OnboardingView {
                                             .child("Speed"),
                                     ),
                             )
-                            .children(
-                                results.iter().enumerate().map(|(index, result)| {
-                                    let rank = index + 1;
-                                    let fraction = bench_bar_fraction(result, fastest);
-                                    let winner_row = self
-                                        .bench_winner_result
-                                        .as_ref()
-                                        .is_some_and(|winner| {
-                                            winner.provider == result.provider
-                                                && winner.threads == result.threads
-                                        });
-                                    let fastest_row = result.rtf <= fastest;
-                                    let fill = if fastest_row {
-                                        rgb(0x4c9f6e)
-                                    } else {
-                                        rgb(0x6b7280)
-                                    };
-                                    let tag = if winner_row {
-                                        "Selected".to_owned()
-                                    } else if fastest_row {
-                                        "Fastest".to_owned()
-                                    } else if result.rtf.is_finite() && result.rtf > 0.0 {
-                                        format!("{:.1}x slower", result.rtf / fastest)
-                                    } else {
-                                        String::new()
-                                    };
-                                    div()
+                            .children(candidates.iter().map(|candidate| {
+                                let done = results
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, result)| {
+                                        result.provider == candidate.provider
+                                            && result.threads == candidate.threads
+                                    })
+                                    .map(|(index, result)| (index + 1, result));
+                                let running = self.bench_running.as_ref().is_some_and(
+                                    |(provider, threads)| {
+                                        provider == &candidate.provider
+                                            && *threads == candidate.threads
+                                    },
+                                );
+                                match done {
+                                    Some((rank, result)) => {
+                                        let fraction = bench_bar_fraction(result, fastest);
+                                        let winner_row = self
+                                            .bench_winner_result
+                                            .as_ref()
+                                            .is_some_and(|winner| {
+                                                winner.provider == result.provider
+                                                    && winner.threads == result.threads
+                                            });
+                                        let fastest_row = result.rtf <= fastest;
+                                        let fill = if fastest_row {
+                                            rgb(0x4c9f6e)
+                                        } else {
+                                            rgb(0x6b7280)
+                                        };
+                                        let tag = if winner_row {
+                                            "Selected".to_owned()
+                                        } else if fastest_row {
+                                            "Fastest".to_owned()
+                                        } else if result.rtf.is_finite() && result.rtf > 0.0 {
+                                            format!("{:.1}x slower", result.rtf / fastest)
+                                        } else {
+                                            String::new()
+                                        };
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .child(
+                                                div()
+                                                    .size(px(22.))
+                                                    .border_1()
+                                                    .border_color(rgb(0x2e2e2e))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_size(px(11.))
+                                                    .text_color(if winner_row {
+                                                        rgb(0x9fe0b8)
+                                                    } else {
+                                                        rgb(0x909090)
+                                                    })
+                                                    .child(format!("{rank}")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(150.))
+                                                    .truncate()
+                                                    .text_size(px(13.))
+                                                    .text_color(if winner_row {
+                                                        rgb(0x9fe0b8)
+                                                    } else {
+                                                        rgb(0xe5e7eb)
+                                                    })
+                                                    .child(bench_label(
+                                                        &result.provider,
+                                                        result.threads,
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .h(px(6.))
+                                                    .bg(rgb(0x17191d))
+                                                    .child(
+                                                        div()
+                                                            .h(px(6.))
+                                                            .bg(fill)
+                                                            .w(relative(fraction)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .w(px(72.))
+                                                    .justify_end()
+                                                    .text_size(px(11.))
+                                                    .text_color(if winner_row {
+                                                        rgb(0x9fe0b8)
+                                                    } else {
+                                                        rgb(0x909090)
+                                                    })
+                                                    .child(tag),
+                                            )
+                                    }
+                                    None if running => div()
                                         .flex()
                                         .items_center()
                                         .gap(px(10.))
-                                        .child(
-                                            div()
-                                                .size(px(22.))
-                                                .border_1()
-                                                .border_color(rgb(0x2e2e2e))
-                                                .items_center()
-                                                .justify_center()
-                                                .text_size(px(11.))
-                                                .text_color(if winner_row {
-                                                    rgb(0x9fe0b8)
-                                                } else {
-                                                    rgb(0x909090)
-                                                })
-                                                .child(format!("{rank}")),
-                                        )
+                                        .bg(rgb(0x14161a))
+                                        .child(div().size(px(22.)))
                                         .child(
                                             div()
                                                 .w(px(150.))
                                                 .truncate()
                                                 .text_size(px(13.))
-                                                .text_color(if winner_row {
-                                                    rgb(0x9fe0b8)
-                                                } else {
-                                                    rgb(0xe5e7eb)
-                                                })
-                                                .child(bench_label(&result.provider, result.threads)),
+                                                .text_color(rgb(0xe5e7eb))
+                                                .child(bench_label(
+                                                    &candidate.provider,
+                                                    candidate.threads,
+                                                )),
                                         )
                                         .child(
                                             div()
                                                 .flex_1()
                                                 .h(px(6.))
-                                                .bg(rgb(0x17191d))
-                                                .child(
-                                                    div()
-                                                        .h(px(6.))
-                                                        .bg(fill)
-                                                        .w(relative(fraction)),
-                                                ),
+                                                .bg(rgb(0x17191d)),
                                         )
                                         .child(
                                             div()
@@ -925,20 +987,41 @@ impl OnboardingView {
                                                 .w(px(72.))
                                                 .justify_end()
                                                 .text_size(px(11.))
-                                                .text_color(if winner_row {
-                                                    rgb(0x9fe0b8)
-                                                } else {
-                                                    rgb(0x909090)
-                                                })
-                                                .child(tag),
+                                                .text_color(rgb(0x7fb2e8))
+                                                .child(format!("Running{dots}")),
+                                        ),
+                                    None => div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.))
+                                        .child(div().size(px(22.)))
+                                        .child(
+                                            div()
+                                                .w(px(150.))
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .text_color(rgb(0x606060))
+                                                .child(bench_label(
+                                                    &candidate.provider,
+                                                    candidate.threads,
+                                                )),
                                         )
-                                }),
-                            )
-                            .children((results.is_empty()).then(|| {
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(0x606060))
-                                    .child("Results will appear here as each engine is measured.")
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .h(px(6.))
+                                                .bg(rgb(0x17191d)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .w(px(72.))
+                                                .justify_end()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(0x606060))
+                                                .child("Waiting"),
+                                        ),
+                                }
                             })),
                     )
                     .children(if waiting {
