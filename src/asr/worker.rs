@@ -266,6 +266,18 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         text,
                         duration_secs,
                     });
+                } else {
+                    // Never leave the UI in Transcribing: a Stop with no live
+                    // session (mic yielded nothing, Start never sent) must
+                    // still answer or the pill spins forever and cancel dies.
+                    log!(
+                        "asr",
+                        "stop with no active session; answering empty (mic may have yielded no audio)"
+                    );
+                    let _ = events.send(Event::Committed {
+                        text: String::new(),
+                        duration_secs: 0.0,
+                    });
                 }
             }
             Ok(Command::ReloadForDebug) => {

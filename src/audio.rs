@@ -39,8 +39,11 @@ pub fn spawn(sender: Sender<Vec<f32>>) -> Recorder {
             match gate_action(was_enabled, enabled) {
                 GateAction::Open => {
                     if stream.is_none() {
-                        if let Err(error) = open_capture(sender.clone()) {
-                            log!("audio", "capture open failed: {error}");
+                        match open_capture(sender.clone()) {
+                            Ok(opened) => stream = Some(opened),
+                            Err(error) => {
+                                log!("audio", "capture open failed: {error}");
+                            }
                         }
                     }
                 }

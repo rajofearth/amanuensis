@@ -1,4 +1,8 @@
-use std::{sync::mpsc, thread, time::Instant};
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::messages::{HotkeyMessage, PasteResult};
 use amanuensis::asr::{Command, Event, Mode};
@@ -158,6 +162,15 @@ impl Dictation {
     }
 
     pub(crate) fn discard_clicked(&mut self, cx: &mut Context<Self>) {
+        if self.phase == Phase::Transcribing {
+            // A Stop is already queued on the serial worker; just mark the
+            // pending commit for drop instead of queueing a second Stop.
+            log!("app", "recording discarded while transcribing");
+            self.discard_requested = true;
+            audio::play(Sound::Cancel);
+            cx.notify();
+            return;
+        }
         if self.phase != Phase::Recording {
             return;
         }
@@ -326,6 +339,16 @@ impl Dictation {
     }
 
     pub(crate) fn push_levels(&mut self, levels: Vec<f32>) {
+        // Let the freshly-opened mic settle: cold-open transients (device
+        // pop, the start blip bleeding back in) would pin the normalizer
+        // peak and shrink every bar for seconds. Display-only; ASR chunks
+        // are untouched.
+        if self
+            .recording_started
+            .is_some_and(|since| since.elapsed() < Duration::from_millis(300))
+        {
+            return;
+        }
         self.waveform.extend(levels);
         let normalized: Vec<f32> = self.waveform.levels().collect();
         let _ = self.pill_cmd.send(PillCommand::Levels(normalized));
