@@ -39,7 +39,11 @@ fn telemetry_dir() -> PathBuf {
 
 fn logs_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("AM_TELEMETRY_DIR") {
-        return PathBuf::from(dir).parent().unwrap().to_path_buf();
+        let p = PathBuf::from(dir);
+        if let Some(parent) = p.parent().filter(|q| !q.as_os_str().is_empty()) {
+            return parent.to_path_buf();
+        }
+        return p;
     }
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -99,6 +103,10 @@ fn log_event(_name: &str, value: &Value) {
     if !CONSENT.load(Ordering::Relaxed) {
         return;
     }
+    write_event(value);
+}
+
+fn write_event(value: &Value) {
     let dir = telemetry_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
         log!("telemetry", "failed to create telemetry dir: {e}");
@@ -538,14 +546,11 @@ pub fn fallback(event: Fallback) {
 }
 
 pub fn consent_event(state: bool) {
-    log_event(
-        "consent",
-        &json!({
-            "event": "consent",
-            "state": state,
-            "ts": utc_timestamp(),
-        }),
-    );
+    write_event(&json!({
+        "event": "consent",
+        "state": state,
+        "ts": utc_timestamp(),
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -652,17 +657,14 @@ pub fn export_logs() -> Result<PathBuf, String> {
     let zip_name = format!("telemetry-manuensis-{version}-{timestamp}.zip");
     let zip_path = base.join(&zip_name);
 
+    let source = tmp.join("*");
     let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-                tmp.join("*").to_string_lossy(),
-                zip_path.to_string_lossy(),
-            ),
-        ])
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg("Compress-Archive -Path $args[0] -DestinationPath $args[1] -Force")
+        .arg(source)
+        .arg(&zip_path)
         .output()
         .map_err(|e| format!("running powershell: {e}"))?;
 

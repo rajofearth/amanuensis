@@ -256,7 +256,9 @@ impl AppRoot {
                             // first captured chunk, never before real audio
                             // exists (the worker drops chunks until Start).
                             if !drained_chunks.is_empty() && !dictation.start_sent {
-                                let _ = dictation.commands.send(Command::Start);
+                                let _ = dictation.commands.send(Command::Start {
+                                    epoch: dictation.epoch,
+                                });
                                 dictation.start_sent = true;
                             }
                             for chunk in drained_chunks {
@@ -604,9 +606,41 @@ impl AppRoot {
         }
         let selection = selection_from_config(&config);
         if self.worker_live {
-            // The worker tracks per-mode engines itself; a live worker only
-            // needs to stay resident. Nothing to remap here.
-            log!("app", "worker already live; using existing selection");
+            // The old SetModel path is gone and the worker bakes its
+            // selection in at spawn, so a newly picked engine needs a fresh
+            // worker. Spawn first, then retire the old one, so the UI is
+            // never left without a worker when the new engine is cached.
+            let record_id = selection.record_model.spec().id;
+            if is_model_cached(record_id) {
+                log!(
+                    "app",
+                    "worker live; switching to newly picked engine {record_id}"
+                );
+                if let Some(dictation) = self.dictation.as_ref() {
+                    let phase = dictation.read(cx).phase;
+                    if matches!(phase, Phase::Recording | Phase::Transcribing) {
+                        log!(
+                            "app",
+                            "WARNING: engine switch drops in-flight audio in phase {phase:?}; old worker's late Committed will be ignored"
+                        );
+                    }
+                }
+                let fresh = amanuensis::asr::spawn_worker(self.events.clone(), selection.clone());
+                if let Some(old) = self.commands.replace(fresh.clone()) {
+                    let _ = old.send(Command::Shutdown);
+                }
+                if let Some(dictation) = self.dictation.clone() {
+                    dictation.update(cx, |dictation, cx| {
+                        dictation.commands = fresh.clone();
+                        cx.notify();
+                    });
+                }
+            } else {
+                log!(
+                    "app",
+                    "worker live; new engine {record_id} not cached, keeping existing worker"
+                );
+            }
             self.pending_start = false;
             self.screen = Screen::Dictation;
             self.hide_pill_window();
@@ -678,8 +712,50 @@ pub(crate) fn selection_from_config(config: &AppConfig) -> ModelSelection {
     } else {
         2
     };
-    let record = kind_by_id(&config.record_model).unwrap_or(ModelKind::Moonshine);
-    let live = kind_by_id(&config.live_model).unwrap_or(ModelKind::Nemotron);
+    let record = match kind_by_id(&config.record_model) {
+        Some(kind) => kind,
+        None => {
+            log!(
+                "app",
+                "ERROR: unknown record_model '{}'; falling back to legacy model '{}'",
+                config.record_model,
+                config.model
+            );
+            match kind_by_id(&config.model) {
+                Some(kind) => kind,
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: unknown legacy model '{}'; using default moonshine",
+                        config.model
+                    );
+                    ModelKind::Moonshine
+                }
+            }
+        }
+    };
+    let live = match kind_by_id(&config.live_model) {
+        Some(kind) => kind,
+        None => {
+            log!(
+                "app",
+                "ERROR: unknown live_model '{}'; falling back to legacy model '{}'",
+                config.live_model,
+                config.model
+            );
+            match kind_by_id(&config.model) {
+                Some(kind) => kind,
+                None => {
+                    log!(
+                        "app",
+                        "ERROR: unknown legacy model '{}'; using default nemotron",
+                        config.model
+                    );
+                    ModelKind::Nemotron
+                }
+            }
+        }
+    };
     let selection = ModelSelection {
         record_model: record,
         live_model: live,

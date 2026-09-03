@@ -13,7 +13,9 @@ use super::{AsrBackend, Mode, ModelKind, ModelPaths};
 
 #[derive(Debug)]
 pub enum Command {
-    Start,
+    Start {
+        epoch: u64,
+    },
     Stop,
     Chunk(Vec<f32>),
     #[allow(dead_code)]
@@ -58,7 +60,11 @@ pub enum Event {
     Ready,
     ModelReady(Mode),
     Partial(String),
-    Committed { text: String, duration_secs: f32 },
+    Committed {
+        text: String,
+        duration_secs: f32,
+        epoch: u64,
+    },
 }
 
 const SESSION_SAMPLE_RATE: usize = 16_000;
@@ -114,6 +120,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
     let mut loaded_kind = wanted;
 
     let mut active = false;
+    let mut session_epoch: u64 = 0;
     let mut session_samples: usize = 0;
     let mut session_feeds: usize = 0;
     let mut decode_nanos: u128 = 0;
@@ -127,8 +134,9 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
     }
     loop {
         match commands.recv() {
-            Ok(Command::Start) => {
+            Ok(Command::Start { epoch }) => {
                 backend.start_session();
+                session_epoch = epoch;
                 session_samples = 0;
                 session_feeds = 0;
                 decode_nanos = 0;
@@ -168,7 +176,9 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                 if active {
                     active = false;
                     let finalize_started = Instant::now();
-                    let mut text = backend.finalize();
+                    let text = backend.finalize();
+                    let finalize_ms = finalize_started.elapsed().as_millis() as u64;
+                    let finalize_secs = finalize_started.elapsed().as_secs_f64();
                     let duration_secs = session_samples as f32 / SESSION_SAMPLE_RATE as f32;
                     let audio_secs = session_samples as f64 / SESSION_SAMPLE_RATE as f64;
                     let decode_secs = decode_nanos as f64 / 1e9;
@@ -190,43 +200,10 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         } else {
                             0.0
                         },
-                        finalize_started.elapsed().as_secs_f64()
+                        finalize_secs
                     );
-                    if mode == Mode::Record && selection.rewrite_record && !text.trim().is_empty() {
-                        let rewrite_started = Instant::now();
-                        let options = super::rewrite::RewriteOptions {
-                            threads: selection.rewrite_threads,
-                            gpu_layers: 0,
-                        };
-                        match super::rewrite::rewrite(&text, &options) {
-                            Some(result) if result.ok && !result.text.is_empty() => {
-                                text = result.text;
-                                log!(
-                                    "asr",
-                                    "rewrite done in {:.2}s (wall {})",
-                                    rewrite_started.elapsed().as_secs_f64(),
-                                    result.wall_ms
-                                );
-                                crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
-                                    backend: "s1-mini".into(),
-                                    device: "cpu".into(),
-                                    wall_ms: rewrite_started.elapsed().as_millis() as u64,
-                                    in_tokens: result.in_tokens,
-                                    out_tokens: result.out_tokens,
-                                    ok: result.ok,
-                                });
-                            }
-                            Some(_) => {
-                                log!("asr", "rewrite returned nothing usable; keeping ASR text");
-                            }
-                            None => {
-                                log!(
-                                    "asr",
-                                    "rewrite unavailable (model/executable missing); keeping ASR text"
-                                );
-                            }
-                        }
-                    }
+                    let needs_rewrite =
+                        mode == Mode::Record && selection.rewrite_record && !text.trim().is_empty();
                     crate::telemetry::session_end(crate::telemetry::SessionEnd {
                         mode: if mode == Mode::Record {
                             "record".into()
@@ -240,7 +217,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         } else {
                             0.0
                         } as f32,
-                        finalize_ms: finalize_started.elapsed().as_millis() as u64,
+                        finalize_ms,
                         partials_advanced: 0,
                         peak_rss_mb: resident_mib(),
                     });
@@ -262,10 +239,61 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         }
                         dump_samples.clear();
                     }
-                    let _ = events.send(Event::Committed {
-                        text,
-                        duration_secs,
-                    });
+                    if needs_rewrite {
+                        let rewrite_events = events.clone();
+                        let rewrite_threads = selection.rewrite_threads;
+                        let commit_epoch = session_epoch;
+                        thread::spawn(move || {
+                            let mut text = text;
+                            let rewrite_started = Instant::now();
+                            let options = super::rewrite::RewriteOptions {
+                                threads: rewrite_threads,
+                                gpu_layers: 0,
+                            };
+                            match super::rewrite::rewrite(&text, &options) {
+                                Some(result) if result.ok && !result.text.is_empty() => {
+                                    text = result.text;
+                                    log!(
+                                        "asr",
+                                        "rewrite done in {:.2}s (wall {})",
+                                        rewrite_started.elapsed().as_secs_f64(),
+                                        result.wall_ms
+                                    );
+                                    crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
+                                        backend: "s1-mini".into(),
+                                        device: "cpu".into(),
+                                        wall_ms: rewrite_started.elapsed().as_millis() as u64,
+                                        in_tokens: result.in_tokens,
+                                        out_tokens: result.out_tokens,
+                                        ok: result.ok,
+                                    });
+                                }
+                                Some(_) => {
+                                    log!(
+                                        "asr",
+                                        "rewrite returned nothing usable; keeping ASR text"
+                                    );
+                                }
+                                None => {
+                                    log!(
+                                        "asr",
+                                        "rewrite unavailable (model/executable missing); keeping ASR text"
+                                    );
+                                }
+                            }
+                            let _ = rewrite_events.send(Event::Committed {
+                                text,
+                                duration_secs,
+                                epoch: commit_epoch,
+                            });
+                        });
+                    } else {
+                        let _ = events.send(Event::Committed {
+                            text,
+                            duration_secs,
+                            epoch: session_epoch,
+                        });
+                    }
                 } else {
                     // Never leave the UI in Transcribing: a Stop with no live
                     // session (mic yielded nothing, Start never sent) must
@@ -277,6 +305,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                     let _ = events.send(Event::Committed {
                         text: String::new(),
                         duration_secs: 0.0,
+                        epoch: session_epoch,
                     });
                 }
             }
@@ -334,15 +363,18 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         &mut last_partial,
                         &mut cached_paths,
                         session_samples,
+                        session_epoch,
                         &events,
                         selection.provider.as_deref(),
                         selection.threads,
                     ) {
-                        SwapOutcome::Swapped | SwapOutcome::FetchFailed => {}
+                        SwapOutcome::Swapped => {
+                            loaded_kind = wanted;
+                            mode = target;
+                        }
+                        SwapOutcome::FetchFailed => {}
                         SwapOutcome::Fatal => return,
                     }
-                    loaded_kind = wanted;
-                    mode = target;
                 }
             }
             Ok(Command::Shutdown) | Err(_) => break,
@@ -364,6 +396,7 @@ fn load_and_swap(
     last_partial: &mut String,
     cached: &mut Option<ModelPaths>,
     session_samples: usize,
+    session_epoch: u64,
     events: &Sender<Event>,
     provider: Option<&str>,
     threads: i32,
@@ -374,14 +407,23 @@ fn load_and_swap(
         let _ = events.send(Event::Committed {
             text,
             duration_secs: session_samples as f32 / SESSION_SAMPLE_RATE as f32,
+            epoch: session_epoch,
         });
     }
-    let new_paths = match cached.take() {
-        Some(paths) if paths_matches_kind(&paths, kind) => Some(paths),
-        _ => fetch_paths(kind, events),
-    };
-    let Some(new_paths) = new_paths else {
-        return SwapOutcome::FetchFailed;
+    let old = cached.take();
+    let mut previous: Option<ModelPaths> = None;
+    let new_paths = match old {
+        Some(paths) if paths_matches_kind(&paths, kind) => paths,
+        old_opt => {
+            previous = old_opt;
+            match fetch_paths(kind, events) {
+                Some(fetched) => fetched,
+                None => {
+                    *cached = previous;
+                    return SwapOutcome::FetchFailed;
+                }
+            }
+        }
     };
     let _ = events.send(Event::LoadingProgress(format!(
         "loading {kind:?} recognizer"
@@ -392,6 +434,12 @@ fn load_and_swap(
             "asr",
             "ERROR: swap to {kind:?} failed, create returned None"
         );
+        // Old backend is still loaded; restore its paths so cached stays
+        // truthful about what is resident.
+        match previous {
+            Some(prev) => *cached = Some(prev),
+            None => *cached = Some(new_paths),
+        }
         return SwapOutcome::Fatal;
     };
     let unload_started = Instant::now();

@@ -7,6 +7,7 @@ use crate::log;
 const S1_SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text.";
 const S1_CONTROL_LINE: &str = "[Styling: semi-formal] [Structure: prose] [Context: general]";
 const MAX_NEW_TOKENS: i32 = 512;
+const MIN_NEW_TOKENS: i32 = 128;
 
 fn models_root() -> Result<PathBuf, String> {
     crate::config::config_dir().map(|dir| dir.join("models"))
@@ -98,7 +99,7 @@ fn run_llama(
         .arg("-ngl")
         .arg(options.gpu_layers.to_string())
         .arg("-n")
-        .arg(MAX_NEW_TOKENS.to_string())
+        .arg(max_new_tokens(transcript).to_string())
         .arg("-sys")
         .arg(S1_SYSTEM_PROMPT)
         .arg("-p")
@@ -135,7 +136,7 @@ fn run_llama(
         };
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if regex_lower(&stderr, "error|failed") {
+    if stderr_signals_failure(&stderr) {
         log!("rewrite", "llama-cli reported error/failure on stderr");
         return CleanedText {
             text: String::new(),
@@ -178,27 +179,115 @@ fn regex_lower(haystack: &str, pattern: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True only on failure-shaped stderr lines. llama.cpp logs benign words like
+/// "error" (error statistics, hints) on success, so a bare substring match
+/// false-positives; require `:` / `failed to`-style phrasing instead.
+fn stderr_signals_failure(stderr: &str) -> bool {
+    regex_lower(
+        stderr,
+        r"error\s*:|failed to |load failed|could not |cannot (open|load|find) |exception|fatal|aborted|no such file|invalid (model|argument|grammar)",
+    )
+}
+
+/// Scale `-n` to the transcript so short dictations don't pay for a full
+/// 512-token generation window. Output mirrors input length, so 2x input
+/// tokens plus slack, clamped to [MIN_NEW_TOKENS, MAX_NEW_TOKENS].
+fn max_new_tokens(transcript: &str) -> i32 {
+    let scaled = estimate_tokens(transcript)
+        .saturating_mul(2)
+        .saturating_add(32)
+        .clamp(MIN_NEW_TOKENS as u64, MAX_NEW_TOKENS as u64);
+    scaled as i32
+}
+
+/// Cap on transcript bytes baked into the boundary regex / exact needle.
+/// The transcript is untrusted ASR text; without a cap a pasted paragraph
+/// builds a multi-KB pattern and prompt junk can echo back as cleaned text.
+const MAX_TRANSCRIPT_PATTERN_BYTES: usize = 2048;
+/// Suffix length used to locate an over-cap transcript's end without
+/// building a pattern from the whole string.
+const TRANSCRIPT_TAIL_ANCHOR_BYTES: usize = 256;
+
+/// Locate the end of the echoed transcript in llama output. Short
+/// transcripts use the exact control-line + transcript regex (plus an exact
+/// needle fallback); over-cap transcripts anchor on a bounded tail suffix so
+/// the pattern size stays constant.
+fn find_transcript_end(all: &str, transcript: &str) -> Option<usize> {
+    if transcript.is_empty() {
+        return None;
+    }
+    if transcript.len() <= MAX_TRANSCRIPT_PATTERN_BYTES {
+        let boundary = format!(
+            r"[^\r\n]*{}[^\r\n]*\r?\n[^\r\n]*{}(?:[ \t]*)\r?\n",
+            regex::escape(S1_CONTROL_LINE),
+            regex::escape(transcript)
+        );
+        if let Ok(re) = regex::Regex::new(&boundary) {
+            if let Some(m) = re.find(all) {
+                return Some(m.end());
+            }
+        }
+        let needle = format!("{transcript}\n");
+        if let Some(index) = all.rfind(&needle) {
+            return Some(index + transcript.len());
+        }
+        return None;
+    }
+    let tail = tail_anchor(transcript, TRANSCRIPT_TAIL_ANCHOR_BYTES);
+    if tail.is_empty() {
+        return None;
+    }
+    let index = all.rfind(tail)?;
+    let after_tail = index + tail.len();
+    let rest = &all[after_tail..];
+    let spaces = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let rest_trimmed = &rest[spaces..];
+    rest_trimmed
+        .strip_prefix('\n')
+        .map(|_| after_tail + spaces + 1)
+}
+
+/// Last role-header boundary for the assistant turn. Requires a line-start +
+/// `:`/newline terminator (or the `<|im_start|>` marker) so prose containing
+/// the bare word "assistant" can't match and leak prompt junk.
+fn assistant_role_start(all: &str) -> Option<usize> {
+    const MARKER: &str = "<|im_start|>assistant";
+    let mut best: Option<usize> = None;
+    if let Some(index) = all.rfind(MARKER) {
+        let end = index + MARKER.len();
+        best = Some(best.map_or(end, |b: usize| b.max(end)));
+    }
+    for needle in ["\nassistant:", "\nassistant\n"] {
+        if let Some(index) = all.rfind(needle) {
+            let end = index + needle.len();
+            best = Some(best.map_or(end, |b: usize| b.max(end)));
+        }
+    }
+    for needle in ["assistant:", "assistant\n"] {
+        if all.starts_with(needle) {
+            best = Some(best.map_or(needle.len(), |b: usize| b.max(needle.len())));
+        }
+    }
+    best
+}
+
+fn tail_anchor<'a>(s: &'a str, max_bytes: usize) -> &'a str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Port of `Get-CleanText` from bench/run_normalizer.ps1. Locates the control
 /// line + transcript boundary in llama's output and strips the prompt banner
 /// and trailing markers.
 fn extract_cleaned_text(all: &str, transcript: &str) -> String {
     let all = all.replace('\r', "");
-    let boundary = format!(
-        r"[^\r\n]*{}[^\r\n]*\r?\n[^\r\n]*{}(?:[ \t]*)\r?\n",
-        regex::escape(S1_CONTROL_LINE),
-        regex::escape(transcript)
-    );
-    let start = regex::Regex::new(&boundary)
-        .and_then(|re| Ok(re.find(&all).map(|m| m.end())))
-        .unwrap_or(None)
-        .or_else(|| {
-            let needle = format!("{transcript}\n");
-            all.rfind(&needle).map(|index| index + transcript.len())
-        })
-        .or_else(|| {
-            all.rfind("assistant")
-                .map(|index| index + "assistant".len())
-        });
+    let start = find_transcript_end(&all, transcript).or_else(|| assistant_role_start(&all));
     let Some(start) = start else {
         return String::new();
     };
@@ -268,5 +357,53 @@ mod tests {
     fn extraction_returns_empty_when_no_marker() {
         let cleaned = extract_cleaned_text("no markers at all", "x");
         assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn max_new_tokens_scales_with_floor_and_ceiling() {
+        assert_eq!(max_new_tokens(""), MIN_NEW_TOKENS);
+        assert_eq!(max_new_tokens("hi"), MIN_NEW_TOKENS);
+        // 400 chars -> ~100 tokens -> 2*100+32 = 232.
+        assert_eq!(max_new_tokens(&"a".repeat(400)), 232);
+        assert_eq!(max_new_tokens(&"a".repeat(100_000)), MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn stderr_ignores_benign_error_mentions() {
+        assert!(!stderr_signals_failure(
+            "llama_context: error stats live here"
+        ));
+        assert!(!stderr_signals_failure(""));
+        assert!(stderr_signals_failure("error: failed to load model"));
+        assert!(stderr_signals_failure(
+            "llama_cli: failed to open model file"
+        ));
+        assert!(stderr_signals_failure("could not read vocab"));
+    }
+
+    #[test]
+    fn extraction_rejects_bare_assistant_mention() {
+        let cleaned = extract_cleaned_text("my assistant helped a lot today", "zzz");
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn extraction_accepts_colon_role_header() {
+        let cleaned = extract_cleaned_text("prompt\nassistant: the answer", "zzz");
+        assert_eq!(cleaned, "the answer");
+    }
+
+    #[test]
+    fn extraction_handles_overcap_transcript_via_tail() {
+        let transcript = "t".repeat(MAX_TRANSCRIPT_PATTERN_BYTES + 100);
+        let all = format!("{S1_CONTROL_LINE}\n{transcript}\nreal answer\n");
+        assert_eq!(extract_cleaned_text(&all, &transcript), "real answer");
+    }
+
+    #[test]
+    fn extraction_overcap_without_newline_boundary_returns_empty() {
+        let transcript = "t".repeat(MAX_TRANSCRIPT_PATTERN_BYTES + 100);
+        let all = format!("prefix {} suffix without boundary", &transcript[..300]);
+        assert_eq!(extract_cleaned_text(&all, &transcript), "");
     }
 }

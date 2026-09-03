@@ -73,6 +73,7 @@ pub(crate) struct Dictation {
     discard_requested: bool,
     flash_since: Option<Instant>,
     pub(crate) start_sent: bool,
+    pub(crate) epoch: u64,
 }
 
 impl Dictation {
@@ -101,10 +102,12 @@ impl Dictation {
             discard_requested: false,
             flash_since: None,
             start_sent: false,
+            epoch: 0,
         }
     }
 
     fn begin_recording(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
         self.focus = win_focus::capture_foreground();
         match &self.focus {
             Some(target) => log!("app", "recording starts, target window: {target}"),
@@ -235,13 +238,18 @@ impl Dictation {
             }
             Event::Partial(text) => {
                 if self.phase == Phase::Recording {
-                    log!("asr", "partial: {text}");
+                    log!("asr", "partial ({} chars)", text.chars().count());
                 }
             }
             Event::Committed {
                 text,
                 duration_secs,
+                epoch,
             } => {
+                if epoch != self.epoch {
+                    log!("app", "stale commit dropped (epoch mismatch)");
+                    return;
+                }
                 if self.phase == Phase::Transcribing {
                     self.transcribing_since = None;
                     if self.discard_requested {
@@ -251,13 +259,14 @@ impl Dictation {
                             text.chars().count()
                         );
                         self.discard_requested = false;
+                        self.pending_start = false;
                         self.enter_flash(cx);
                         return;
                     }
                     self.enter_flash(cx);
                     log!(
                         "app",
-                        "committed {:.1}s audio, raw ({} chars): {text:?}",
+                        "committed {:.1}s audio, raw ({} chars)",
                         duration_secs,
                         text.chars().count()
                     );
@@ -265,7 +274,7 @@ impl Dictation {
                     if cleaned != text.trim() {
                         log!(
                             "app",
-                            "cleanup: raw -> cleaned ({} chars): {cleaned:?}",
+                            "cleanup: raw -> cleaned ({} chars)",
                             cleaned.chars().count()
                         );
                     }
@@ -306,6 +315,14 @@ impl Dictation {
                             };
                             let _ = results.send(result);
                         });
+                    }
+                    if self.pending_start {
+                        self.pending_start = false;
+                        log!(
+                            "app",
+                            "queued start during transcribing: starting next recording"
+                        );
+                        self.begin_recording();
                     }
                 }
             }
