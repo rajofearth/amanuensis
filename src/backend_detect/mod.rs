@@ -405,15 +405,24 @@ fn bench_candidate(
     audio_secs: f64,
 ) -> Option<f32> {
     use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig};
+    let ModelPaths::Nemotron {
+        encoder,
+        decoder,
+        joiner,
+        tokens,
+    } = paths
+    else {
+        return None;
+    };
     let mut config = OnlineRecognizerConfig::default();
     config.feat_config.sample_rate = CALIB_SAMPLE_RATE;
     config.feat_config.feature_dim = 128;
     config.model_config.transducer = OnlineTransducerModelConfig {
-        encoder: Some(path_string(&paths.encoder)),
-        decoder: Some(path_string(&paths.decoder)),
-        joiner: Some(path_string(&paths.joiner)),
+        encoder: Some(path_string(encoder)),
+        decoder: Some(path_string(decoder)),
+        joiner: Some(path_string(joiner)),
     };
-    config.model_config.tokens = Some(path_string(&paths.tokens));
+    config.model_config.tokens = Some(path_string(tokens));
     config.model_config.num_threads = threads;
     config.model_config.provider = Some(provider.to_owned());
     config.decoding_method = Some("greedy_search".to_owned());
@@ -485,7 +494,7 @@ pub fn probe_child() -> i32 {
         eprintln!("[probe] cannot resolve model dir");
         return 2;
     };
-    let paths = ModelPaths {
+    let paths = ModelPaths::Nemotron {
         encoder: model_dir.join("encoder.int8.onnx"),
         decoder: model_dir.join("decoder.int8.onnx"),
         joiner: model_dir.join("joiner.int8.onnx"),

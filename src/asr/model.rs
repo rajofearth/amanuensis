@@ -1,6 +1,7 @@
 use super::fetch;
 pub const REPO_OWNER: &str = "csukuangfj2";
 const NEMOTRON_REPO: &str = "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
+const MOONSHINE_REPO: &str = "sherpa-onnx-moonshine-base-en-int8";
 
 pub struct ModelSpec {
     pub id: &'static str,
@@ -12,15 +13,26 @@ pub struct ModelSpec {
     pub wer_note: &'static str,
 }
 
-pub const REGISTRY: [ModelSpec; 1] = [ModelSpec {
-    id: "nemotron",
-    display_name: "Nemotron Streaming",
-    repo: NEMOTRON_REPO,
-    size_mb: 632,
-    min_ram_gb: 4,
-    chunk_ms: 80,
-    wer_note: "~7.2\u{2013}7.8% WER, tracks voice closely",
-}];
+pub const REGISTRY: [ModelSpec; 2] = [
+    ModelSpec {
+        id: "moonshine",
+        display_name: "Moonshine (record)",
+        repo: MOONSHINE_REPO,
+        size_mb: 300,
+        min_ram_gb: 2,
+        chunk_ms: 0,
+        wer_note: "offline ASR, no partials, fast decode",
+    },
+    ModelSpec {
+        id: "nemotron",
+        display_name: "Nemotron Streaming",
+        repo: NEMOTRON_REPO,
+        size_mb: 632,
+        min_ram_gb: 4,
+        chunk_ms: 80,
+        wer_note: "~7.2\u{2013}7.8% WER, tracks voice closely",
+    },
+];
 
 pub fn spec_by_id(id: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().find(|spec| spec.id == id)
@@ -28,6 +40,7 @@ pub fn spec_by_id(id: &str) -> Option<&'static ModelSpec> {
 
 pub fn kind_by_id(id: &str) -> Option<ModelKind> {
     match id {
+        "moonshine" => Some(ModelKind::Moonshine),
         "nemotron" => Some(ModelKind::Nemotron),
         _ => None,
     }
@@ -35,23 +48,34 @@ pub fn kind_by_id(id: &str) -> Option<ModelKind> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelKind {
+    Moonshine,
     Nemotron,
 }
 
 impl ModelKind {
     pub fn spec(self) -> &'static ModelSpec {
         match self {
-            Self::Nemotron => &REGISTRY[0],
+            Self::Moonshine => &REGISTRY[0],
+            Self::Nemotron => &REGISTRY[1],
         }
     }
 }
 
 #[derive(Clone)]
-pub struct ModelPaths {
-    pub encoder: std::path::PathBuf,
-    pub decoder: std::path::PathBuf,
-    pub joiner: std::path::PathBuf,
-    pub tokens: std::path::PathBuf,
+pub enum ModelPaths {
+    Nemotron {
+        encoder: std::path::PathBuf,
+        decoder: std::path::PathBuf,
+        joiner: std::path::PathBuf,
+        tokens: std::path::PathBuf,
+    },
+    Moonshine {
+        preprocessor: std::path::PathBuf,
+        encoder: std::path::PathBuf,
+        uncached_decoder: std::path::PathBuf,
+        cached_decoder: std::path::PathBuf,
+        tokens: std::path::PathBuf,
+    },
 }
 
 pub use fetch::{DownloadProgress, cached_model_dir, progress_text};

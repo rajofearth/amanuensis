@@ -148,6 +148,14 @@ fn main() {
                 let tray_enabled = loaded_config
                     .as_ref()
                     .map_or(true, |config| config.tray_enabled);
+                // Apply consent before emitting anything: telemetry is
+                // consent-gated, so app_start/device_profile sent earlier
+                // would always be dropped on a fresh/legacy config.
+                if let Some(config) = loaded_config.as_ref() {
+                    amanuensis::telemetry::set_consent(config.telemetry_consent);
+                }
+                amanuensis::telemetry::app_start();
+                amanuensis::telemetry::device_profile();
                 let tray = TrayController::spawn(ui_sender.clone(), tray_enabled);
                 let device = detect_device();
 
@@ -170,9 +178,20 @@ fn main() {
                 let (dictation, commands, screen) = match loaded_config {
                     Some(config) => {
                         let selection = selection_from_config(&config);
-                        let model_id = selection.model.spec().id;
-                        if is_model_cached(model_id) {
-                            log!("app", "config found: model={}", config.model);
+                        // The worker boots into Record mode, so the record
+                        // engine must be present to start dictating. Pre-per-mode
+                        // configs used a single model; accept it as the record
+                        // engine too, so legacy installs keep working.
+                        let record_model_id = selection.record_model.spec().id;
+                        let can_start = is_model_cached(record_model_id)
+                            || is_model_cached(&config.model);
+                        if can_start {
+                            log!(
+                                "app",
+                                "config found: record={} live={}",
+                                config.record_model,
+                                config.live_model
+                            );
                             let commands = asr::spawn_worker(event_sender.clone(), selection);
                             let dictation = cx.new(|_| {
                                 Dictation::new(
@@ -187,13 +206,13 @@ fn main() {
                         } else {
                             log!(
                                 "app",
-                                "config found but cached model '{model_id}' missing; entering recovery setup"
+                                "config found but no configured engine cached; entering recovery setup"
                             );
                             let view = cx.new(|_| {
                                 OnboardingView::new(
                                     SetupOrigin::Recovery,
                                     device,
-                                    model_id,
+                                    record_model_id,
                                     tray_enabled,
                                     ui_sender.clone(),
                                 )

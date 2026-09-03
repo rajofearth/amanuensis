@@ -7,6 +7,7 @@ use std::{
 use crate::log;
 
 use super::model;
+use super::moonshine::MoonshineBackend;
 use super::nemotron::NemotronBackend;
 use super::{AsrBackend, Mode, ModelKind, ModelPaths};
 
@@ -19,26 +20,35 @@ pub enum Command {
     Shutdown,
     ReloadForDebug,
     SwitchMode(Mode),
-    SetModel(ModelKind),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSelection {
-    pub model: ModelKind,
+    /// ASR engine for record mode.
+    pub record_model: ModelKind,
+    /// ASR engine for live mode.
+    pub live_model: ModelKind,
     /// sherpa provider string; `None` means the default (cpu). Env
     /// `ASR_PROVIDER` overrides this at recognizer load time.
     pub provider: Option<String>,
     /// Thread count for the recognizer. Env `ASR_THREADS` overrides this at
     /// recognizer load time.
     pub threads: i32,
+    /// Whether record-mode transcripts run through the s1-mini rewrite pass.
+    pub rewrite_record: bool,
+    /// Thread count for the s1-mini rewrite subprocess.
+    pub rewrite_threads: i32,
 }
 
 impl Default for ModelSelection {
     fn default() -> Self {
         Self {
-            model: ModelKind::Nemotron,
+            record_model: ModelKind::Moonshine,
+            live_model: ModelKind::Nemotron,
             provider: None,
             threads: 2,
+            rewrite_record: true,
+            rewrite_threads: 2,
         }
     }
 }
@@ -62,9 +72,10 @@ pub fn spawn_worker(events: Sender<Event>, selection: ModelSelection) -> Sender<
     commands
 }
 
-fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelSelection) {
+fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelection) {
     let mut mode = Mode::Record;
-    let Some(paths) = fetch_paths(selection.model, &events) else {
+    let wanted = model_for_mode(selection.record_model, selection.live_model, mode);
+    let Some(paths) = fetch_paths(wanted, &events) else {
         return;
     };
 
@@ -82,11 +93,25 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
         started.elapsed().as_secs_f64(),
         resident_mib()
     );
+    crate::telemetry::backend_selected(crate::telemetry::BackendSelected {
+        kind: if mode == Mode::Record {
+            "asr_record".into()
+        } else {
+            "asr_live".into()
+        },
+        provider: selection.provider.as_deref().unwrap_or("cpu").to_string(),
+        backend: wanted.spec().id.to_owned(),
+        device: "cpu".into(),
+        threads: selection.threads,
+        decided_by: "cache".into(),
+        bench_ref: None,
+    });
     if events.send(Event::Ready).is_err() {
         return;
     }
 
     let mut cached_paths: Option<ModelPaths> = Some(paths);
+    let mut loaded_kind = wanted;
 
     let mut active = false;
     let mut session_samples: usize = 0;
@@ -143,7 +168,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                 if active {
                     active = false;
                     let finalize_started = Instant::now();
-                    let text = backend.finalize();
+                    let mut text = backend.finalize();
                     let duration_secs = session_samples as f32 / SESSION_SAMPLE_RATE as f32;
                     let audio_secs = session_samples as f64 / SESSION_SAMPLE_RATE as f64;
                     let decode_secs = decode_nanos as f64 / 1e9;
@@ -167,6 +192,58 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                         },
                         finalize_started.elapsed().as_secs_f64()
                     );
+                    if mode == Mode::Record && selection.rewrite_record && !text.trim().is_empty() {
+                        let rewrite_started = Instant::now();
+                        let options = super::rewrite::RewriteOptions {
+                            threads: selection.rewrite_threads,
+                            gpu_layers: 0,
+                        };
+                        match super::rewrite::rewrite(&text, &options) {
+                            Some(result) if result.ok && !result.text.is_empty() => {
+                                text = result.text;
+                                log!(
+                                    "asr",
+                                    "rewrite done in {:.2}s (wall {})",
+                                    rewrite_started.elapsed().as_secs_f64(),
+                                    result.wall_ms
+                                );
+                                crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
+                                    backend: "s1-mini".into(),
+                                    device: "cpu".into(),
+                                    wall_ms: rewrite_started.elapsed().as_millis() as u64,
+                                    in_tokens: result.in_tokens,
+                                    out_tokens: result.out_tokens,
+                                    ok: result.ok,
+                                });
+                            }
+                            Some(_) => {
+                                log!("asr", "rewrite returned nothing usable; keeping ASR text");
+                            }
+                            None => {
+                                log!(
+                                    "asr",
+                                    "rewrite unavailable (model/executable missing); keeping ASR text"
+                                );
+                            }
+                        }
+                    }
+                    crate::telemetry::session_end(crate::telemetry::SessionEnd {
+                        mode: if mode == Mode::Record {
+                            "record".into()
+                        } else {
+                            "live".into()
+                        },
+                        audio_secs: audio_secs as f32,
+                        decode_wall_ms: (decode_nanos / 1_000_000) as u64,
+                        rtf: if audio_secs > 0.0 {
+                            decode_secs / audio_secs as f64
+                        } else {
+                            0.0
+                        } as f32,
+                        finalize_ms: finalize_started.elapsed().as_millis() as u64,
+                        partials_advanced: 0,
+                        peak_rss_mb: resident_mib(),
+                    });
                     if let Some(path) = &dump_path {
                         let bytes: Vec<u8> = dump_samples
                             .iter()
@@ -224,35 +301,36 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, mut selection: ModelS
                 }
             }
             Ok(Command::SwitchMode(target)) => {
-                log!(
-                    "asr",
-                    "switch to {target:?}: single resident model, keeping recognizer"
-                );
-                mode = target;
-                let _ = events.send(Event::ModelReady(mode));
-            }
-            Ok(Command::SetModel(kind)) => {
-                if kind == selection.model {
-                    log!("asr", "set model: already {kind:?}, nothing to do");
-                    continue;
-                }
-                log!("asr", "set model: {:?} -> {:?}", selection.model, kind);
-                selection.model = kind;
-                cached_paths = None;
-                match load_and_swap(
-                    mode,
-                    kind,
-                    &mut active,
-                    &mut backend,
-                    &mut last_partial,
-                    &mut cached_paths,
-                    session_samples,
-                    &events,
-                    selection.provider.as_deref(),
-                    selection.threads,
-                ) {
-                    SwapOutcome::Swapped | SwapOutcome::FetchFailed => {}
-                    SwapOutcome::Fatal => return,
+                let wanted = model_for_mode(selection.record_model, selection.live_model, target);
+                if wanted == loaded_kind {
+                    log!(
+                        "asr",
+                        "switch to {target:?}: model {wanted:?} already resident, keeping recognizer"
+                    );
+                    mode = target;
+                    let _ = events.send(Event::ModelReady(mode));
+                } else {
+                    log!(
+                        "asr",
+                        "switch to {target:?}: swapping {loaded_kind:?} -> {wanted:?}"
+                    );
+                    match load_and_swap(
+                        target,
+                        wanted,
+                        &mut active,
+                        &mut backend,
+                        &mut last_partial,
+                        &mut cached_paths,
+                        session_samples,
+                        &events,
+                        selection.provider.as_deref(),
+                        selection.threads,
+                    ) {
+                        SwapOutcome::Swapped | SwapOutcome::FetchFailed => {}
+                        SwapOutcome::Fatal => return,
+                    }
+                    loaded_kind = wanted;
+                    mode = target;
                 }
             }
             Ok(Command::Shutdown) | Err(_) => break,
@@ -287,8 +365,8 @@ fn load_and_swap(
         });
     }
     let new_paths = match cached.take() {
-        Some(paths) => Some(paths),
-        None => fetch_paths(kind, events),
+        Some(paths) if paths_matches_kind(&paths, kind) => Some(paths),
+        _ => fetch_paths(kind, events),
     };
     let Some(new_paths) = new_paths else {
         return SwapOutcome::FetchFailed;
@@ -349,7 +427,30 @@ fn load_backend(
     provider: Option<&str>,
     threads: i32,
 ) -> Option<Box<dyn AsrBackend>> {
-    NemotronBackend::load(paths, provider, threads).map(|backend| Box::new(backend) as _)
+    match paths {
+        ModelPaths::Nemotron { .. } => {
+            NemotronBackend::load(paths, provider, threads).map(|backend| Box::new(backend) as _)
+        }
+        ModelPaths::Moonshine { .. } => {
+            MoonshineBackend::load(paths, provider, threads).map(|backend| Box::new(backend) as _)
+        }
+    }
+}
+
+/// The ASR engine wanted for a given mode.
+fn model_for_mode(record: ModelKind, live: ModelKind, mode: Mode) -> ModelKind {
+    match mode {
+        Mode::Record => record,
+        Mode::Live => live,
+    }
+}
+
+fn paths_matches_kind(paths: &ModelPaths, kind: ModelKind) -> bool {
+    matches!(
+        (paths, kind),
+        (ModelPaths::Nemotron { .. }, ModelKind::Nemotron)
+            | (ModelPaths::Moonshine { .. }, ModelKind::Moonshine)
+    )
 }
 
 fn resident_mib() -> f64 {

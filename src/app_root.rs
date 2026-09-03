@@ -294,11 +294,11 @@ impl AppRoot {
         if let Some(dictation) = self.dictation.clone() {
             dictation.update(cx, |dictation, cx| dictation.cancel_pending_start(cx));
         }
-        let default_id = ModelKind::Nemotron.spec().id;
+        let default_id = ModelKind::Moonshine.spec().id;
         let model_id = config::load().map_or(default_id, |config| {
-            spec_by_id(&config.model).map_or(default_id, |spec| spec.id)
+            spec_by_id(&config.record_model).map_or(default_id, |spec| spec.id)
         });
-        log!("app", "opening settings: model={model_id}");
+        log!("app", "opening settings: record model={model_id}");
         let device = detect_device();
         let view = cx.new(|_| {
             OnboardingView::new(
@@ -581,28 +581,32 @@ impl AppRoot {
     }
 
     pub(crate) fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
+        let existing = config::load();
+        let existing_defaults = existing.clone().unwrap_or_default();
         let config = AppConfig {
+            record_model: model.spec().id.to_owned(),
+            live_model: existing
+                .as_ref()
+                .map(|c| c.live_model.clone())
+                .unwrap_or_else(|| ModelKind::Nemotron.spec().id.to_owned()),
             model: model.spec().id.to_owned(),
-            tray_enabled: config::load().map_or(true, |existing| existing.tray_enabled),
-            ..config::load().unwrap_or_default()
+            tray_enabled: existing.map_or(true, |c| c.tray_enabled),
+            ..existing_defaults
         };
         match config::save(&config) {
-            Ok(()) => log!("app", "config saved: model={}", config.model),
+            Ok(()) => log!(
+                "app",
+                "config saved: record={} live={}",
+                config.record_model,
+                config.live_model
+            ),
             Err(error) => log!("app", "config save FAILED: {error}"),
         }
+        let selection = selection_from_config(&config);
         if self.worker_live {
-            match self.commands.clone() {
-                Some(commands) => {
-                    let _ = commands.send(Command::SetModel(model));
-                    log!("app", "SetModel sent to live worker: {}", model.spec().id);
-                }
-                None => {
-                    log!(
-                        "app",
-                        "ERROR: worker_live with no worker channel; cannot send SetModel"
-                    );
-                }
-            }
+            // The worker tracks per-mode engines itself; a live worker only
+            // needs to stay resident. Nothing to remap here.
+            log!("app", "worker already live; using existing selection");
             self.pending_start = false;
             self.screen = Screen::Dictation;
             self.hide_pill_window();
@@ -615,15 +619,6 @@ impl AppRoot {
             log!("app", "post-onboarding backend bench scheduled");
             std::thread::spawn(backend_detect::run_backend_bench);
         }
-        let selection = ModelSelection {
-            model,
-            provider: (!cache.asr.provider.is_empty()).then(|| cache.asr.provider.clone()),
-            threads: if cache.asr.threads > 0 {
-                cache.asr.threads
-            } else {
-                2
-            },
-        };
         log!("app", "worker spawned with selection {selection:?}");
         let commands = amanuensis::asr::spawn_worker(self.events.clone(), selection);
         self.worker_live = true;
@@ -676,15 +671,6 @@ pub(crate) fn panel_title_utf16() -> Vec<u16> {
 }
 
 pub(crate) fn selection_from_config(config: &AppConfig) -> ModelSelection {
-    let fallback = ModelKind::Nemotron;
-    let model = kind_by_id(&config.model).unwrap_or_else(|| {
-        log!(
-            "app",
-            "unknown model id '{}' in config; using default instead",
-            config.model
-        );
-        fallback
-    });
     let cached = &config.backend_cache.asr;
     let provider = (!cached.provider.is_empty()).then(|| cached.provider.clone());
     let threads = if cached.threads > 0 {
@@ -692,11 +678,18 @@ pub(crate) fn selection_from_config(config: &AppConfig) -> ModelSelection {
     } else {
         2
     };
-    ModelSelection {
-        model,
+    let record = kind_by_id(&config.record_model).unwrap_or(ModelKind::Moonshine);
+    let live = kind_by_id(&config.live_model).unwrap_or(ModelKind::Nemotron);
+    let selection = ModelSelection {
+        record_model: record,
+        live_model: live,
         provider,
         threads,
-    }
+        rewrite_record: config.rewrite_record,
+        rewrite_threads: cached.threads.max(2),
+    };
+    amanuensis::telemetry::set_consent(config.telemetry_consent);
+    selection
 }
 
 pub(crate) fn detect_device() -> (u32, usize) {

@@ -1,6 +1,8 @@
 pub mod fetch;
 mod model;
+mod moonshine;
 mod nemotron;
+pub mod rewrite;
 pub mod worker;
 
 pub use fetch::DownloadProgress;
@@ -9,6 +11,7 @@ pub use model::{
     ensure_model_by_spec, is_model_cached, kind_by_id, progress_text, repo_cache_dir_for,
     spec_by_id,
 };
+pub use moonshine::MoonshineBackend;
 pub use nemotron::NemotronBackend;
 pub use worker::{Command, Event, ModelSelection, spawn_worker};
 

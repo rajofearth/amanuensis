@@ -18,19 +18,28 @@ pub struct NemotronBackend {
 
 impl NemotronBackend {
     pub fn load(
-        model: &ModelPaths,
+        paths: &ModelPaths,
         preferred_provider: Option<&str>,
         preferred_threads: i32,
     ) -> Option<Self> {
+        let ModelPaths::Nemotron {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = paths
+        else {
+            return None;
+        };
         let mut config = OnlineRecognizerConfig::default();
         config.feat_config.sample_rate = SAMPLE_RATE;
         config.feat_config.feature_dim = FEATURE_DIM;
         config.model_config.transducer = OnlineTransducerModelConfig {
-            encoder: Some(path_string(&model.encoder)),
-            decoder: Some(path_string(&model.decoder)),
-            joiner: Some(path_string(&model.joiner)),
+            encoder: Some(path_string(encoder)),
+            decoder: Some(path_string(decoder)),
+            joiner: Some(path_string(joiner)),
         };
-        config.model_config.tokens = Some(path_string(&model.tokens));
+        config.model_config.tokens = Some(path_string(tokens));
         config.model_config.num_threads = threads(preferred_threads);
         if let Some(provider) = provider(preferred_provider) {
             config.model_config.provider = Some(provider);

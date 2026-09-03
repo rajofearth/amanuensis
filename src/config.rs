@@ -44,26 +44,85 @@ pub struct BackendCache {
     pub normalizer: NormalizerCacheEntry,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppConfig {
+    /// Legacy single-model setting, kept for backwards compatibility. Newer
+    /// fields (`record_model` / `live_model`) win when present; otherwise the
+    /// per-mode engines inherit from `model` so upgraded installs keep
+    /// dictating on the engine they already used.
     pub model: String,
+    pub record_model: String,
+    pub live_model: String,
+    pub rewrite_record: bool,
+    #[serde(default)]
+    pub telemetry_consent: bool,
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
     #[serde(default)]
     pub backend_cache: BackendCache,
 }
 
+fn default_record_model() -> String {
+    "moonshine".to_owned()
+}
+
+fn default_live_model() -> String {
+    "nemotron".to_owned()
+}
+
+fn default_rewrite_record() -> bool {
+    true
+}
+
 fn default_tray_enabled() -> bool {
     true
 }
 
+/// Serde intermediate that records whether the per-mode fields were present in
+/// the stored JSON, so `AppConfig` can resolve them against the legacy `model`.
+#[derive(Default, Deserialize)]
+struct AppConfigRaw {
+    model: Option<String>,
+    #[serde(default)]
+    record_model: Option<String>,
+    #[serde(default)]
+    live_model: Option<String>,
+    #[serde(default)]
+    rewrite_record: Option<bool>,
+    #[serde(default)]
+    telemetry_consent: bool,
+    #[serde(default = "default_tray_enabled")]
+    tray_enabled: bool,
+    #[serde(default)]
+    backend_cache: BackendCache,
+}
+
+impl From<AppConfigRaw> for AppConfig {
+    fn from(raw: AppConfigRaw) -> Self {
+        let legacy_model = raw.model.clone();
+        let record_model = raw
+            .record_model
+            .or_else(|| legacy_model.clone())
+            .unwrap_or_else(default_record_model);
+        let live_model = raw
+            .live_model
+            .or_else(|| legacy_model.clone())
+            .unwrap_or_else(default_live_model);
+        Self {
+            model: legacy_model.unwrap_or_else(|| "nemotron".to_owned()),
+            record_model,
+            live_model,
+            rewrite_record: raw.rewrite_record.unwrap_or_else(default_rewrite_record),
+            telemetry_consent: raw.telemetry_consent,
+            tray_enabled: raw.tray_enabled,
+            backend_cache: raw.backend_cache,
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
-        Self {
-            model: "nemotron".to_owned(),
-            tray_enabled: true,
-            backend_cache: BackendCache::default(),
-        }
+        AppConfigRaw::default().into()
     }
 }
 
@@ -112,8 +171,8 @@ pub fn set_tray_enabled(enabled: bool) -> Result<(), String> {
 
 fn load_from(path: &Path) -> Option<AppConfig> {
     let text = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str(&text) {
-        Ok(config) => Some(config),
+    match serde_json::from_str::<AppConfigRaw>(&text) {
+        Ok(raw) => Some(raw.into()),
         Err(error) => {
             log!(
                 "config",
@@ -152,6 +211,10 @@ mod tests {
         let path = temp_path("roundtrip");
         let written = AppConfig {
             model: "nemotron".to_owned(),
+            record_model: "moonshine".to_owned(),
+            live_model: "nemotron".to_owned(),
+            rewrite_record: true,
+            telemetry_consent: false,
             tray_enabled: true,
             backend_cache: BackendCache {
                 asr: AsrCacheEntry {
@@ -219,14 +282,65 @@ mod tests {
     }
 
     #[test]
-    fn load_old_two_slot_schema_returns_none() {
+    fn legacy_model_inherits_into_both_modes() {
+        // A pre-per-mode config only carries `model`. Upgrading must keep both
+        // engines on that same model so behavior doesn't silently change.
+        let path = temp_path("legacymodel");
+        std::fs::write(&path, r#"{"model":"nemotron","tray_enabled":true}"#).unwrap();
+        let loaded = load_from(&path).expect("load legacy");
+        assert_eq!(loaded.record_model, "nemotron");
+        assert_eq!(loaded.live_model, "nemotron");
+        assert_eq!(loaded.rewrite_record, true);
+        assert!(!loaded.telemetry_consent);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fresh_default_uses_new_default_profile() {
+        // No `model` and no per-mode fields means a brand-new install, which
+        // gets the moonshine record + nemotron live default profile.
+        let config = AppConfig::default();
+        assert_eq!(config.record_model, "moonshine");
+        assert_eq!(config.live_model, "nemotron");
+        assert_eq!(config.rewrite_record, true);
+        assert!(!config.telemetry_consent);
+    }
+
+    #[test]
+    fn per_mode_fields_override_legacy_model() {
+        let path = temp_path("permode");
+        std::fs::write(
+            &path,
+            r#"{
+                "model":"nemotron",
+                "record_model":"moonshine",
+                "live_model":"nemotron",
+                "rewrite_record":false,
+                "telemetry_consent":true
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_from(&path).expect("load");
+        assert_eq!(loaded.record_model, "moonshine");
+        assert_eq!(loaded.live_model, "nemotron");
+        assert!(!loaded.rewrite_record);
+        assert!(loaded.telemetry_consent);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_old_two_slot_schema_now_loads_with_nemotron_engines() {
+        // The old two-slot config (record_model/live_model, no `model`) is
+        // superseded by our own per-mode fields, so it parses cleanly now.
         let path = temp_path("oldschema");
         std::fs::write(
             &path,
             r#"{"record_model":"nemotron","live_model":"nemotron"}"#,
         )
         .unwrap();
-        assert_eq!(load_from(&path), None);
+        let loaded = load_from(&path).expect("load old two-slot schema");
+        assert_eq!(loaded.record_model, "nemotron");
+        assert_eq!(loaded.live_model, "nemotron");
         let _ = std::fs::remove_file(path);
     }
 }

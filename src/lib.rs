@@ -9,4 +9,5 @@ pub mod paste;
 pub mod pill_win32;
 pub mod pill_window;
 pub mod setup_steps;
+pub mod telemetry;
 pub mod win_focus;

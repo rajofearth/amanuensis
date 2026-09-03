@@ -39,7 +39,7 @@ fn main() {
     let kind = ModelKind::Nemotron;
     let spec = kind.spec();
     let dir = fetch::cached_model_dir(spec);
-    let paths = amanuensis::asr::ModelPaths {
+    let paths = amanuensis::asr::ModelPaths::Nemotron {
         encoder: dir.join("encoder.int8.onnx"),
         decoder: dir.join("decoder.int8.onnx"),
         joiner: dir.join("joiner.int8.onnx"),

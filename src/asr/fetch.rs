@@ -10,10 +10,26 @@ use crate::config;
 use super::model::{ModelPaths, ModelSpec, REPO_OWNER};
 
 const HF_BASE: &str = "https://huggingface.co";
-pub(crate) const MODEL_FILES: [&str; 4] = [
+
+fn model_files(spec: &ModelSpec) -> &'static [&'static str] {
+    match spec.id {
+        "moonshine" => &MOONSHINE_FILES,
+        _ => &NEMOTRON_FILES,
+    }
+}
+
+pub(crate) static NEMOTRON_FILES: [&str; 4] = [
     "encoder.int8.onnx",
     "decoder.int8.onnx",
     "joiner.int8.onnx",
+    "tokens.txt",
+];
+
+pub(crate) static MOONSHINE_FILES: [&str; 5] = [
+    "preprocess.onnx",
+    "encode.int8.onnx",
+    "uncached_decode.int8.onnx",
+    "cached_decode.int8.onnx",
     "tokens.txt",
 ];
 
@@ -139,7 +155,7 @@ fn head_content_length(url: &str) -> Option<u64> {
 }
 
 pub fn total_size(spec: &ModelSpec) -> Option<u64> {
-    MODEL_FILES
+    model_files(spec)
         .iter()
         .map(|file| head_content_length(&file_url(spec, file)))
         .collect::<Option<Vec<_>>>()
@@ -155,7 +171,7 @@ fn dir_complete(dir: &Path, files: &[&str]) -> bool {
 }
 
 pub fn is_spec_cached(spec: &ModelSpec) -> bool {
-    dir_complete(&cached_model_dir(spec), &MODEL_FILES)
+    dir_complete(&cached_model_dir(spec), model_files(spec))
 }
 
 pub(crate) fn mb_summary(done: u64, total: u64) -> String {
@@ -418,7 +434,8 @@ pub fn ensure_model(
     }
     let dir = cached_model_dir(spec);
     std::fs::create_dir_all(&dir).map_err(|error| format!("creating model dir: {error}"))?;
-    let known_sizes: Vec<Option<u64>> = MODEL_FILES
+    let files = model_files(spec);
+    let known_sizes: Vec<Option<u64>> = files
         .iter()
         .map(|file| head_content_length(&file_url(spec, file)))
         .collect();
@@ -426,7 +443,8 @@ pub fn ensure_model(
         .iter()
         .fold(0, |sum, size| sum + size.unwrap_or(0));
     let mut aggregate = Aggregate::new(total);
-    for (index, file) in MODEL_FILES.iter().enumerate() {
+    let download_started = Instant::now();
+    for (index, file) in files.iter().enumerate() {
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             return Ok(None);
         }
@@ -445,12 +463,28 @@ pub fn ensure_model(
         });
         aggregate.finish_file(finished);
     }
-    Ok(Some(ModelPaths {
-        encoder: dir.join(MODEL_FILES[0]),
-        decoder: dir.join(MODEL_FILES[1]),
-        joiner: dir.join(MODEL_FILES[2]),
-        tokens: dir.join(MODEL_FILES[3]),
-    }))
+    crate::telemetry::model_download(crate::telemetry::ModelDownload {
+        model: spec.id.to_owned(),
+        bytes: total,
+        seconds: download_started.elapsed().as_secs_f64(),
+        source: "huggingface".into(),
+    });
+    let paths = match spec.id {
+        "moonshine" => ModelPaths::Moonshine {
+            preprocessor: dir.join(MOONSHINE_FILES[0]),
+            encoder: dir.join(MOONSHINE_FILES[1]),
+            uncached_decoder: dir.join(MOONSHINE_FILES[2]),
+            cached_decoder: dir.join(MOONSHINE_FILES[3]),
+            tokens: dir.join(MOONSHINE_FILES[4]),
+        },
+        _ => ModelPaths::Nemotron {
+            encoder: dir.join(NEMOTRON_FILES[0]),
+            decoder: dir.join(NEMOTRON_FILES[1]),
+            joiner: dir.join(NEMOTRON_FILES[2]),
+            tokens: dir.join(NEMOTRON_FILES[3]),
+        },
+    };
+    Ok(Some(paths))
 }
 
 #[cfg(test)]

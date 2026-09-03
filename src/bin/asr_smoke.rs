@@ -63,7 +63,7 @@ fn ensure_model_files(kind: ModelKind) -> (ModelPaths, PathBuf, String) {
     let expected = expected_for_zero(&trans_path);
 
     (
-        ModelPaths {
+        ModelPaths::Nemotron {
             encoder: dir.join("encoder.int8.onnx"),
             decoder: dir.join("decoder.int8.onnx"),
             joiner: dir.join("joiner.int8.onnx"),
