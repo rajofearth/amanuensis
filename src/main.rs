@@ -9,7 +9,11 @@ mod messages;
 mod onboarding_view;
 mod tray;
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use amanuensis::asr::{self, Event, is_model_cached};
 use amanuensis::audio;
@@ -22,6 +26,7 @@ use amanuensis::logging;
 use amanuensis::pill_win32::PillButton;
 use amanuensis::pill_win32::PillOverlay;
 use amanuensis::pill_window as pw;
+use amanuensis::preload;
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey},
@@ -33,7 +38,7 @@ use gpui::{
 use gpui_platform::application;
 
 use crate::app_root::{AppRoot, Screen, detect_device, rms_level, selection_from_config};
-use crate::dictation_view::Dictation;
+use crate::dictation_view::{Dictation, Phase};
 use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
 use crate::onboarding_view::{OnboardingView, SetupOrigin};
 use crate::tray::TrayController;
@@ -185,7 +190,14 @@ fn main() {
                         let record_model_id = selection.record_model.spec().id;
                         let can_start = is_model_cached(record_model_id)
                             || is_model_cached(&config.model);
-                        if can_start {
+                        // RAM-aware preload: read RAM once, decide, and start
+                        // the hourly log-only watch. A denied verdict skips
+                        // the spawn; first F9 reloads per use (see hotkey
+                        // loop below), mirroring finish_onboarding's
+                        // worker-live-false branch. No new channels.
+                        let (verdict, _) = preload::should_preload(config.preload_engines);
+                        preload::spawn_ram_watch(config.preload_engines, verdict);
+                        if can_start && verdict.preload {
                             log!(
                                 "app",
                                 "config found: record={} live={}",
@@ -203,6 +215,13 @@ fn main() {
                                 )
                             });
                             (Some(dictation), Some(commands), Screen::Dictation)
+                        } else if can_start {
+                            log!(
+                                "app",
+                                "preload skipped ({}); engines load per use on first F9",
+                                verdict.reason
+                            );
+                            (None, None, Screen::Dictation)
                         } else {
                             log!(
                                 "app",
@@ -279,18 +298,93 @@ fn main() {
                         async move |cx| {
                             let mut pending_levels: Vec<f32> = Vec::new();
                             let mut pending_chunks: Vec<Vec<f32>> = Vec::new();
+                            // Last recording-related activity; drives the 5-min
+                            // idle release via preload::should_evict. Reset on
+                            // hotkeys, ASR events, and any non-idle phase.
+                            let mut last_activity = Instant::now();
                             loop {
                                 while let Ok(chunk) = audio_receiver.try_recv() {
                                     pending_levels.push(rms_level(&chunk));
                                     pending_chunks.push(chunk);
                                 }
                                 while let Ok(event) = event_receiver.try_recv() {
+                                    last_activity = Instant::now();
                                     cx.update(|_, cx| {
                                         app.update(cx, |app, cx| app.handle_asr_event(event, cx));
                                     })
                                     .ok();
                                 }
                                 while let Ok(message) = hotkey_receiver.try_recv() {
+                                    last_activity = Instant::now();
+                                    // Transparent per-use reload: a
+                                    // preload-skipped or idle-evicted worker
+                                    // (Dictation screen, worker_live false)
+                                    // spawns fresh on F9 with pending_start so
+                                    // recording begins on Ready. Mirrors
+                                    // finish_onboarding's worker-live-false
+                                    // branch; reuses existing channels only.
+                                    if matches!(&message, HotkeyMessage::ToggleRecording) {
+                                        let needs_reload = cx
+                                            .update(|_, cx| {
+                                                let root = app.read(cx);
+                                                !root.worker_live
+                                                    && matches!(
+                                                        root.screen,
+                                                        Screen::Dictation
+                                                    )
+                                            })
+                                            .unwrap_or(false);
+                                        if needs_reload {
+                                            let reloaded = cx
+                                                .update(|_, cx| {
+                                                    app.update(cx, |app, cx| {
+                                                        let config = config::load()
+                                                            .unwrap_or_default();
+                                                        let selection =
+                                                            selection_from_config(&config);
+                                                        let record_id = selection
+                                                            .record_model
+                                                            .spec()
+                                                            .id;
+                                                        if !is_model_cached(record_id)
+                                                            && !is_model_cached(&config.model)
+                                                        {
+                                                            log!(
+                                                                "app",
+                                                                "reload skipped: no cached engine"
+                                                            );
+                                                            return false;
+                                                        }
+                                                        log!(
+                                                            "app",
+                                                            "worker reload on F9 (per-use load)"
+                                                        );
+                                                        let commands = asr::spawn_worker(
+                                                            app.events.clone(),
+                                                            selection,
+                                                        );
+                                                        app.worker_live = true;
+                                                        let dictation = cx.new(|_| {
+                                                            Dictation::new(
+                                                                commands.clone(),
+                                                                app.results.clone(),
+                                                                app.pill_cmd.clone(),
+                                                                app.esc.clone(),
+                                                                true,
+                                                            )
+                                                        });
+                                                        app.dictation = Some(dictation);
+                                                        app.commands = Some(commands);
+                                                        cx.notify();
+                                                        true
+                                                    })
+                                                })
+                                                .unwrap_or(false);
+                                            if reloaded {
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     cx.update(|_, cx| {
                                         app.update(cx, |app, cx| app.handle_hotkey(message, cx));
                                     })
@@ -343,6 +437,61 @@ fn main() {
                                     });
                                 })
                                 .ok();
+                                // Idle release: 5 min with no recording
+                                // activity shuts the worker down and drops both
+                                // command holders, so the UI never keeps a dead
+                                // channel. Next F9 reloads via the path above.
+                                // Never evicts mid-recording/transcribing.
+                                let idle = cx
+                                    .update(|_, cx| {
+                                        let live = app.read(cx).worker_live;
+                                        let phase = app
+                                            .read(cx)
+                                            .dictation
+                                            .clone()
+                                            .map(|d| d.read(cx).phase);
+                                        (live, phase)
+                                    })
+                                    .unwrap_or((false, None));
+                                match idle {
+                                    (true, Some(Phase::Idle)) => {
+                                        if preload::should_evict(
+                                            last_activity,
+                                            Instant::now(),
+                                        ) {
+                                            cx.update(|_, cx| {
+                                                app.update(cx, |app, _cx| {
+                                                    match app.commands.clone() {
+                                                        Some(commands) => {
+                                                            let _ = commands.send(
+                                                                asr::Command::Shutdown,
+                                                            );
+                                                            log!(
+                                                                "app",
+                                                                "idle 5 min with no recording; worker released, next F9 reloads"
+                                                            );
+                                                        }
+                                                        None => {
+                                                            log!(
+                                                                "app",
+                                                                "idle evict: worker_live with no channel; clearing"
+                                                            );
+                                                        }
+                                                    }
+                                                    app.commands = None;
+                                                    app.dictation = None;
+                                                    app.worker_live = false;
+                                                });
+                                            })
+                                            .ok();
+                                            last_activity = Instant::now();
+                                        }
+                                    }
+                                    (true, Some(_)) => {
+                                        last_activity = Instant::now();
+                                    }
+                                    _ => {}
+                                }
                                 cx.background_executor().timer(POLL_INTERVAL).await;
                             }
                         }

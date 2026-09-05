@@ -88,14 +88,14 @@ impl SpeedTracker {
     }
 }
 
-struct Aggregate {
+pub(crate) struct Aggregate {
     total: u64,
     completed: u64,
     speed: SpeedTracker,
 }
 
 impl Aggregate {
-    fn new(total: u64) -> Self {
+    pub(crate) fn new(total: u64) -> Self {
         Self {
             total,
             completed: 0,
@@ -103,11 +103,11 @@ impl Aggregate {
         }
     }
 
-    fn finish_file(&mut self, bytes: u64) {
+    pub(crate) fn finish_file(&mut self, bytes: u64) {
         self.completed += bytes;
     }
 
-    fn current(&mut self, file: &str, streamed: u64) -> DownloadProgress {
+    pub(crate) fn current(&mut self, file: &str, streamed: u64) -> DownloadProgress {
         let done = self.completed + streamed;
         let bytes_per_sec = self.speed.push(done, Instant::now());
         DownloadProgress {
@@ -149,7 +149,7 @@ fn http_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
-fn head_content_length(url: &str) -> Option<u64> {
+pub(crate) fn head_content_length(url: &str) -> Option<u64> {
     let response = http_agent().head(url).call().ok()?;
     response.header("Content-Length")?.parse::<u64>().ok()
 }
@@ -317,9 +317,14 @@ pub fn generation_is_current(message_generation: u64, current_generation: u64) -
     message_generation == current_generation
 }
 
-pub fn ensure_file(
-    spec: &ModelSpec,
-    file: &str,
+/// Stream `url` to `final_path` with resume (`.part` + `Range`), byte-exact
+/// verification when `expected_size` is known, and per-write `on_chunk(done)`
+/// callbacks. `Ok(true)` = ready, `Ok(false)` = cancelled. Shared by model
+/// files (`ensure_file`) and s1 assets.
+pub(crate) fn download_url_to(
+    url: &str,
+    file_label: &str,
+    final_path: &Path,
     expected_size: Option<u64>,
     cancel: Option<&AtomicBool>,
     on_chunk: &mut dyn FnMut(u64),
@@ -327,21 +332,17 @@ pub fn ensure_file(
     if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Ok(false);
     }
-    let url = file_url(spec, file);
     let expected = match expected_size {
         Some(size) => Some(size),
-        None => head_content_length(&url),
+        None => head_content_length(url),
     };
-    let dir = cached_model_dir(spec);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("creating model dir: {error}"))?;
-    let final_path = dir.join(file);
     if let Some(parent) = final_path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     }
-    if let Ok(meta) = std::fs::metadata(&final_path)
+    if let Ok(meta) = std::fs::metadata(final_path)
         && meta.is_file()
     {
         let accepted = match expected {
@@ -359,7 +360,7 @@ pub fn ensure_file(
     }
     let resumed = if open_len > 0 {
         match http_agent()
-            .get(&url)
+            .get(url)
             .set("Range", &format!("bytes={open_len}-"))
             .call()
         {
@@ -376,7 +377,7 @@ pub fn ensure_file(
         Some(pair) => pair,
         None => {
             let response = http_agent()
-                .get(&url)
+                .get(url)
                 .call()
                 .map_err(|error| error.to_string())?;
             (response, 0)
@@ -406,22 +407,34 @@ pub fn ensure_file(
                 done += n as u64;
                 on_chunk(done);
             }
-            Err(error) => return Err(format!("streaming {file}: {error}")),
+            Err(error) => return Err(format!("streaming {file_label}: {error}")),
         }
     }
-    std::io::Write::flush(&mut out).map_err(|error| format!("flushing {file}: {error}"))?;
+    std::io::Write::flush(&mut out).map_err(|error| format!("flushing {file_label}: {error}"))?;
     drop(out);
     if let Some(expected) = expected
         && done != expected
     {
         let _ = std::fs::remove_file(&part_path);
         return Err(format!(
-            "{file}: downloaded {done} bytes, expected {expected}"
+            "{file_label}: downloaded {done} bytes, expected {expected}"
         ));
     }
-    std::fs::rename(&part_path, &final_path)
-        .map_err(|error| format!("promoting {file}: {error}"))?;
+    std::fs::rename(&part_path, final_path)
+        .map_err(|error| format!("promoting {file_label}: {error}"))?;
     Ok(true)
+}
+
+pub fn ensure_file(
+    spec: &ModelSpec,
+    file: &str,
+    expected_size: Option<u64>,
+    cancel: Option<&AtomicBool>,
+    on_chunk: &mut dyn FnMut(u64),
+) -> Result<bool, String> {
+    let url = file_url(spec, file);
+    let final_path = cached_model_dir(spec).join(file);
+    download_url_to(&url, file, &final_path, expected_size, cancel, on_chunk)
 }
 
 pub fn ensure_model(

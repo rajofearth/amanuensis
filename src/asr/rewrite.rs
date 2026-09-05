@@ -1,13 +1,72 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::fetch::{self, DownloadProgress};
 use crate::log;
 
 const S1_SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text.";
+/// Bench default control line (`bench/run_normalizer.ps1 -ControlLine`);
+/// superseded at runtime by `control_line()`. Kept for parity + tests.
+#[allow(dead_code)]
 const S1_CONTROL_LINE: &str = "[Styling: semi-formal] [Structure: prose] [Context: general]";
 const MAX_NEW_TOKENS: i32 = 512;
 const MIN_NEW_TOKENS: i32 = 128;
+
+/// Defaults for the rewrite presets (match `config::AppConfig` defaults).
+pub const DEFAULT_STYLING: &str = "casual";
+pub const DEFAULT_STRUCTURE: &str = "prose";
+pub const DEFAULT_CONTEXT: &str = "general";
+
+/// s1-mini asset URLs, pinned from the bench ground truth
+/// (`research/webgpu-s1-vs-nemotron.md`: first-party
+/// `superwhisper/s1-mini-GGUF` GGUF + llama.cpp b10675 win-arm64 prebuilt).
+/// Env `S1_GGUF_URL` / `S1_LLAMA_CLI_URL` override these. The llama-cli asset
+/// name follows the observed b10675 `llama-b10675-bin-win-<target>-arm64.zip`
+/// pattern — the download agent should verify it against the release assets.
+pub const S1_GGUF_URL: &str =
+    "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf";
+pub const S1_LLAMA_CLI_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10675/llama-b10675-bin-win-cpu-arm64.zip";
+
+/// Pinned s1-mini GGUF byte size; `ensure_s1_assets` refuses a GGUF whose
+/// length differs, same as `fetch::ensure_file` exact-size checks.
+pub const S1_GGUF_BYTES: u64 = 484_219_808;
+
+/// Validate a styling preset; unknown values fall back to the default word so
+/// the prompt never carries garbage.
+pub fn valid_styling(s: &str) -> &str {
+    match s {
+        "casual" | "semi-casual" | "semi-formal" | "formal" => s,
+        _ => DEFAULT_STYLING,
+    }
+}
+
+/// Validate a structure preset; unknown values fall back to the default word.
+pub fn valid_structure(s: &str) -> &str {
+    match s {
+        "prose" | "lists" => s,
+        _ => DEFAULT_STRUCTURE,
+    }
+}
+
+/// Validate a context preset; unknown values fall back to the default word.
+pub fn valid_context(s: &str) -> &str {
+    match s {
+        "general" | "email" => s,
+        _ => DEFAULT_CONTEXT,
+    }
+}
+
+/// Build the control line from validated presets.
+pub fn control_line(styling: &str, structure: &str, context: &str) -> String {
+    format!(
+        "[Styling: {}] [Structure: {}] [Context: {}]",
+        valid_styling(styling),
+        valid_structure(structure),
+        valid_context(context)
+    )
+}
 
 fn models_root() -> Result<PathBuf, String> {
     crate::config::config_dir().map(|dir| dir.join("models"))
@@ -39,6 +98,8 @@ pub struct RewriteOptions {
     pub threads: i32,
     /// Number of layers offloaded to the GPU, `0` for CPU-only.
     pub gpu_layers: i32,
+    /// Control line prepended to the transcript, built with `control_line()`.
+    pub control_line: String,
 }
 
 /// The cleaned text returned by an s1-mini rewrite pass.
@@ -81,7 +142,7 @@ fn run_llama(
     transcript: &str,
     options: &RewriteOptions,
 ) -> CleanedText {
-    let user_message = format!("{S1_CONTROL_LINE}\n{transcript}");
+    let user_message = format!("{}\n{transcript}", options.control_line);
     let mut command = std::process::Command::new(llama);
     command
         .arg("-m")
@@ -144,7 +205,7 @@ fn run_llama(
         };
     }
     let combined = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), stderr);
-    let text = extract_cleaned_text(&combined, transcript);
+    let text = extract_cleaned_text(&combined, transcript, &options.control_line);
     let ok = !text.is_empty();
     CleanedText { text, ok }
 }
@@ -211,15 +272,16 @@ const TRANSCRIPT_TAIL_ANCHOR_BYTES: usize = 256;
 /// Locate the end of the echoed transcript in llama output. Short
 /// transcripts use the exact control-line + transcript regex (plus an exact
 /// needle fallback); over-cap transcripts anchor on a bounded tail suffix so
-/// the pattern size stays constant.
-fn find_transcript_end(all: &str, transcript: &str) -> Option<usize> {
+/// the pattern size stays constant. `control_line` must be the line actually
+/// sent in the prompt, otherwise the boundary regex cannot match.
+fn find_transcript_end(all: &str, transcript: &str, control_line: &str) -> Option<usize> {
     if transcript.is_empty() {
         return None;
     }
     if transcript.len() <= MAX_TRANSCRIPT_PATTERN_BYTES {
         let boundary = format!(
             r"[^\r\n]*{}[^\r\n]*\r?\n[^\r\n]*{}(?:[ \t]*)\r?\n",
-            regex::escape(S1_CONTROL_LINE),
+            regex::escape(control_line),
             regex::escape(transcript)
         );
         if let Ok(re) = regex::Regex::new(&boundary) {
@@ -284,10 +346,11 @@ fn tail_anchor<'a>(s: &'a str, max_bytes: usize) -> &'a str {
 
 /// Port of `Get-CleanText` from bench/run_normalizer.ps1. Locates the control
 /// line + transcript boundary in llama's output and strips the prompt banner
-/// and trailing markers.
-fn extract_cleaned_text(all: &str, transcript: &str) -> String {
+/// and trailing markers. `control_line` must be the line actually sent.
+fn extract_cleaned_text(all: &str, transcript: &str, control_line: &str) -> String {
     let all = all.replace('\r', "");
-    let start = find_transcript_end(&all, transcript).or_else(|| assistant_role_start(&all));
+    let start =
+        find_transcript_end(&all, transcript, control_line).or_else(|| assistant_role_start(&all));
     let Some(start) = start else {
         return String::new();
     };
@@ -314,22 +377,130 @@ fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() / 4) as u64
 }
 
-/// Download the s1-mini GGUF and llama-cli alongside the models. Returns true
-/// on full success. Reuses the existing resumable download path style but the
-/// artifacts live under `models/` next to the ASR model dirs.
-pub fn ensure_rewrite_assets(on_progress: &mut dyn FnMut(&str, u64, u64)) -> Result<bool, String> {
+/// Download + extract the missing s1-mini assets (GGUF + llama-cli zip) with
+/// per-chunk `DownloadProgress` identical in shape to `fetch::ensure_model`,
+/// so the onboarding progress UI consumes it unchanged. Skips whatever is
+/// already present (GGUF byte-exact, CLI by `s1_llama_cli_path`). `Ok(true)`
+/// means both assets are ready; `Ok(false)` means cancelled.
+pub fn ensure_s1_assets(
+    on_progress: &mut dyn FnMut(DownloadProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, String> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    if cancelled() {
+        return Ok(false);
+    }
     let root = models_root()?;
     std::fs::create_dir_all(&root).map_err(|error| format!("creating models dir: {error}"))?;
 
-    let llama_cli_url = std::env::var("S1_LLAMA_CLI_URL")
-        .unwrap_or_else(|_| "https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-b3870-bin-win-arm64-avx2.zip".to_owned());
-    let gguf_url = std::env::var("S1_GGUF_URL").unwrap_or_else(|_| {
-        "https://huggingface.co/bartowski/SynthLabs-S1-mini-GGUF/resolve/main/SynthLabs-S1-mini-Q4_K_M.gguf".to_owned()
-    });
-    // TODO(issue #2): unconditional GGUF fetch is a placeholder until the exact
-    // s1-mini q4_k_m asset and llama-cli artifact are pinned from the bench.
-    let _ = (llama_cli_url, gguf_url, on_progress);
+    // Pinned for the download agent (env overrides honored for testing).
+    let gguf_url = std::env::var("S1_GGUF_URL").unwrap_or_else(|_| S1_GGUF_URL.to_owned());
+    let zip_url = std::env::var("S1_LLAMA_CLI_URL").unwrap_or_else(|_| S1_LLAMA_CLI_URL.to_owned());
+    let zip_name = zip_url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("llama-cli.zip");
+
+    let zip_total = fetch::head_content_length(&zip_url);
+    let mut aggregate = fetch::Aggregate::new(S1_GGUF_BYTES + zip_total.unwrap_or(0));
+
+    // GGUF, byte-exact.
+    let gguf_path = root.join("s1-mini-q4_k_m.gguf");
+    let have_gguf = std::fs::metadata(&gguf_path)
+        .map(|meta| meta.is_file() && meta.len() == S1_GGUF_BYTES)
+        .unwrap_or(false);
+    if !have_gguf {
+        let label = "s1-mini-q4_k_m.gguf".to_owned();
+        let ready = fetch::download_url_to(
+            &gguf_url,
+            &label,
+            &gguf_path,
+            Some(S1_GGUF_BYTES),
+            cancel,
+            &mut |streamed| on_progress(aggregate.current(&label, streamed)),
+        )?;
+        if !ready {
+            return Ok(false);
+        }
+    }
+    aggregate.finish_file(S1_GGUF_BYTES);
+
+    // llama-cli zip (flat: exe + DLLs); extract ALL files into models/ so the
+    // DLLs sit beside llama-cli.exe.
+    if s1_llama_cli_path().is_none() {
+        if cancelled() {
+            return Ok(false);
+        }
+        let zip_path = root.join(zip_name);
+        let ready = fetch::download_url_to(
+            &zip_url,
+            zip_name,
+            &zip_path,
+            zip_total,
+            cancel,
+            &mut |streamed| on_progress(aggregate.current(zip_name, streamed)),
+        )?;
+        if !ready {
+            return Ok(false);
+        }
+        let zip_len = std::fs::metadata(&zip_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        expand_archive(&zip_path, &root)?;
+        let _ = std::fs::remove_file(&zip_path);
+        if s1_llama_cli_path().is_none() {
+            return Err(format!("llama-cli.exe missing after extracting {zip_name}"));
+        }
+        aggregate.finish_file(zip_total.unwrap_or(zip_len));
+    } else {
+        aggregate.finish_file(zip_total.unwrap_or(0));
+    }
     Ok(true)
+}
+
+/// Extract a flat zip with PowerShell (Windows-only app, no new deps),
+/// mirroring the `powershell.exe` + `$args[]` style in `telemetry.rs`.
+fn expand_archive(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg("Expand-Archive -Path $args[0] -DestinationPath $args[1] -Force")
+        .arg(zip_path)
+        .arg(dest_dir)
+        .output()
+        .map_err(|error| format!("running powershell Expand-Archive: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Expand-Archive failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Check the s1-mini GGUF + llama-cli presence under `models/`, fetching what
+/// is missing via `ensure_s1_assets`. Returns `Ok(true)` only when both
+/// exist. `on_progress` reports `(ready, total)` readiness; byte-level
+/// progress flows through `ensure_s1_assets`' own callback instead.
+pub fn ensure_rewrite_assets(on_progress: &mut dyn FnMut(&str, u64, u64)) -> Result<bool, String> {
+    let readiness = || {
+        let ready = u64::from(s1_model_path().is_some()) + u64::from(s1_llama_cli_path().is_some());
+        (ready, 2)
+    };
+    let (ready, total) = readiness();
+    on_progress("s1-mini", ready, total);
+    let fetched = ensure_s1_assets(&mut |_| {}, None)?;
+    let (ready, total) = readiness();
+    on_progress("s1-mini", ready, total);
+    if s1_model_path().is_none() {
+        log!("rewrite", "s1-mini GGUF missing under models/");
+    }
+    if s1_llama_cli_path().is_none() {
+        log!("rewrite", "llama-cli missing under models/");
+    }
+    Ok(fetched && ready == total)
 }
 
 #[cfg(test)]
@@ -342,20 +513,20 @@ mod tests {
         let all = format!(
             "[Styling: semi-formal] [Structure: prose] [Context: general]\n{transcript}\ncleaned words here\nExiting...\n"
         );
-        let cleaned = extract_cleaned_text(&all, transcript);
+        let cleaned = extract_cleaned_text(&all, transcript, S1_CONTROL_LINE);
         assert_eq!(cleaned, "cleaned words here");
     }
 
     #[test]
     fn extraction_fallback_via_assistant_when_boundary_missing() {
         let all = "some prompt bytes\nassistant\nthe real answer\n[ Generation: 12 tokens ]";
-        let cleaned = extract_cleaned_text(all, "nothing");
+        let cleaned = extract_cleaned_text(all, "nothing", S1_CONTROL_LINE);
         assert_eq!(cleaned, "the real answer");
     }
 
     #[test]
     fn extraction_returns_empty_when_no_marker() {
-        let cleaned = extract_cleaned_text("no markers at all", "x");
+        let cleaned = extract_cleaned_text("no markers at all", "x", S1_CONTROL_LINE);
         assert_eq!(cleaned, "");
     }
 
@@ -383,13 +554,14 @@ mod tests {
 
     #[test]
     fn extraction_rejects_bare_assistant_mention() {
-        let cleaned = extract_cleaned_text("my assistant helped a lot today", "zzz");
+        let cleaned =
+            extract_cleaned_text("my assistant helped a lot today", "zzz", S1_CONTROL_LINE);
         assert_eq!(cleaned, "");
     }
 
     #[test]
     fn extraction_accepts_colon_role_header() {
-        let cleaned = extract_cleaned_text("prompt\nassistant: the answer", "zzz");
+        let cleaned = extract_cleaned_text("prompt\nassistant: the answer", "zzz", S1_CONTROL_LINE);
         assert_eq!(cleaned, "the answer");
     }
 
@@ -397,13 +569,63 @@ mod tests {
     fn extraction_handles_overcap_transcript_via_tail() {
         let transcript = "t".repeat(MAX_TRANSCRIPT_PATTERN_BYTES + 100);
         let all = format!("{S1_CONTROL_LINE}\n{transcript}\nreal answer\n");
-        assert_eq!(extract_cleaned_text(&all, &transcript), "real answer");
+        assert_eq!(
+            extract_cleaned_text(&all, &transcript, S1_CONTROL_LINE),
+            "real answer"
+        );
     }
 
     #[test]
     fn extraction_overcap_without_newline_boundary_returns_empty() {
         let transcript = "t".repeat(MAX_TRANSCRIPT_PATTERN_BYTES + 100);
         let all = format!("prefix {} suffix without boundary", &transcript[..300]);
-        assert_eq!(extract_cleaned_text(&all, &transcript), "");
+        assert_eq!(extract_cleaned_text(&all, &transcript, S1_CONTROL_LINE), "");
+    }
+
+    #[test]
+    fn control_line_builds_from_valid_presets() {
+        assert_eq!(
+            control_line("formal", "lists", "email"),
+            "[Styling: formal] [Structure: lists] [Context: email]"
+        );
+        assert_eq!(
+            control_line("casual", "prose", "general"),
+            "[Styling: casual] [Structure: prose] [Context: general]"
+        );
+    }
+
+    #[test]
+    fn control_line_falls_back_per_field() {
+        assert_eq!(
+            control_line("shouty", "bullets", "meeting"),
+            "[Styling: casual] [Structure: prose] [Context: general]"
+        );
+        // Empty strings are unknown too.
+        assert_eq!(
+            control_line("", "", ""),
+            "[Styling: casual] [Structure: prose] [Context: general]"
+        );
+        // Valid fields survive alongside invalid ones.
+        assert_eq!(
+            control_line("formal", "bullets", "email"),
+            "[Styling: formal] [Structure: prose] [Context: email]"
+        );
+    }
+
+    #[test]
+    fn extraction_matches_runtime_control_line() {
+        let line = control_line("formal", "lists", "email");
+        let transcript = "hello world";
+        let all = format!("{line}\n{transcript}\ncleaned words here\n");
+        assert_eq!(
+            extract_cleaned_text(&all, transcript, &line),
+            "cleaned words here"
+        );
+        // A stale control line must not match the boundary (falls through to
+        // the needle fallback only when the transcript echoes with newline).
+        assert_eq!(
+            extract_cleaned_text(&all, transcript, S1_CONTROL_LINE),
+            "cleaned words here"
+        );
     }
 }

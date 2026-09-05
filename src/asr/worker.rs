@@ -55,6 +55,29 @@ impl Default for ModelSelection {
     }
 }
 
+impl ModelSelection {
+    /// Rewrite presets read at rewrite time from the on-disk config, so
+    /// settings changes apply without rebuilding the worker selection. Any
+    /// load failure falls back to casual/prose/general.
+    /// (Associated fn, not fields: `selection_from_config` in app_root.rs
+    /// builds this struct as an exhaustive literal and must keep compiling
+    /// untouched.)
+    pub fn rewrite_presets() -> (String, String, String) {
+        match crate::config::load() {
+            Some(config) => (
+                config.rewrite_styling,
+                config.rewrite_structure,
+                config.rewrite_context,
+            ),
+            None => (
+                super::rewrite::DEFAULT_STYLING.to_owned(),
+                super::rewrite::DEFAULT_STRUCTURE.to_owned(),
+                super::rewrite::DEFAULT_CONTEXT.to_owned(),
+            ),
+        }
+    }
+}
+
 pub enum Event {
     LoadingProgress(String),
     Ready,
@@ -68,6 +91,18 @@ pub enum Event {
 }
 
 const SESSION_SAMPLE_RATE: usize = 16_000;
+
+/// Rewrite gate: clips shorter than this skip the s1-mini pass and commit
+/// raw ASR; the model round-trip cannot improve a fragment.
+const MIN_REWRITE_AUDIO_SECS: f64 = 1.5;
+/// Rewrite gate: transcripts with fewer words than this skip the pass.
+const MIN_REWRITE_WORDS: usize = 8;
+
+/// True when a clip is too small for the rewrite pass to add value.
+/// Pure: unit-tested below.
+fn should_skip_rewrite(audio_secs: f64, transcript: &str) -> bool {
+    audio_secs < MIN_REWRITE_AUDIO_SECS || transcript.split_whitespace().count() < MIN_REWRITE_WORDS
+}
 
 pub fn spawn_worker(events: Sender<Event>, selection: ModelSelection) -> Sender<Command> {
     let (commands, receiver) = channel::<Command>();
@@ -202,8 +237,22 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         },
                         finalize_secs
                     );
-                    let needs_rewrite =
-                        mode == Mode::Record && selection.rewrite_record && !text.trim().is_empty();
+                    let tiny_clip = should_skip_rewrite(audio_secs, &text);
+                    if tiny_clip
+                        && mode == Mode::Record
+                        && selection.rewrite_record
+                        && !text.trim().is_empty()
+                    {
+                        log!(
+                            "asr",
+                            "rewrite skipped: tiny clip ({audio_secs:.2}s audio, {} words); committing raw ASR",
+                            text.split_whitespace().count()
+                        );
+                    }
+                    let needs_rewrite = mode == Mode::Record
+                        && selection.rewrite_record
+                        && !text.trim().is_empty()
+                        && !tiny_clip;
                     crate::telemetry::session_end(crate::telemetry::SessionEnd {
                         mode: if mode == Mode::Record {
                             "record".into()
@@ -243,20 +292,26 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         let rewrite_events = events.clone();
                         let rewrite_threads = selection.rewrite_threads;
                         let commit_epoch = session_epoch;
+                        let (styling, structure, context) = ModelSelection::rewrite_presets();
+                        let rewrite_audio_secs = audio_secs;
                         thread::spawn(move || {
                             let mut text = text;
                             let rewrite_started = Instant::now();
                             let options = super::rewrite::RewriteOptions {
                                 threads: rewrite_threads,
                                 gpu_layers: 0,
+                                control_line: super::rewrite::control_line(
+                                    &styling, &structure, &context,
+                                ),
                             };
                             match super::rewrite::rewrite(&text, &options) {
                                 Some(result) if result.ok && !result.text.is_empty() => {
                                     text = result.text;
+                                    let wall_secs = rewrite_started.elapsed().as_secs_f64();
                                     log!(
                                         "asr",
                                         "rewrite done in {:.2}s (wall {})",
-                                        rewrite_started.elapsed().as_secs_f64(),
+                                        wall_secs,
                                         result.wall_ms
                                     );
                                     crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
@@ -267,6 +322,22 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                                         out_tokens: result.out_tokens,
                                         ok: result.ok,
                                     });
+                                    crate::telemetry::backend_bench(
+                                        crate::telemetry::BackendBench {
+                                            candidate: "s1-mini".into(),
+                                            provider: "cpu".into(),
+                                            device: "cpu".into(),
+                                            rtf: if rewrite_audio_secs > 0.0 {
+                                                wall_secs / rewrite_audio_secs
+                                            } else {
+                                                0.0
+                                            }
+                                                as f32,
+                                            wall_ms: rewrite_started.elapsed().as_millis() as u64,
+                                            margin: None,
+                                            accepted: true,
+                                        },
+                                    );
                                 }
                                 Some(_) => {
                                     log!(
@@ -524,4 +595,43 @@ fn resident_mib() -> f64 {
         .process(pid)
         .map(|process| process.memory() as f64 / 1024.0 / 1024.0)
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_clip_skips_on_short_audio() {
+        assert!(should_skip_rewrite(
+            0.0,
+            "one two three four five six seven eight nine"
+        ));
+        assert!(should_skip_rewrite(
+            1.49,
+            "one two three four five six seven eight nine"
+        ));
+    }
+
+    #[test]
+    fn tiny_clip_skips_on_few_words() {
+        assert!(should_skip_rewrite(10.0, ""));
+        assert!(should_skip_rewrite(10.0, "hello world"));
+        assert!(should_skip_rewrite(
+            10.0,
+            "one two three four five six seven"
+        ));
+    }
+
+    #[test]
+    fn healthy_clip_rewrites() {
+        assert!(!should_skip_rewrite(
+            1.5,
+            "one two three four five six seven eight"
+        ));
+        assert!(!should_skip_rewrite(
+            5.0,
+            "one two three four five six seven eight nine ten"
+        ));
+    }
 }

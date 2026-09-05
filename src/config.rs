@@ -46,14 +46,22 @@ pub struct BackendCache {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppConfig {
-    /// Legacy single-model setting, kept for backwards compatibility. Newer
-    /// fields (`record_model` / `live_model`) win when present; otherwise the
-    /// per-mode engines inherit from `model` so upgraded installs keep
-    /// dictating on the engine they already used.
+    /// Legacy single-model setting, kept for backwards compatibility. A config
+    /// carrying only `model` (no per-mode fields) migrates to the pipeline
+    /// defaults below instead of inheriting, so upgraded installs land on the
+    /// moonshine record + nemotron live profile.
     pub model: String,
     pub record_model: String,
     pub live_model: String,
     pub rewrite_record: bool,
+    /// Rewrite preset, validated at use site (not an enum) so old configs
+    /// with unknown values keep loading.
+    pub rewrite_styling: String,
+    pub rewrite_structure: String,
+    pub rewrite_context: String,
+    /// User override for engine preload. True allows preload; the RAM policy
+    /// decides at runtime.
+    pub preload_engines: bool,
     #[serde(default)]
     pub telemetry_consent: bool,
     #[serde(default = "default_tray_enabled")]
@@ -74,6 +82,22 @@ fn default_rewrite_record() -> bool {
     true
 }
 
+fn default_rewrite_styling() -> String {
+    "casual".to_owned()
+}
+
+fn default_rewrite_structure() -> String {
+    "prose".to_owned()
+}
+
+fn default_rewrite_context() -> String {
+    "general".to_owned()
+}
+
+fn default_preload_engines() -> bool {
+    true
+}
+
 fn default_tray_enabled() -> bool {
     true
 }
@@ -90,6 +114,14 @@ struct AppConfigRaw {
     #[serde(default)]
     rewrite_record: Option<bool>,
     #[serde(default)]
+    rewrite_styling: Option<String>,
+    #[serde(default)]
+    rewrite_structure: Option<String>,
+    #[serde(default)]
+    rewrite_context: Option<String>,
+    #[serde(default)]
+    preload_engines: Option<bool>,
+    #[serde(default)]
     telemetry_consent: bool,
     #[serde(default = "default_tray_enabled")]
     tray_enabled: bool,
@@ -99,20 +131,20 @@ struct AppConfigRaw {
 
 impl From<AppConfigRaw> for AppConfig {
     fn from(raw: AppConfigRaw) -> Self {
-        let legacy_model = raw.model.clone();
-        let record_model = raw
-            .record_model
-            .or_else(|| legacy_model.clone())
-            .unwrap_or_else(default_record_model);
-        let live_model = raw
-            .live_model
-            .or_else(|| legacy_model.clone())
-            .unwrap_or_else(default_live_model);
+        // Legacy configs (only `model` set, no per-mode fields) migrate to
+        // the pipeline defaults; the legacy value is preserved in `model`
+        // for reference but never inherited into the per-mode engines.
         Self {
-            model: legacy_model.unwrap_or_else(|| "nemotron".to_owned()),
-            record_model,
-            live_model,
+            model: raw.model.unwrap_or_else(|| "nemotron".to_owned()),
+            record_model: raw.record_model.unwrap_or_else(default_record_model),
+            live_model: raw.live_model.unwrap_or_else(default_live_model),
             rewrite_record: raw.rewrite_record.unwrap_or_else(default_rewrite_record),
+            rewrite_styling: raw.rewrite_styling.unwrap_or_else(default_rewrite_styling),
+            rewrite_structure: raw
+                .rewrite_structure
+                .unwrap_or_else(default_rewrite_structure),
+            rewrite_context: raw.rewrite_context.unwrap_or_else(default_rewrite_context),
+            preload_engines: raw.preload_engines.unwrap_or_else(default_preload_engines),
             telemetry_consent: raw.telemetry_consent,
             tray_enabled: raw.tray_enabled,
             backend_cache: raw.backend_cache,
@@ -214,6 +246,10 @@ mod tests {
             record_model: "moonshine".to_owned(),
             live_model: "nemotron".to_owned(),
             rewrite_record: true,
+            rewrite_styling: "formal".to_owned(),
+            rewrite_structure: "bullets".to_owned(),
+            rewrite_context: "meeting".to_owned(),
+            preload_engines: false,
             telemetry_consent: false,
             tray_enabled: true,
             backend_cache: BackendCache {
@@ -282,15 +318,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_model_inherits_into_both_modes() {
-        // A pre-per-mode config only carries `model`. Upgrading must keep both
-        // engines on that same model so behavior doesn't silently change.
+    fn legacy_model_migrates_to_pipeline() {
+        // A pre-per-mode config only carries `model`. Upgrading lands on the
+        // pipeline defaults (moonshine record + nemotron live, rewrite on)
+        // instead of inheriting the legacy engine.
         let path = temp_path("legacymodel");
         std::fs::write(&path, r#"{"model":"nemotron","tray_enabled":true}"#).unwrap();
         let loaded = load_from(&path).expect("load legacy");
-        assert_eq!(loaded.record_model, "nemotron");
+        assert_eq!(loaded.record_model, "moonshine");
         assert_eq!(loaded.live_model, "nemotron");
         assert_eq!(loaded.rewrite_record, true);
+        assert_eq!(loaded.rewrite_styling, "casual");
+        assert_eq!(loaded.rewrite_structure, "prose");
+        assert_eq!(loaded.rewrite_context, "general");
+        assert!(loaded.preload_engines);
         assert!(!loaded.telemetry_consent);
         let _ = std::fs::remove_file(path);
     }
@@ -303,6 +344,10 @@ mod tests {
         assert_eq!(config.record_model, "moonshine");
         assert_eq!(config.live_model, "nemotron");
         assert_eq!(config.rewrite_record, true);
+        assert_eq!(config.rewrite_styling, "casual");
+        assert_eq!(config.rewrite_structure, "prose");
+        assert_eq!(config.rewrite_context, "general");
+        assert!(config.preload_engines);
         assert!(!config.telemetry_consent);
     }
 
@@ -341,6 +386,26 @@ mod tests {
         let loaded = load_from(&path).expect("load old two-slot schema");
         assert_eq!(loaded.record_model, "nemotron");
         assert_eq!(loaded.live_model, "nemotron");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_presets_roundtrip_through_save_load() {
+        let path = temp_path("presets");
+        let written = AppConfig {
+            rewrite_styling: "formal".to_owned(),
+            rewrite_structure: "bullets".to_owned(),
+            rewrite_context: "meeting".to_owned(),
+            preload_engines: false,
+            ..AppConfig::default()
+        };
+        save_to(&path, &written).expect("save");
+        let loaded = load_from(&path).expect("load after save");
+        assert_eq!(loaded, written);
+        assert_eq!(loaded.rewrite_styling, "formal");
+        assert_eq!(loaded.rewrite_structure, "bullets");
+        assert_eq!(loaded.rewrite_context, "meeting");
+        assert!(!loaded.preload_engines);
         let _ = std::fs::remove_file(path);
     }
 }

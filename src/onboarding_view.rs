@@ -12,6 +12,7 @@ use amanuensis::backend_detect::{self, BenchProgress, BenchResult, HardwareProfi
 use amanuensis::config::{self, AppConfig};
 use amanuensis::log;
 use amanuensis::setup_steps::{SetupStep, StepEvent, next_step};
+use amanuensis::telemetry;
 use gpui::{
     App, Context, Div, IntoElement, Render, Stateful, Window, div, prelude::*, px, relative, rgb,
 };
@@ -45,6 +46,13 @@ pub(crate) struct OnboardingView {
     step: Option<SetupStep>,
     start_queued: bool,
     tray_enabled: bool,
+    record_model: String,
+    live_model: String,
+    rewrite_styling: String,
+    rewrite_structure: String,
+    rewrite_context: String,
+    telemetry_consent: bool,
+    preload_engines: bool,
     mic_level: f32,
     mic_peak: f32,
     bench_run: bool,
@@ -68,6 +76,7 @@ impl OnboardingView {
         tray_enabled: bool,
         ui: mpsc::Sender<UiMessage>,
     ) -> Self {
+        let cfg = config::load().unwrap_or_default();
         Self {
             origin,
             model_id,
@@ -84,6 +93,13 @@ impl OnboardingView {
             step: (origin == SetupOrigin::FirstRun).then_some(SetupStep::Welcome),
             start_queued: false,
             tray_enabled,
+            record_model: cfg.record_model.clone(),
+            live_model: cfg.live_model.clone(),
+            rewrite_styling: cfg.rewrite_styling.clone(),
+            rewrite_structure: cfg.rewrite_structure.clone(),
+            rewrite_context: cfg.rewrite_context.clone(),
+            telemetry_consent: cfg.telemetry_consent,
+            preload_engines: cfg.preload_engines,
             mic_level: 0.0,
             mic_peak: 0.0,
             bench_run: false,
@@ -103,6 +119,93 @@ impl OnboardingView {
     fn toggle_tray(&mut self, cx: &mut Context<Self>) {
         self.tray_enabled = !self.tray_enabled;
         let _ = self.ui.send(UiMessage::TraySetEnabled(self.tray_enabled));
+        cx.notify();
+    }
+
+    fn persist_config(&self) -> Result<(), String> {
+        let mut cfg = config::load().unwrap_or_default();
+        cfg.record_model = self.record_model.clone();
+        cfg.live_model = self.live_model.clone();
+        cfg.rewrite_styling = self.rewrite_styling.clone();
+        cfg.rewrite_structure = self.rewrite_structure.clone();
+        cfg.rewrite_context = self.rewrite_context.clone();
+        cfg.telemetry_consent = self.telemetry_consent;
+        cfg.preload_engines = self.preload_engines;
+        cfg.tray_enabled = self.tray_enabled;
+        config::save(&cfg)
+    }
+
+    fn set_engine(&mut self, slot: &'static str, id: &'static str, cx: &mut Context<Self>) {
+        if slot == "record" {
+            self.record_model = id.to_owned();
+        } else {
+            self.live_model = id.to_owned();
+        }
+        match self.persist_config() {
+            Ok(()) => log!("app", "engine picked: {slot}={id}"),
+            Err(error) => {
+                log!("app", "engine pick save FAILED: {error}");
+                self.error = Some(format!("could not save engine choice: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_preset(&mut self, slot: &'static str, value: &'static str, cx: &mut Context<Self>) {
+        match slot {
+            "styling" => self.rewrite_styling = value.to_owned(),
+            "structure" => self.rewrite_structure = value.to_owned(),
+            _ => self.rewrite_context = value.to_owned(),
+        }
+        match self.persist_config() {
+            Ok(()) => log!("app", "rewrite preset picked: {slot}={value}"),
+            Err(error) => {
+                log!("app", "rewrite preset save FAILED: {error}");
+                self.error = Some(format!("could not save rewrite choice: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_telemetry(&mut self, cx: &mut Context<Self>) {
+        self.telemetry_consent = !self.telemetry_consent;
+        let state = self.telemetry_consent;
+        match self.persist_config() {
+            Ok(()) => log!("app", "telemetry consent flipped: {state}"),
+            Err(error) => {
+                log!("app", "telemetry consent save FAILED: {error}");
+                self.error = Some(format!("could not save telemetry choice: {error}"));
+            }
+        }
+        telemetry::set_consent(state);
+        telemetry::consent_event(state);
+        cx.notify();
+    }
+
+    fn toggle_preload(&mut self, cx: &mut Context<Self>) {
+        self.preload_engines = !self.preload_engines;
+        match self.persist_config() {
+            Ok(()) => log!("app", "preload flipped: {}", self.preload_engines),
+            Err(error) => {
+                log!("app", "preload save FAILED: {error}");
+                self.error = Some(format!("could not save preload choice: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn export_logs_clicked(&mut self, cx: &mut Context<Self>) {
+        match telemetry::export_logs() {
+            Ok(path) => {
+                log!("app", "logs exported: {}", path.display());
+                self.status = Some(format!("Logs saved to {}", path.display()));
+                self.error = None;
+            }
+            Err(error) => {
+                log!("app", "log export FAILED: {error}");
+                self.error = Some(error);
+            }
+        }
         cx.notify();
     }
 
@@ -578,6 +681,52 @@ impl OnboardingView {
                         .text_color(rgb(0xcc9933))
                         .child("Your PC has less memory than recommended — it may run slowly.")
                 }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .id("consent-check")
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(rgb(0x505050))
+                                .px(px(10.))
+                                .py(px(4.))
+                                .bg(if self.telemetry_consent {
+                                    rgb(0x2a2a2a)
+                                } else {
+                                    rgb(0x171717)
+                                })
+                                .text_size(px(11.))
+                                .text_color(if self.telemetry_consent {
+                                    rgb(0xf2f2f2)
+                                } else {
+                                    rgb(0x707070)
+                                })
+                                .child(if self.telemetry_consent { "ON" } else { "OFF" })
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_telemetry(cx))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(0x909090))
+                                .child("Share anonymous usage stats. Off unless you say yes."),
+                        ),
+                )
+                .children(self.progress.as_ref().map(|progress| {
+                    let eta = self.eta.estimate(progress.done, progress.total);
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0xd8d8d8))
+                        .child(progress_status(
+                            &progress.file,
+                            progress,
+                            eta.as_deref(),
+                        ))
+                }))
+                .children(self.progress.as_ref().map(progress_bar))
                 .children(self.error.clone().map(|error| {
                     div()
                         .text_size(px(12.))
@@ -1276,6 +1425,348 @@ impl Render for OnboardingView {
                         .on_click(cx.listener(|this, _, _, cx| this.recheck_backend(cx))),
                     )
             })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .p(px(12.))
+                    .child(div().text_size(px(13.)).child("Engines"))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x808080))
+                            .child("Record handles F9 clips. Live follows your voice as you talk."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Record"),
+                            )
+                            .child(
+                                choice_button(
+                                    "engine-record-moonshine",
+                                    "Moonshine",
+                                    self.record_model == "moonshine",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_engine("record", "moonshine", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "engine-record-nemotron",
+                                    "Nemotron",
+                                    self.record_model == "nemotron",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_engine("record", "nemotron", cx)
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Live"),
+                            )
+                            .child(
+                                choice_button(
+                                    "engine-live-moonshine",
+                                    "Moonshine",
+                                    self.live_model == "moonshine",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_engine("live", "moonshine", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "engine-live-nemotron",
+                                    "Nemotron",
+                                    self.live_model == "nemotron",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_engine("live", "nemotron", cx)
+                                })),
+                            ),
+                    )
+                    .children((self.live_model == "moonshine").then(|| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xcc9933))
+                            .child(
+                                "Live runs on Moonshine, so text only lands after you stop. You will not see partials while speaking.",
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .p(px(12.))
+                    .child(div().text_size(px(13.)).child("Rewrite presets"))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x808080))
+                            .child("Record clips get cleaned up before pasting. Pick how they should sound."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Styling"),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-styling-casual",
+                                    "Casual",
+                                    self.rewrite_styling == "casual",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("styling", "casual", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-styling-semi-casual",
+                                    "Semi-casual",
+                                    self.rewrite_styling == "semi-casual",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("styling", "semi-casual", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-styling-semi-formal",
+                                    "Semi-formal",
+                                    self.rewrite_styling == "semi-formal",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("styling", "semi-formal", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-styling-formal",
+                                    "Formal",
+                                    self.rewrite_styling == "formal",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("styling", "formal", cx)
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Structure"),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-structure-prose",
+                                    "Prose",
+                                    self.rewrite_structure == "prose",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("structure", "prose", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-structure-lists",
+                                    "Lists",
+                                    self.rewrite_structure == "lists",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("structure", "lists", cx)
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x909090))
+                                    .child("Context"),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-context-general",
+                                    "General",
+                                    self.rewrite_context == "general",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("context", "general", cx)
+                                })),
+                            )
+                            .child(
+                                choice_button(
+                                    "preset-context-email",
+                                    "Email",
+                                    self.rewrite_context == "email",
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_preset("context", "email", cx)
+                                })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Usage stats"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x808080))
+                                    .child("Anonymous telemetry. Off unless you say yes."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("telemetry-toggle")
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(0x505050))
+                            .px(px(10.))
+                            .py(px(4.))
+                            .bg(if self.telemetry_consent {
+                                rgb(0x2a2a2a)
+                            } else {
+                                rgb(0x171717)
+                            })
+                            .text_size(px(11.))
+                            .text_color(if self.telemetry_consent {
+                                rgb(0xf2f2f2)
+                            } else {
+                                rgb(0x707070)
+                            })
+                            .child(if self.telemetry_consent { "ON" } else { "OFF" })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_telemetry(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Preload engines"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x808080))
+                                    .child("Warm both engines at startup when memory allows."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("preload-toggle")
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgb(0x505050))
+                            .px(px(10.))
+                            .py(px(4.))
+                            .bg(if self.preload_engines {
+                                rgb(0x2a2a2a)
+                            } else {
+                                rgb(0x171717)
+                            })
+                            .text_size(px(11.))
+                            .text_color(if self.preload_engines {
+                                rgb(0xf2f2f2)
+                            } else {
+                                rgb(0x707070)
+                            })
+                            .child(if self.preload_engines { "ON" } else { "OFF" })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_preload(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(rgb(0x2e2e2e))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child("Logs"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0x808080))
+                                    .child("Bundle logs and device info into a zip."),
+                            ),
+                    )
+                    .child(
+                        action_button("export-logs", "Export logs", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.export_logs_clicked(cx))),
+                    ),
+            )
             .children(
                 ((self.origin == SetupOrigin::Recovery) && !self.downloading).then(|| {
                     div()
@@ -1595,6 +2086,36 @@ pub(crate) fn action_button(id: &'static str, label: &'static str, enabled: bool
             rgb(0xe5e7eb)
         } else {
             rgb(0x606060)
+        })
+        .child(label)
+}
+
+pub(crate) fn choice_button(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(8.))
+        .py(px(2.))
+        .border_1()
+        .border_color(if selected {
+            rgb(0x6b7280)
+        } else {
+            rgb(0x2e2e2e)
+        })
+        .text_size(px(12.))
+        .bg(if selected {
+            rgb(0x2a2a2a)
+        } else {
+            rgb(0x17191d)
+        })
+        .text_color(if selected {
+            rgb(0xf2f2f2)
+        } else {
+            rgb(0xe5e7eb)
         })
         .child(label)
 }
