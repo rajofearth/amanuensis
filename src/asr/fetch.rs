@@ -37,8 +37,7 @@ pub(crate) static MOONSHINE_FILES: [&str; 5] = [
 // `csukuangfj2/sherpa-onnx-moonshine-base-en-int8` is empty, so there are no
 // per-file HF URLs for moonshine (nemotron still uses `file_url` below).
 pub(crate) const MOONSHINE_TARBALL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2";
-pub(crate) const MOONSHINE_TARBALL_FILE: &str =
-    "sherpa-onnx-moonshine-base-en-int8.tar.bz2";
+pub(crate) const MOONSHINE_TARBALL_FILE: &str = "sherpa-onnx-moonshine-base-en-int8.tar.bz2";
 pub(crate) const MOONSHINE_TARBALL_SIZE: u64 = 250_807_309;
 
 #[derive(Clone, Debug)]
@@ -534,8 +533,7 @@ fn extract_moonshine_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), Stri
         let nested = find_nested_model_file(dest_dir, file)
             .ok_or_else(|| format!("{file} missing after moonshine extraction"))?;
         let parent = nested.parent().map(Path::to_path_buf);
-        std::fs::rename(&nested, &direct)
-            .map_err(|error| format!("promoting {file}: {error}"))?;
+        std::fs::rename(&nested, &direct).map_err(|error| format!("promoting {file}: {error}"))?;
         if let Some(parent) = parent {
             let _ = std::fs::remove_dir(parent);
         }
