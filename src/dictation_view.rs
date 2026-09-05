@@ -245,6 +245,7 @@ impl Dictation {
                 text,
                 duration_secs,
                 epoch,
+                rewritten,
             } => {
                 if epoch != self.epoch {
                     log!("app", "stale commit dropped (epoch mismatch)");
@@ -270,7 +271,14 @@ impl Dictation {
                         duration_secs,
                         text.chars().count()
                     );
-                    let cleaned = clean_transcript(&text);
+                    // s1-mini output is already styled: skip clean_transcript
+                    // entirely (trim only) so curly quotes, em dashes, and
+                    // truecasing survive. Raw ASR keeps full cleanup.
+                    let cleaned = if rewritten {
+                        text.trim().to_owned()
+                    } else {
+                        clean_transcript(&text)
+                    };
                     if cleaned != text.trim() {
                         log!(
                             "app",

@@ -87,6 +87,7 @@ pub enum Event {
         text: String,
         duration_secs: f32,
         epoch: u64,
+        rewritten: bool,
     },
 }
 
@@ -296,6 +297,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         let rewrite_audio_secs = audio_secs;
                         thread::spawn(move || {
                             let mut text = text;
+                            let mut rewritten = false;
                             let rewrite_started = Instant::now();
                             let options = super::rewrite::RewriteOptions {
                                 threads: rewrite_threads,
@@ -307,6 +309,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                             match super::rewrite::rewrite(&text, &options) {
                                 Some(result) if result.ok && !result.text.is_empty() => {
                                     text = result.text;
+                                    rewritten = true;
                                     let wall_secs = rewrite_started.elapsed().as_secs_f64();
                                     log!(
                                         "asr",
@@ -344,18 +347,35 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                                         "asr",
                                         "rewrite returned nothing usable; keeping ASR text"
                                     );
+                                    crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
+                                        backend: "s1-mini".into(),
+                                        device: "cpu".into(),
+                                        wall_ms: rewrite_started.elapsed().as_millis() as u64,
+                                        in_tokens: super::rewrite::estimate_tokens(&text),
+                                        out_tokens: 0,
+                                        ok: false,
+                                    });
                                 }
                                 None => {
                                     log!(
                                         "asr",
                                         "rewrite unavailable (model/executable missing); keeping ASR text"
                                     );
+                                    crate::telemetry::rewrite_end(crate::telemetry::RewriteEnd {
+                                        backend: "s1-mini".into(),
+                                        device: "cpu".into(),
+                                        wall_ms: rewrite_started.elapsed().as_millis() as u64,
+                                        in_tokens: super::rewrite::estimate_tokens(&text),
+                                        out_tokens: 0,
+                                        ok: false,
+                                    });
                                 }
                             }
                             let _ = rewrite_events.send(Event::Committed {
                                 text,
                                 duration_secs,
                                 epoch: commit_epoch,
+                                rewritten,
                             });
                         });
                     } else {
@@ -363,6 +383,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                             text,
                             duration_secs,
                             epoch: session_epoch,
+                            rewritten: false,
                         });
                     }
                 } else {
@@ -377,6 +398,7 @@ fn run(commands: Receiver<Command>, events: Sender<Event>, selection: ModelSelec
                         text: String::new(),
                         duration_secs: 0.0,
                         epoch: session_epoch,
+                        rewritten: false,
                     });
                 }
             }
@@ -479,6 +501,7 @@ fn load_and_swap(
             text,
             duration_secs: session_samples as f32 / SESSION_SAMPLE_RATE as f32,
             epoch: session_epoch,
+            rewritten: false,
         });
     }
     let old = cached.take();

@@ -257,7 +257,7 @@ fn main() {
                             OnboardingView::new(
                                 SetupOrigin::FirstRun,
                                 device,
-                                "nemotron",
+                                "moonshine",
                                 tray_enabled,
                                 ui_sender.clone(),
                             )
@@ -289,6 +289,7 @@ fn main() {
                     pending_start: false,
                     download_generation: 0,
                     cancel_flag: None,
+                    s1_engine: None,
                     hwnd: None,
                 });
 
@@ -359,6 +360,7 @@ fn main() {
                                                             "app",
                                                             "worker reload on F9 (per-use load)"
                                                         );
+                                                        let record = selection.record_model;
                                                         let commands = asr::spawn_worker(
                                                             app.events.clone(),
                                                             selection,
@@ -375,6 +377,15 @@ fn main() {
                                                         });
                                                         app.dictation = Some(dictation);
                                                         app.commands = Some(commands);
+                                                        // Per-use s1 chain: rewrite needs s1-mini
+                                                        // even when the engine was already cached.
+                                                        // User-initiated (F9), so re-arm a past s1
+                                                        // failure instead of sticking silent; same
+                                                        // progress/ready rules as onboarding. The
+                                                        // worker is already live, so the
+                                                        // stay-unready return is ignored.
+                                                        AppRoot::rearm_s1_retry();
+                                                        app.ensure_s1_chain(record);
                                                         cx.notify();
                                                         true
                                                     })

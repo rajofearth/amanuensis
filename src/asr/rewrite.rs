@@ -11,8 +11,8 @@ const S1_SYSTEM_PROMPT: &str = "You are a text normalizer for speech-to-text tra
 /// superseded at runtime by `control_line()`. Kept for parity + tests.
 #[allow(dead_code)]
 const S1_CONTROL_LINE: &str = "[Styling: semi-formal] [Structure: prose] [Context: general]";
-const MAX_NEW_TOKENS: i32 = 512;
-const MIN_NEW_TOKENS: i32 = 128;
+const MAX_NEW_TOKENS: i32 = 1024;
+const MIN_NEW_TOKENS: i32 = 64;
 
 /// Defaults for the rewrite presets (match `config::AppConfig` defaults).
 pub const DEFAULT_STYLING: &str = "casual";
@@ -251,11 +251,12 @@ fn stderr_signals_failure(stderr: &str) -> bool {
 }
 
 /// Scale `-n` to the transcript so short dictations don't pay for a full
-/// 512-token generation window. Output mirrors input length, so 2x input
+/// 1024-token generation window. Mirrors the Space formula: 1.3x input
 /// tokens plus slack, clamped to [MIN_NEW_TOKENS, MAX_NEW_TOKENS].
 fn max_new_tokens(transcript: &str) -> i32 {
     let scaled = estimate_tokens(transcript)
-        .saturating_mul(2)
+        .saturating_mul(13)
+        .saturating_div(10)
         .saturating_add(32)
         .clamp(MIN_NEW_TOKENS as u64, MAX_NEW_TOKENS as u64);
     scaled as i32
@@ -373,7 +374,7 @@ fn extract_cleaned_text(all: &str, transcript: &str, control_line: &str) -> Stri
     text.trim().to_owned()
 }
 
-fn estimate_tokens(text: &str) -> u64 {
+pub(crate) fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() / 4) as u64
 }
 
@@ -534,9 +535,27 @@ mod tests {
     fn max_new_tokens_scales_with_floor_and_ceiling() {
         assert_eq!(max_new_tokens(""), MIN_NEW_TOKENS);
         assert_eq!(max_new_tokens("hi"), MIN_NEW_TOKENS);
-        // 400 chars -> ~100 tokens -> 2*100+32 = 232.
-        assert_eq!(max_new_tokens(&"a".repeat(400)), 232);
+        // 400 chars -> ~100 tokens -> floor(100*1.3)+32 = 162.
+        assert_eq!(max_new_tokens(&"a".repeat(400)), 162);
         assert_eq!(max_new_tokens(&"a".repeat(100_000)), MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn max_new_tokens_floor_boundary() {
+        // 96 chars -> 24 tokens -> floor(24*1.3)+32 = 63 -> clamped to 64.
+        assert_eq!(max_new_tokens(&"a".repeat(96)), 64);
+        // 100 chars -> 25 tokens -> floor(25*1.3)+32 = 64.
+        assert_eq!(max_new_tokens(&"a".repeat(100)), 64);
+        // 104 chars -> 26 tokens -> floor(26*1.3)+32 = 65.
+        assert_eq!(max_new_tokens(&"a".repeat(104)), 65);
+    }
+
+    #[test]
+    fn max_new_tokens_ceiling_boundary() {
+        // 3052 chars -> 763 tokens -> floor(763*1.3)+32 = 1023.
+        assert_eq!(max_new_tokens(&"a".repeat(3052)), 1023);
+        // 3056 chars -> 764 tokens -> floor(764*1.3)+32 = 1025 -> clamped.
+        assert_eq!(max_new_tokens(&"a".repeat(3056)), MAX_NEW_TOKENS);
     }
 
     #[test]

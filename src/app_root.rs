@@ -62,6 +62,10 @@ pub(crate) struct AppRoot {
     pub(crate) pending_start: bool,
     pub(crate) download_generation: u64,
     pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
+    /// Record engine owning the in-flight chained s1 fetch (set by
+    /// `start_s1_fetch`, taken on terminal). Lets the s1-failure arm stay
+    /// loud and unblocking for any engine instead of hardcoding Moonshine.
+    pub(crate) s1_engine: Option<ModelKind>,
     pub(crate) worker_live: bool,
     pub(crate) hwnd: Option<isize>,
 }
@@ -142,10 +146,9 @@ impl AppRoot {
                 if self.dictation.is_some() {
                     self.screen = Screen::Dictation;
                     self.hide_pill_window();
-                    // Settings may have switched the record engine to
-                    // moonshine while s1-mini was never fetched (cached
-                    // engine → no download → no chain → rewrite silently
-                    // raw). Kick the fetch off now, same rules as
+                    // Settings may have switched the record engine while s1-mini
+                    // was never fetched (cached engine → no download → no
+                    // chain → rewrite silently raw). Kick the fetch off now, same rules as
                     // onboarding. Skipped while a download is in flight —
                     // its own terminal chains s1 — so the flight is never
                     // orphaned by a generation bump.
@@ -371,7 +374,8 @@ impl AppRoot {
         // messages are dropped by the generation check below. It also clears
         // a past s1 failure, re-arming the normal download-path chain.
         S1_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
-        S1_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+        Self::rearm_s1_retry();
+        self.s1_engine = None;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flag = Some(cancel.clone());
         log!(
@@ -388,6 +392,7 @@ impl AppRoot {
     /// the s1 terminal (`engine_ready`) — the same rules as onboarding.
     fn start_s1_fetch(&mut self, engine: ModelKind, generation: u64) {
         S1_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.s1_engine = Some(engine);
         log!(
             "app",
             "engine {} cached but s1-mini assets missing; starting s1 fetch (generation {generation})",
@@ -398,21 +403,29 @@ impl AppRoot {
         spawn_s1_download(engine, generation, cancel, self.downloads.clone());
     }
 
+    /// User-initiated retry re-arm: clears a past s1 failure so the next
+    /// chain attempt can happen. Called only from user-initiated paths
+    /// (`start_download`, `finish_onboarding`, per-use reload) — never from
+    /// automatic terminals — so a failing s1 can't retry-loop by itself.
+    pub(crate) fn rearm_s1_retry() {
+        S1_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Chain the s1 fetch for a record engine that needs it but has no
-    /// download in flight (settings switch onto a cached moonshine, or a
-    /// direct Finish with s1 missing): fresh generation, same
+    /// download in flight (settings switch onto a cached engine, per-use
+    /// reload, or a direct Finish with s1 missing): fresh generation, same
     /// progress/ready rules as the onboarding chain. Returns true when the
     /// caller must stay unready (fetch started, or one already running).
     /// Never triggers when the engine itself is uncached (its own download
     /// chains s1 on Finish) and never retries a failed s1 (see `S1_FAILED`).
-    fn ensure_s1_chain(&mut self, record: ModelKind) -> bool {
+    pub(crate) fn ensure_s1_chain(&mut self, record: ModelKind) -> bool {
         if S1_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
             return true;
         }
         if S1_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
-        if !Self::s1_chain_needed(record) {
+        if !Self::s1_chain_needed() {
             return false;
         }
         if !is_model_cached(record.spec().id) {
@@ -424,15 +437,12 @@ impl AppRoot {
         true
     }
 
-    /// True when a moonshine record engine must chain the s1-mini fetch
-    /// before flipping ready: rewrite enabled in the live config and at
-    /// least one s1 asset missing. Nemotron-only flows never trigger s1. A
-    /// missing config (first run) means pipeline defaults, where rewrite is
-    /// on.
-    fn s1_chain_needed(model: ModelKind) -> bool {
-        if model != ModelKind::Moonshine {
-            return false;
-        }
+    /// True when a record engine must chain the s1-mini fetch before
+    /// flipping ready: rewrite enabled in the live config and at least one
+    /// s1 asset missing, regardless of record engine — Nemotron-record
+    /// users get working rewrite too. A missing config (first run) means
+    /// pipeline defaults, where rewrite is on.
+    fn s1_chain_needed() -> bool {
         if !config::load().map(|c| c.rewrite_record).unwrap_or(true) {
             return false;
         }
@@ -493,12 +503,13 @@ impl AppRoot {
                         if S1_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
                             // S1 phase complete: engine + s1-mini both present.
                             S1_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+                            self.s1_engine = None;
                             log!(
                                 "app",
                                 "s1-mini assets ready; engine + rewrite ready to record"
                             );
                             self.engine_ready(model, cx);
-                        } else if Self::s1_chain_needed(model) {
+                        } else if Self::s1_chain_needed() {
                             // Engine done but s1-mini missing: stay unready and
                             // chain the s1 fetch on the same generation so the
                             // progress bar keeps moving. Readiness flips only
@@ -512,14 +523,24 @@ impl AppRoot {
                         if S1_IN_FLIGHT.swap(false, std::sync::atomic::Ordering::SeqCst) {
                             // S1 failed: never block recording on it. The
                             // engine is cached; rewrite just stays unavailable.
-                            // Record the failure so the `finish_onboarding`
-                            // below proceeds raw instead of re-chaining.
+                            // Record the failure so automatic re-chains stay
+                            // quiet instead of retrying ~500 MB forever; the
+                            // next user-initiated download/start re-arms via
+                            // `rearm_s1_retry`. Stay loud here and emit error
+                            // telemetry so the failure isn't silent.
                             S1_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let engine = self.s1_engine.take().unwrap_or(ModelKind::Moonshine);
                             log!(
                                 "app",
                                 "ERROR: s1-mini download FAILED: {error}; continuing engine-ready with rewrite unavailable"
                             );
-                            self.engine_ready(ModelKind::Moonshine, cx);
+                            amanuensis::telemetry::error(amanuensis::telemetry::ErrorEvent {
+                                kind: "s1_download".to_owned(),
+                                backend: "s1-mini".to_owned(),
+                                message: error.clone(),
+                                stderr_tail: String::new(),
+                            });
+                            self.engine_ready(engine, cx);
                         } else if let Screen::Onboarding { view, .. } = self.screen.clone() {
                             view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
                         }
@@ -533,6 +554,7 @@ impl AppRoot {
                 }
                 self.cancel_flag = None;
                 if S1_IN_FLIGHT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.s1_engine = None;
                     log!(
                         "app",
                         "s1-mini download cancelled; engine cached, staying in setup"
@@ -709,6 +731,10 @@ impl AppRoot {
     }
 
     pub(crate) fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
+        // User-initiated Finish: a past s1 failure must not stick-silently
+        // block the retry below. (Automatic `engine_ready` entries are
+        // no-ops here — `start_download`/the s1 terminal already cleared.)
+        Self::rearm_s1_retry();
         let existing = config::load();
         let existing_defaults = existing.clone().unwrap_or_default();
         let config = AppConfig {

@@ -141,6 +141,20 @@ mod tests {
     }
 
     #[test]
+    fn s1_rewritten_text_survives_trim_only() {
+        // Rewritten (s1-mini) commits skip clean_transcript — trim only — so
+        // styled output passes through byte-identical.
+        let s1 = "  “Revenue grew 12%” — She Said the Outlook Is Strong  ";
+        assert_eq!(
+            s1.trim(),
+            "“Revenue grew 12%” — She Said the Outlook Is Strong"
+        );
+        // Justification for the bypass: clean_transcript would mangle this
+        // path's output, stripping a meaningful sentence starter.
+        assert_eq!(clean_transcript("Ah, revenue grew"), "revenue grew");
+    }
+
+    #[test]
     fn collapses_spaces_before_punct_and_trims() {
         assert_eq!(clean_transcript("well , yes"), "well, yes");
         assert_eq!(clean_transcript("  done.  "), "done.");
