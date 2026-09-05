@@ -53,7 +53,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SUCCESS_LINGER: Duration = Duration::from_millis(1200);
 const UNINSTALL_SUCCESS_LINGER: Duration = Duration::from_millis(600);
 
-const TAGLINE: &str = "Press F9 anywhere, speak — your words become text. Private, local, fast.";
+const TAGLINE: &str =
+    "Press F9 anywhere, speak, and your words become text. It all runs on your PC.";
 const LAUNCHING_LINE: &str = "Launching Amanuensis…";
 
 #[derive(Clone, Debug)]

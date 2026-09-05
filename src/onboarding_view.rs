@@ -27,8 +27,8 @@ pub(crate) enum SetupOrigin {
     Respawn,
 }
 
-pub(crate) const RECOVERY_NOTICE: &str = "Cached model not found — download it below to continue.";
-pub(crate) const BLOCKED_NOTICE: &str = "Model not downloaded — download it in setup first.";
+pub(crate) const RECOVERY_NOTICE: &str = "Cached model not found. Download it below to continue.";
+pub(crate) const BLOCKED_NOTICE: &str = "Model not downloaded. Download it in setup first.";
 
 pub(crate) struct OnboardingView {
     origin: SetupOrigin,
@@ -225,12 +225,11 @@ impl OnboardingView {
         match winner {
             Some(provider) => {
                 log!("app", "backend bench finished: winner={provider}");
-                self.status = Some(format!("Backend benchmarked: fastest is {provider}."));
+                self.status = Some(format!("Backend test done. Fastest is {provider}."));
             }
             None => {
                 log!("app", "backend bench finished: no winner recorded");
-                self.status =
-                    Some("Backend benchmark skipped or found nothing to record.".to_owned());
+                self.status = Some("Backend test skipped or gave no result.".to_owned());
             }
         }
         cx.notify();
@@ -441,10 +440,10 @@ impl OnboardingView {
         self.eta.clear();
         if let Some(step) = self.step {
             self.step = next_step(step, StepEvent::DownloadCancelled);
-            self.status = Some("Cancelled — it will resume next time.".to_owned());
+            self.status = Some("Cancelled. It will resume next time.".to_owned());
         } else {
             self.status = Some(
-                "Cancelled — progress saved; the next Start resumes from the same byte offset."
+                "Cancelled. Progress is saved. The next Start picks up where it stopped."
                     .to_owned(),
             );
         }
@@ -671,7 +670,7 @@ impl OnboardingView {
                         .text_size(px(12.))
                         .text_color(rgb(0x909090))
                         .child(format!(
-                            "One-time setup downloads a voice model (~{} MB). After that, everything runs on your PC — nothing leaves it.",
+                            "One-time setup downloads the voice model (~{} MB), then a small cleanup model. After that, everything runs on your PC. Nothing leaves it.",
                             spec.size_mb
                         )),
                 )
@@ -679,7 +678,7 @@ impl OnboardingView {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(0xcc9933))
-                        .child("Your PC has less memory than recommended — it may run slowly.")
+                        .child("Your PC has less memory than recommended. It may run slowly.")
                 }))
                 .child(
                     div()
@@ -746,11 +745,11 @@ impl OnboardingView {
                 .child(numbered_row(1, "F9 starts your microphone"))
                 .child(numbered_row(
                     2,
-                    "A voice model running on your PC transcribes as you speak — audio never leaves your machine",
+                    "A voice model on your PC turns your speech into text. Audio never leaves your machine",
                 ))
                 .child(numbered_row(
                     3,
-                    "Filler words are cleaned up, then the text is pasted wherever your cursor is",
+                    "A cleanup model tidies the text using your presets, then pastes it where your cursor is. Very short clips skip this step",
                 ))
                 .child(tour_footer(
                     Some(action_button("tour-how-back", "Back", true).on_click(cx.listener(
@@ -802,7 +801,7 @@ impl OnboardingView {
                     .child(
                         div()
                             .text_size(px(14.))
-                            .child("Say something — the bar should move."),
+                            .child("Say something. The bar should move."),
                     )
                     .child(
                         div()
@@ -840,7 +839,7 @@ impl OnboardingView {
                             ))
                             .child(primary_button(
                                 "tour-mic-continue",
-                                "Looks good — continue",
+                                "Looks good. Continue",
                                 cx.listener(|this, _, _, cx| this.start_clicked(cx)),
                             )),
                     )
@@ -856,7 +855,7 @@ impl OnboardingView {
                     .and_then(|progress| progress.bytes_per_sec)
                     .map(speed_summary);
                 base()
-                    .child(div().text_size(px(20.)).child("Setting up your voice model…"))
+                    .child(div().text_size(px(20.)).child("Setting up dictation"))
                     .children((self.progress.is_none()).then(|| {
                         div()
                             .text_size(px(13.))
@@ -902,7 +901,7 @@ impl OnboardingView {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(0x909090))
-                            .child("You can cancel — it resumes where it left off."),
+                            .child("You can cancel. It resumes where it left off."),
                     )
             }
             SetupStep::DetectHardware => {
@@ -1252,11 +1251,11 @@ impl OnboardingView {
                     })
             }
             SetupStep::Ready => base()
-                .child(div().text_size(px(26.)).child("You're all set — try it."))
+                .child(div().text_size(px(26.)).child("You are all set. Try it."))
                 .child(
                     div()
                         .text_size(px(14.))
-                        .child("Hold F9 and speak — your words will land in the last app you used."),
+                        .child("Hold F9 and speak. Your words land in the last app you used."),
                 )
                 .children(self.notice.clone().map(|notice| {
                     div()
@@ -1268,7 +1267,7 @@ impl OnboardingView {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(0xcc9933))
-                        .child("F9 pressed — recording will begin once models load")
+                        .child("F9 pressed. Recording begins once the models load")
                 }))
                 .child(
                     div()
@@ -1326,7 +1325,7 @@ impl Render for OnboardingView {
                     .text_size(px(11.))
                     .text_color(rgb(0x909090))
                     .child(format!(
-                        "detected: {} GB RAM, {} logical cores",
+                        "Found {} GB RAM and {} logical cores",
                         self.ram_gb, self.cores
                     )),
             )
@@ -1452,7 +1451,7 @@ impl Render for OnboardingView {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(0x808080))
-                            .child("Record handles F9 clips. Live follows your voice as you talk."),
+                            .child("Record handles F9 clips and lands after you stop. Live shows text as you talk when set to Nemotron."),
                     )
                     .child(
                         div()
@@ -1542,7 +1541,7 @@ impl Render for OnboardingView {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(0x808080))
-                            .child("Record clips get cleaned up before pasting. Pick how they should sound."),
+                            .child("Record clips get tidied before pasting. These presets set the tone. Very short clips skip this step."),
                     )
                     .child(
                         div()
@@ -1837,12 +1836,12 @@ impl Render for OnboardingView {
                             .gap(px(12.))
                             .text_size(px(11.))
                             .text_color(rgb(0x909090))
-                            .child(format!("{} MB · {} ms chunks", spec.size_mb, spec.chunk_ms))
+                            .child(format!("~{} MB download", spec.size_mb))
                             .child(spec.wer_note),
                     )
                     .children((!cached_now && !self.downloading).then(|| {
                         div().text_size(px(11.)).text_color(rgb(0xcc9933)).child(
-                            "Model not on disk — dictation won't work until you download it.",
+                            "Model not on disk. Download it before dictating.",
                         )
                     })),
             )
@@ -1889,7 +1888,7 @@ impl Render for OnboardingView {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(0xcc9933))
-                            .child("F9 pressed — recording will begin once models load")
+                            .child("F9 pressed. Recording begins once the models load")
                     })),
             )
             .children((self.busy && self.downloading).then(|| {
