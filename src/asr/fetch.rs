@@ -33,6 +33,14 @@ pub(crate) static MOONSHINE_FILES: [&str; 5] = [
     "tokens.txt",
 ];
 
+// Moonshine ships as a single GitHub release tarball — the HuggingFace repo
+// `csukuangfj2/sherpa-onnx-moonshine-base-en-int8` is empty, so there are no
+// per-file HF URLs for moonshine (nemotron still uses `file_url` below).
+pub(crate) const MOONSHINE_TARBALL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2";
+pub(crate) const MOONSHINE_TARBALL_FILE: &str =
+    "sherpa-onnx-moonshine-base-en-int8.tar.bz2";
+pub(crate) const MOONSHINE_TARBALL_SIZE: u64 = 250_807_309;
+
 #[derive(Clone, Debug)]
 pub struct DownloadProgress {
     pub file: String,
@@ -155,6 +163,9 @@ pub(crate) fn head_content_length(url: &str) -> Option<u64> {
 }
 
 pub fn total_size(spec: &ModelSpec) -> Option<u64> {
+    if spec.id == "moonshine" {
+        return Some(MOONSHINE_TARBALL_SIZE);
+    }
     model_files(spec)
         .iter()
         .map(|file| head_content_length(&file_url(spec, file)))
@@ -437,11 +448,121 @@ pub fn ensure_file(
     download_url_to(&url, file, &final_path, expected_size, cancel, on_chunk)
 }
 
+/// Fetch moonshine via the GitHub release tarball (resume + byte-exact size
+/// check through the shared `download_url_to` helper), extract the 5 model
+/// files into the cache dir, verify all are present, then delete the tarball.
+/// `Ok(None)` = cancelled. The nemotron per-file HF path below is untouched.
+fn ensure_moonshine(
+    spec: &ModelSpec,
+    on_progress: &mut dyn FnMut(DownloadProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<ModelPaths>, String> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Ok(None);
+    }
+    let dir = cached_model_dir(spec);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("creating model dir: {error}"))?;
+    let download_started = Instant::now();
+    if !dir_complete(&dir, &MOONSHINE_FILES) {
+        let tarball_path = dir.join(MOONSHINE_TARBALL_FILE);
+        let mut aggregate = Aggregate::new(MOONSHINE_TARBALL_SIZE);
+        let label = MOONSHINE_TARBALL_FILE.to_owned();
+        let ready = download_url_to(
+            MOONSHINE_TARBALL_URL,
+            MOONSHINE_TARBALL_FILE,
+            &tarball_path,
+            Some(MOONSHINE_TARBALL_SIZE),
+            cancel,
+            &mut |streamed| {
+                on_progress(aggregate.current(&label, streamed));
+            },
+        )?;
+        if !ready {
+            return Ok(None);
+        }
+        aggregate.finish_file(MOONSHINE_TARBALL_SIZE);
+        extract_moonshine_tarball(&tarball_path, &dir)?;
+        if !dir_complete(&dir, &MOONSHINE_FILES) {
+            return Err("moonshine tarball extracted but model files are missing".to_owned());
+        }
+        std::fs::remove_file(&tarball_path)
+            .map_err(|error| format!("removing moonshine tarball: {error}"))?;
+    }
+    crate::telemetry::model_download(crate::telemetry::ModelDownload {
+        model: spec.id.to_owned(),
+        bytes: MOONSHINE_TARBALL_SIZE,
+        seconds: download_started.elapsed().as_secs_f64(),
+        source: "github".into(),
+    });
+    Ok(Some(ModelPaths::Moonshine {
+        preprocessor: dir.join(MOONSHINE_FILES[0]),
+        encoder: dir.join(MOONSHINE_FILES[1]),
+        uncached_decoder: dir.join(MOONSHINE_FILES[2]),
+        cached_decoder: dir.join(MOONSHINE_FILES[3]),
+        tokens: dir.join(MOONSHINE_FILES[4]),
+    }))
+}
+
+/// Extract the moonshine tarball with Windows `tar.exe` (ships with Windows,
+/// no new deps), mirroring the `powershell.exe` + `$args[]` style of
+/// `expand_archive` in `rewrite.rs`. The tarball nests the model files one
+/// level down, so each is promoted to `dest_dir` afterwards.
+fn extract_moonshine_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg("tar -xjf $args[0] -C $args[1]")
+        .arg(tarball)
+        .arg(dest_dir)
+        .output()
+        .map_err(|error| format!("running tar extraction: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tar extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    for file in MOONSHINE_FILES {
+        let direct = dest_dir.join(file);
+        if std::fs::metadata(&direct)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let nested = find_nested_model_file(dest_dir, file)
+            .ok_or_else(|| format!("{file} missing after moonshine extraction"))?;
+        let parent = nested.parent().map(Path::to_path_buf);
+        std::fs::rename(&nested, &direct)
+            .map_err(|error| format!("promoting {file}: {error}"))?;
+        if let Some(parent) = parent {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+    Ok(())
+}
+
+/// Locate `file` one level below `dir` (the tarball wraps its payload in a
+/// single top-level directory).
+fn find_nested_model_file(dir: &Path, file: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let candidate = entry.path().join(file);
+        std::fs::metadata(&candidate)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+            .then_some(candidate)
+    })
+}
+
 pub fn ensure_model(
     spec: &ModelSpec,
     on_progress: &mut dyn FnMut(DownloadProgress),
     cancel: Option<&AtomicBool>,
 ) -> Result<Option<ModelPaths>, String> {
+    if spec.id == "moonshine" {
+        return ensure_moonshine(spec, on_progress, cancel);
+    }
     if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Ok(None);
     }
@@ -482,20 +603,11 @@ pub fn ensure_model(
         seconds: download_started.elapsed().as_secs_f64(),
         source: "huggingface".into(),
     });
-    let paths = match spec.id {
-        "moonshine" => ModelPaths::Moonshine {
-            preprocessor: dir.join(MOONSHINE_FILES[0]),
-            encoder: dir.join(MOONSHINE_FILES[1]),
-            uncached_decoder: dir.join(MOONSHINE_FILES[2]),
-            cached_decoder: dir.join(MOONSHINE_FILES[3]),
-            tokens: dir.join(MOONSHINE_FILES[4]),
-        },
-        _ => ModelPaths::Nemotron {
-            encoder: dir.join(NEMOTRON_FILES[0]),
-            decoder: dir.join(NEMOTRON_FILES[1]),
-            joiner: dir.join(NEMOTRON_FILES[2]),
-            tokens: dir.join(NEMOTRON_FILES[3]),
-        },
+    let paths = ModelPaths::Nemotron {
+        encoder: dir.join(NEMOTRON_FILES[0]),
+        decoder: dir.join(NEMOTRON_FILES[1]),
+        joiner: dir.join(NEMOTRON_FILES[2]),
+        tokens: dir.join(NEMOTRON_FILES[3]),
     };
     Ok(Some(paths))
 }
@@ -515,7 +627,8 @@ mod tests {
 
     #[test]
     fn file_url_has_expected_shape() {
-        let spec = &super::super::model::REGISTRY[0];
+        let spec = &super::super::model::REGISTRY[1];
+        assert_eq!(spec.id, "nemotron");
         assert_eq!(
             file_url(spec, "encoder.int8.onnx"),
             format!(
@@ -523,6 +636,30 @@ mod tests {
                 spec.repo
             )
         );
+    }
+
+    #[test]
+    fn moonshine_has_no_hf_per_file_repo_and_known_tarball_size() {
+        let spec = &super::super::model::REGISTRY[0];
+        assert_eq!(spec.id, "moonshine");
+        assert!(spec.repo.is_empty());
+        assert_eq!(total_size(spec), Some(MOONSHINE_TARBALL_SIZE));
+        assert_eq!(MOONSHINE_TARBALL_SIZE, 250_807_309);
+        assert!(MOONSHINE_TARBALL_URL.ends_with(".tar.bz2"));
+    }
+
+    #[test]
+    fn nested_lookup_finds_tarball_layout_one_level_down() {
+        let dir = temp_dir("nested");
+        let sub = dir.join("sherpa-onnx-moonshine-base-en-int8");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("tokens.txt"), b"a").unwrap();
+        assert_eq!(
+            find_nested_model_file(&dir, "tokens.txt"),
+            Some(sub.join("tokens.txt"))
+        );
+        assert_eq!(find_nested_model_file(&dir, "missing.onnx"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

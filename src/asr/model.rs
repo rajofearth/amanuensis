@@ -1,7 +1,11 @@
 use super::fetch;
 pub const REPO_OWNER: &str = "csukuangfj2";
 const NEMOTRON_REPO: &str = "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
-const MOONSHINE_REPO: &str = "sherpa-onnx-moonshine-base-en-int8";
+// Moonshine has no per-file HuggingFace artifact: the HF repo
+// `sherpa-onnx-moonshine-base-en-int8` is empty, so moonshine must NOT go
+// through `file_url`. It ships as a GitHub release tarball instead — see
+// `MOONSHINE_TARBALL_URL` in fetch.rs. `repo` stays empty for moonshine;
+// the field itself is kept because `ModelSpec` is shared with nemotron.
 
 pub struct ModelSpec {
     pub id: &'static str,
@@ -17,7 +21,7 @@ pub const REGISTRY: [ModelSpec; 2] = [
     ModelSpec {
         id: "moonshine",
         display_name: "Moonshine (record)",
-        repo: MOONSHINE_REPO,
+        repo: "",
         size_mb: 300,
         min_ram_gb: 2,
         chunk_ms: 0,
