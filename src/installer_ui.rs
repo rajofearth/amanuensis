@@ -389,28 +389,36 @@ impl InstallerApp {
                     .text_color(rgb(0x909090))
                     .child(version_arrow(installed, APP_VERSION))
             }))
-            .child(self.render_path_row(cx))
-            .child(toggle_row(
-                "start-menu-toggle",
-                "Start menu shortcut",
-                "Adds Amanuensis to your all-apps list.",
-                self.start_menu,
-                cx.listener(|this, _, _, cx| {
-                    this.start_menu = !this.start_menu;
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "autostart-toggle",
-                "Start with Windows",
-                "Launches Amanuensis when you sign in.",
-                self.autostart,
-                cx.listener(|this, _, _, cx| {
-                    this.autostart = !this.autostart;
-                    cx.notify();
-                }),
-            ))
-            .child(div().flex_1())
+            .child(
+                div()
+                    .id("installer-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .gap(px(14.))
+                    .child(self.render_path_row(cx))
+                    .child(toggle_row(
+                        "start-menu-toggle",
+                        "Start menu shortcut",
+                        "Adds Amanuensis to your all-apps list.",
+                        self.start_menu,
+                        cx.listener(|this, _, _, cx| {
+                            this.start_menu = !this.start_menu;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(toggle_row(
+                        "autostart-toggle",
+                        "Start with Windows",
+                        "Launches Amanuensis when you sign in.",
+                        self.autostart,
+                        cx.listener(|this, _, _, cx| {
+                            this.autostart = !this.autostart;
+                            cx.notify();
+                        }),
+                    )),
+            )
             .child(footer(
                 text_button(
                     "cancel",
@@ -490,43 +498,51 @@ impl InstallerApp {
             )
             .child(
                 div()
-                    .id("keep-data")
-                    .cursor_pointer()
+                    .id("installer-scroll")
                     .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .border_1()
-                    .border_color(rgb(0x2e2e2e))
-                    .px(px(12.))
-                    .py(px(8.))
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .gap(px(14.))
                     .child(
                         div()
+                            .id("keep-data")
+                            .cursor_pointer()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .size(px(14.))
+                            .gap(px(10.))
                             .border_1()
-                            .border_color(rgb(0x505050))
-                            .bg(if self.keep_data {
-                                rgb(0x2a2a2a)
-                            } else {
-                                rgb(0x171717)
-                            })
-                            .text_size(px(11.))
-                            .text_color(rgb(0xf2f2f2))
-                            .child(if self.keep_data { "✓" } else { "" }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .child("Keep my models and settings"),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.keep_data = !this.keep_data;
-                        cx.notify();
-                    })),
+                            .border_color(rgb(0x2e2e2e))
+                            .px(px(12.))
+                            .py(px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(14.))
+                                    .border_1()
+                                    .border_color(rgb(0x505050))
+                                    .bg(if self.keep_data {
+                                        rgb(0x2a2a2a)
+                                    } else {
+                                        rgb(0x171717)
+                                    })
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0xf2f2f2))
+                                    .child(if self.keep_data { "✓" } else { "" }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .child("Keep my models and settings"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.keep_data = !this.keep_data;
+                                cx.notify();
+                            })),
+                    ),
             )
-            .child(div().flex_1())
             .child(footer(
                 text_button(
                     "cancel",
