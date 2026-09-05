@@ -3,6 +3,7 @@ use std::{
     thread,
 };
 
+use amanuensis::asr::rewrite::{s1_llama_cli_path, s1_model_path};
 use amanuensis::asr::{
     Command, Event, ModelKind, ModelSelection, is_model_cached, kind_by_id, repo_cache_dir_for,
     spec_by_id,
@@ -17,7 +18,7 @@ use amanuensis::pill_window as pw;
 use gpui::{Context, Entity, KeyDownEvent, Window, div, prelude::*};
 
 use crate::dictation_view::{Dictation, Phase};
-use crate::download_runner::{remove_dir_all_retrying, spawn_model_download};
+use crate::download_runner::{remove_dir_all_retrying, spawn_model_download, spawn_s1_download};
 use crate::messages::{DownloadMessage, HotkeyMessage, PasteResult, UiMessage};
 use crate::tray::TrayCommand;
 
@@ -26,6 +27,12 @@ const LOW_SIGNAL_GAIN: f32 = 8.0;
 use crate::onboarding_view::{OnboardingView, SetupOrigin};
 
 pub(crate) const WINDOW_TITLE: &str = "amanuensis-window";
+/// True while the chained s1-mini fetch (started from a finished moonshine
+/// engine download) is in flight. Process-wide because there is a single
+/// `AppRoot`/download channel; a struct field would break `main.rs`'s
+/// exhaustive `AppRoot` literal. Cleared on every terminal s1 message and on
+/// `start_download`, so a stale s1 message can never be misclassified.
+static S1_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 pub(crate) enum Screen {
     Onboarding {
@@ -342,6 +349,9 @@ impl AppRoot {
         }
         self.download_generation += 1;
         let generation = self.download_generation;
+        // A fresh engine download invalidates any chained s1 state; stale s1
+        // messages are dropped by the generation check below.
+        S1_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flag = Some(cancel.clone());
         log!(
@@ -350,6 +360,38 @@ impl AppRoot {
             spec.id
         );
         spawn_model_download(spec, purge, generation, cancel, self.downloads.clone());
+    }
+
+    /// True when a just-finished record-engine download must chain the s1-mini
+    /// fetch before flipping ready: only moonshine (the rewrite engine) with
+    /// rewrite enabled in the live config and at least one s1 asset missing.
+    /// Nemotron-only flows never trigger s1. A missing config (first run)
+    /// means pipeline defaults, where rewrite is on.
+    fn s1_chain_needed(model: ModelKind) -> bool {
+        if model != ModelKind::Moonshine {
+            return false;
+        }
+        if !config::load().map(|c| c.rewrite_record).unwrap_or(true) {
+            return false;
+        }
+        s1_model_path().is_none() || s1_llama_cli_path().is_none()
+    }
+
+    /// Engine (+ s1, when chained) present: advance the step flow or finish
+    /// onboarding, consuming any queued pending-start.
+    pub(crate) fn engine_ready(&mut self, model: ModelKind, cx: &mut Context<Self>) {
+        let step_flow_view = match self.screen.clone() {
+            Screen::Onboarding { view, .. } => Some(view),
+            Screen::Dictation => None,
+        };
+        let in_step_flow = step_flow_view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).step_active());
+        if in_step_flow && let Some(view) = step_flow_view {
+            view.update(cx, |onboarding, cx| onboarding.download_finished_step(cx));
+        } else {
+            self.finish_onboarding(model, cx);
+        }
     }
 
     pub(crate) fn handle_download_message(
@@ -386,21 +428,42 @@ impl AppRoot {
                 self.cancel_flag = None;
                 match result {
                     Ok(model) => {
-                        let step_flow_view = match self.screen.clone() {
-                            Screen::Onboarding { view, .. } => Some(view),
-                            Screen::Dictation => None,
-                        };
-                        let in_step_flow = step_flow_view
-                            .as_ref()
-                            .is_some_and(|view| view.read(cx).step_active());
-                        if in_step_flow && let Some(view) = step_flow_view {
-                            view.update(cx, |onboarding, cx| onboarding.download_finished_step(cx));
+                        if S1_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+                            // S1 phase complete: engine + s1-mini both present.
+                            S1_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+                            log!(
+                                "app",
+                                "s1-mini assets ready; engine + rewrite ready to record"
+                            );
+                            self.engine_ready(model, cx);
+                        } else if Self::s1_chain_needed(model) {
+                            // Engine done but s1-mini missing: stay unready and
+                            // chain the s1 fetch on the same generation so the
+                            // progress bar keeps moving. Readiness flips only
+                            // when the s1 terminal message arrives below.
+                            S1_IN_FLIGHT.store(true, std::sync::atomic::Ordering::SeqCst);
+                            log!(
+                                "app",
+                                "engine {} cached but s1-mini assets missing; starting s1 fetch (generation {generation})",
+                                model.spec().id
+                            );
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            self.cancel_flag = Some(cancel.clone());
+                            spawn_s1_download(model, generation, cancel, self.downloads.clone());
                         } else {
-                            self.finish_onboarding(model, cx);
+                            self.engine_ready(model, cx);
                         }
                     }
                     Err(error) => {
-                        if let Screen::Onboarding { view, .. } = self.screen.clone() {
+                        if S1_IN_FLIGHT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            // S1 failed: never block recording on it. The
+                            // engine is cached; rewrite just stays unavailable.
+                            log!(
+                                "app",
+                                "ERROR: s1-mini download FAILED: {error}; continuing engine-ready with rewrite unavailable"
+                            );
+                            self.engine_ready(ModelKind::Moonshine, cx);
+                        } else if let Screen::Onboarding { view, .. } = self.screen.clone() {
                             view.update(cx, |onboarding, cx| onboarding.download_failed(error, cx));
                         }
                     }
@@ -412,6 +475,12 @@ impl AppRoot {
                     return;
                 }
                 self.cancel_flag = None;
+                if S1_IN_FLIGHT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    log!(
+                        "app",
+                        "s1-mini download cancelled; engine cached, staying in setup"
+                    );
+                }
                 if let Screen::Onboarding { view, .. } = self.screen.clone() {
                     view.update(cx, |onboarding, cx| onboarding.download_cancelled(cx));
                 }

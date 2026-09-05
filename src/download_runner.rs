@@ -4,7 +4,8 @@ use std::{
     time::Duration,
 };
 
-use amanuensis::asr::{ModelSpec, ensure_model_by_spec, kind_by_id, repo_cache_dir_for};
+use amanuensis::asr::rewrite::ensure_s1_assets;
+use amanuensis::asr::{ModelKind, ModelSpec, ensure_model_by_spec, kind_by_id, repo_cache_dir_for};
 use amanuensis::log;
 
 use crate::messages::DownloadMessage;
@@ -48,6 +49,58 @@ pub(crate) fn spawn_model_download(
             }
         }
         run_download(spec, generation, cancel, download);
+    });
+}
+
+/// s1-mini rewrite-asset fetch on the same download channel. Generation/cancel
+/// semantics are identical to `spawn_model_download`: the caller reuses the
+/// engine download's generation (so stale-drop keeps working) and stores a
+/// fresh cancel flag before spawning. `ensure_s1_assets` already reports
+/// `DownloadProgress` in the same shape as the engine fetch, so the existing
+/// progress bar consumes it unchanged. `engine` is passed through into the
+/// terminal `Finished` so the reader knows which record engine is ready.
+pub(crate) fn spawn_s1_download(
+    engine: ModelKind,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    download: mpsc::Sender<DownloadMessage>,
+) {
+    thread::spawn(move || {
+        match ensure_s1_assets(
+            &mut |progress| {
+                log!(
+                    "app",
+                    "s1 download progress: {} · {} B / {} B",
+                    progress.file,
+                    progress.done,
+                    progress.total
+                );
+                let _ = download.send(DownloadMessage::Progress {
+                    generation,
+                    progress,
+                });
+            },
+            Some(&cancel),
+        ) {
+            Ok(true) => {
+                log!("app", "s1-mini download finished");
+                let _ = download.send(DownloadMessage::Finished {
+                    generation,
+                    result: Ok(engine),
+                });
+            }
+            Ok(false) => {
+                log!("app", "s1-mini download cancelled");
+                let _ = download.send(DownloadMessage::Cancelled { generation });
+            }
+            Err(error) => {
+                log!("app", "s1-mini download FAILED: {error}");
+                let _ = download.send(DownloadMessage::Finished {
+                    generation,
+                    result: Err(error),
+                });
+            }
+        }
     });
 }
 
