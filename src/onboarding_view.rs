@@ -1332,26 +1332,40 @@ impl Render for OnboardingView {
             )
             .child(
                 div()
+                    .id("settings-scroll")
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_1()
-                    .border_color(rgb(0x2e2e2e))
-                    .px(px(12.))
-                    .py(px(8.))
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .gap(px(12.))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(div().text_size(px(13.)).child("Windows tray icon"))
+                            .items_center()
+                            .justify_between()
+                            .border_1()
+                            .border_color(rgb(0x2e2e2e))
+                            .px(px(12.))
+                            .py(px(8.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(0x808080))
-                                    .child("Left-click opens settings; right-click shows actions."),
-                            ),
-                    )
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .child("Windows tray icon"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(0x808080))
+                                            .child(
+                                                "Left-click opens settings; right-click shows actions.",
+                                            ),
+                                    ),
+                            )
                     .child(
                         div()
                             .id("tray-toggle")
@@ -1871,12 +1885,13 @@ impl Render for OnboardingView {
                     .text_color(rgb(0xcc3333))
                     .child(format!("failed: {error}"))
             }))
-            .children(self.start_queued.then(|| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(0xcc9933))
-                    .child("F9 pressed — recording will begin once models load")
-            }))
+                    .children(self.start_queued.then(|| {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xcc9933))
+                            .child("F9 pressed — recording will begin once models load")
+                    })),
+            )
             .children((self.busy && self.downloading).then(|| {
                 action_button(
                     "cancel",
