@@ -1,5 +1,6 @@
 use std::{
     io::Read,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -205,7 +206,28 @@ pub fn speed_summary(bytes_per_sec: f64) -> String {
     }
 }
 
+/// Label for the progress bar, derived from the file being fetched: the
+/// s1-mini assets ride the engine download channel, so the chained engine's
+/// display name would mislabel them ("Downloading Nemotron Streaming …
+/// (s1-mini-q4_k_m.gguf)"). s1 asset files always read "s1-mini".
+pub const S1_PROGRESS_LABEL: &str = "s1-mini";
+
+/// True for s1-mini asset files (GGUF + llama-cli zip), whatever the chained
+/// engine.
+pub fn is_s1_asset_file(file: &str) -> bool {
+    file.starts_with("s1-mini") || file.starts_with("llama-")
+}
+
+fn progress_label<'a>(display_name: &'a str, file: &str) -> &'a str {
+    if is_s1_asset_file(file) {
+        S1_PROGRESS_LABEL
+    } else {
+        display_name
+    }
+}
+
 pub fn progress_text(display_name: &str, progress: &DownloadProgress) -> String {
+    let display_name = progress_label(display_name, &progress.file);
     format!(
         "Downloading {} — {} ({})",
         display_name,
@@ -219,6 +241,7 @@ pub fn progress_status(
     progress: &DownloadProgress,
     eta: Option<&str>,
 ) -> String {
+    let display_name = progress_label(display_name, &progress.file);
     let speed_part = progress
         .bytes_per_sec
         .map(|bytes_per_sec| format!(" · {}", speed_summary(bytes_per_sec)))
@@ -507,6 +530,9 @@ fn ensure_moonshine(
 /// `expand_archive` in `rewrite.rs`. The tarball nests the model files one
 /// level down, so each is promoted to `dest_dir` afterwards.
 fn extract_moonshine_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), String> {
+    // Hidden console: extraction runs on the download thread; a flashing
+    // powershell window per download is a bug, not feedback.
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = std::process::Command::new("powershell.exe")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -514,6 +540,7 @@ fn extract_moonshine_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), Stri
         .arg("tar -xjf $args[0] -C $args[1]")
         .arg(tarball)
         .arg(dest_dir)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("running tar extraction: {error}"))?;
     if !output.status.success() {
@@ -789,6 +816,37 @@ mod tests {
     fn generation_guard_matches_only_current() {
         assert!(generation_is_current(7, 7));
         assert!(!generation_is_current(6, 7));
+    }
+
+    #[test]
+    fn s1_asset_files_label_as_s1_mini_not_engine() {
+        let gguf = DownloadProgress {
+            file: "s1-mini-q4_k_m.gguf".to_owned(),
+            done: 8,
+            total: 100,
+            bytes_per_sec: None,
+        };
+        assert!(progress_text("Nemotron Streaming", &gguf).starts_with("Downloading s1-mini —"));
+        assert!(
+            progress_status("Nemotron Streaming", &gguf, None).starts_with("Downloading s1-mini —")
+        );
+        let zip = DownloadProgress {
+            file: "llama-b10675-bin-win-cpu-arm64.zip".to_owned(),
+            done: 8,
+            total: 100,
+            bytes_per_sec: None,
+        };
+        assert!(progress_text("Nemotron Streaming", &zip).starts_with("Downloading s1-mini —"));
+        let engine = DownloadProgress {
+            file: "encoder.int8.onnx".to_owned(),
+            done: 8,
+            total: 100,
+            bytes_per_sec: None,
+        };
+        assert!(
+            progress_text("Nemotron Streaming", &engine)
+                .starts_with("Downloading Nemotron Streaming —")
+        );
     }
 
     #[test]

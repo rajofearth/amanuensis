@@ -35,8 +35,10 @@ pub(crate) const WINDOW_TITLE: &str = "amanuensis-window";
 static S1_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Set when the chained s1-mini fetch fails: the engine is usable raw, so a
 /// later `finish_onboarding` must proceed instead of re-chaining (otherwise
-/// every finish would retry ~500 MB forever). Cleared by the next engine
-/// `start_download`, which re-arms the normal download-path chain.
+/// every finish would retry ~500 MB forever). Cleared only by user-initiated
+/// paths (`start_download`, the Finish click, per-use F9 reload) — never by
+/// automatic download terminals, so a terminal failure can never re-queue
+/// itself.
 static S1_FAILED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 pub(crate) enum Screen {
@@ -405,8 +407,10 @@ impl AppRoot {
 
     /// User-initiated retry re-arm: clears a past s1 failure so the next
     /// chain attempt can happen. Called only from user-initiated paths
-    /// (`start_download`, `finish_onboarding`, per-use reload) — never from
-    /// automatic terminals — so a failing s1 can't retry-loop by itself.
+    /// (`start_download`, the `FinishOnboarding` click, per-use F9 reload) —
+    /// never from automatic terminals or `finish_onboarding` (which is also
+    /// reached via `engine_ready`) — so a failing s1 can't retry-loop by
+    /// itself.
     pub(crate) fn rearm_s1_retry() {
         S1_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -598,6 +602,13 @@ impl AppRoot {
             }
             UiMessage::FinishOnboarding { captured_model } => {
                 let kind = kind_by_id(captured_model).unwrap_or(ModelKind::Nemotron);
+                // User-initiated Finish: re-arm a past s1 failure so the
+                // chain below can retry. `finish_onboarding` itself must not
+                // re-arm — it is also reached automatically from download
+                // terminals via `engine_ready`, where re-arming would clear
+                // the failure the s1 terminal just recorded and re-queue the
+                // same fetch/extract forever.
+                Self::rearm_s1_retry();
                 self.finish_onboarding(kind, cx);
             }
             UiMessage::DeleteRequest { captured_model } => self.delete_model(captured_model),
@@ -731,10 +742,13 @@ impl AppRoot {
     }
 
     pub(crate) fn finish_onboarding(&mut self, model: ModelKind, cx: &mut Context<Self>) {
-        // User-initiated Finish: a past s1 failure must not stick-silently
-        // block the retry below. (Automatic `engine_ready` entries are
-        // no-ops here — `start_download`/the s1 terminal already cleared.)
-        Self::rearm_s1_retry();
+        // No re-arm here: this is also reached automatically from download
+        // terminals via `engine_ready`, and re-arming would clear an s1
+        // failure just recorded by the s1 terminal, re-queueing the same
+        // fetch/extract in a visible loop (single-shot rule: a terminal
+        // success/failure must never re-queue itself). User-initiated
+        // entries (the `FinishOnboarding` click, `start_download`, per-use
+        // F9 reload) re-arm before getting here.
         let existing = config::load();
         let existing_defaults = existing.clone().unwrap_or_default();
         let config = AppConfig {

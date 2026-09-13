@@ -1,6 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
+    os::windows::process::CommandExt,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -665,6 +666,7 @@ pub fn export_logs() -> Result<PathBuf, String> {
         .arg("Compress-Archive -Path $args[0] -DestinationPath $args[1] -Force")
         .arg(source)
         .arg(&zip_path)
+        .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("running powershell: {e}"))?;
 

@@ -1,3 +1,4 @@
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +166,7 @@ fn run_llama(
         .arg(S1_SYSTEM_PROMPT)
         .arg("-p")
         .arg(&user_message)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -209,6 +211,10 @@ fn run_llama(
     let ok = !text.is_empty();
     CleanedText { text, ok }
 }
+
+/// Hidden consoles: the rewrite child and the zip extraction run off the
+/// hot path; a flashing console window per run is a bug, not feedback.
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Upper bound for one rewrite pass. Measured cost is ~3-6 s/clip on CPU;
 /// 120 s is far above any healthy run and only trips on a wedged child.
@@ -470,6 +476,7 @@ fn expand_archive(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         .arg("Expand-Archive -Path $args[0] -DestinationPath $args[1] -Force")
         .arg(zip_path)
         .arg(dest_dir)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("running powershell Expand-Archive: {error}"))?;
     if !output.status.success() {
